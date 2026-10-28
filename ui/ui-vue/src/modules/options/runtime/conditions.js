@@ -289,6 +289,12 @@ export default function (deps) {
     beammpProxyEngineSound(values) {
         return values.enableProxyVehicles!==false && values.proxyEngineSound===true
     },
+    beammpProxyRealWheels(values) {
+        return values.enableProxyVehicles!==false && values.proxyMeshEnabled!==false && values.proxyMeshRealWheels!==false
+    },
+    beammpProxyAutoReal(values) {
+        return values.enableProxyVehicles!==false && values.proxyAutoReal===true
+    },
     beammpEnableBlobs(values) {
         return values.enableBlobs===true
     },
