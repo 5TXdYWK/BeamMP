@@ -73,8 +73,59 @@ async function unregisterRoutes() {
   )
 }
 
+// The game hot-reloads every Vue mod (onUnload > re-eval > onLoad) whenever any mod adds files under
+// /ui/ui-vue/mods/, e.g. while MPModManager activates server mods during a join. Unregistering our routes
+// makes the route manager fall back to "menu", unmounting the BeamMP page and its loading overlay.
+// This module and beammpState.js are re-evaluated on reload, so the snapshot lives on window.
+const RELOAD_SNAPSHOT_KEY = "__beammpReloadSnapshot"
+const RELOAD_SNAPSHOT_MAX_AGE_MS = 10000
+
+function luaResult(command) {
+  return new Promise(resolve => api.engineLua(command, data => resolve(data)))
+}
+
+// Remember the active BeamMP route (and the join overlay) before our routes go away.
+async function saveReloadSnapshot() {
+  window[RELOAD_SNAPSHOT_KEY] = null
+  try {
+    const current = await luaResult("(function() local c = extensions.ui_router and extensions.ui_router.getCurrent(); local r = c and c.request; if not r then return nil end; return {name = r.name, params = r.params} end)()")
+    const name = current?.name
+    if (typeof name !== "string" || !(name === BEAMMP_ROUTE_NAME || name.startsWith(BEAMMP_ROUTE_NAME + "."))) return
+    window[RELOAD_SNAPSHOT_KEY] = {
+      time: Date.now(),
+      name,
+      params: current.params && typeof current.params === "object" ? current.params : undefined,
+      loadingOverlayVisible: state.loadingOverlayVisible.value,
+      loadingStatus: state.loadingStatus.value,
+      downloadingMods: state.downloadingMods.value,
+    }
+  } catch (err) {
+    console.error("[BeamMP] Failed to save route before UI reload", err)
+  }
+}
+
+// After a hot reload, return to the remembered BeamMP route unless a level has started loading meanwhile.
+async function restoreReloadSnapshot() {
+  const snapshot = window[RELOAD_SNAPSHOT_KEY]
+  window[RELOAD_SNAPSHOT_KEY] = null
+  if (!snapshot || Date.now() - snapshot.time > RELOAD_SNAPSHOT_MAX_AGE_MS) return
+
+  try {
+    const blocked = await luaResult("(function() local m = getMissionFilename and getMissionFilename(); local c = extensions.ui_router and extensions.ui_router.getCurrent(); local r = c and c.request; return (type(m) == 'string' and m ~= '') or not r or r.name ~= 'menu' end)()")
+    if (blocked) return // in a level, loading one, or the user already moved elsewhere
+
+    state.loadingOverlayVisible.value = Boolean(snapshot.loadingOverlayVisible)
+    state.loadingStatus.value = snapshot.loadingStatus || ""
+    state.downloadingMods.value = Array.isArray(snapshot.downloadingMods) ? snapshot.downloadingMods : []
+    await lua.extensions.ui_router.navigate(snapshot.name, snapshot.params)
+  } catch (err) {
+    console.error("[BeamMP] Failed to restore route after UI reload", err)
+  }
+}
+
 // convenience ID for for example #3
 const TAB_ID = "beammp"
+let removeRouteGuard = null
 let activeBeamMPDialog = null
 
 function escapeHtml(value) {
@@ -138,6 +189,7 @@ export async function onLoad() {
     events.on("MainMenuButtons", addBeamMPMainMenuButton)
     // Broadcast this event in case we already were in main menu when the mod loaded
     events.emit("BroadcastMainMenuButtons")
+    await restoreReloadSnapshot()
   }
 
   // 3. A dedicated "BeamMP" pause tab.
@@ -165,7 +217,8 @@ export async function onLoad() {
     componentName: `${MOD_ROOT}/cards/BeamMPPauseServerDetailsRedirect.vue`,
   })
 
-  vueRouter.beforeEach(async (to, from) => {
+  removeRouteGuard?.()
+  removeRouteGuard = vueRouter.beforeEach(async (to, from) => {
     if (to.name.startsWith(BEAMMP_ROUTE_NAME)) {
       var connected = await isLauncherConnected()
       
@@ -195,8 +248,11 @@ export async function onUnload() {
   events.off("MainMenuButtons", addBeamMPMainMenuButton)
   events.emit("BroadcastMainMenuButtons") // poke buttons to update
 
-  // remove the standalone route
+  // remember where we were in case this is a hot reload, then remove the standalone route
+  await saveReloadSnapshot()
   await unregisterRoutes()
+  removeRouteGuard?.()
+  removeRouteGuard = null
 
   // you can unregister buttons manually at any time like so:
   // await lua.extensions.ui_pause_actions.unregisterModButton("annas-toolbox-workshop")
