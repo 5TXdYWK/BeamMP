@@ -75,6 +75,8 @@
     "ui.options.beammp.proxyMaxMeshProxies.tooltip": "Maximum number of proxies that use body meshes at the same time (nearest first).",
     "ui.options.beammp.proxyMeshWheels": "Draw proxy wheels",
     "ui.options.beammp.proxyMeshWheels.tooltip": "Draw simple wheels under proxies that use body meshes.",
+    "ui.options.beammp.proxySmoothHandover": "Smooth proxy to real swap",
+    "ui.options.beammp.proxySmoothHandover.tooltip": "When a proxy is swapped for a real vehicle, the proxy stays visible while the real vehicle spawns hidden, then the real vehicle is placed on the proxy's pose (keeping its velocity) and shown once it has synced.",
     "ui.options.beammp.enableBlobs": "Enable blobs for unspawned vehicles",
     "ui.options.beammp.enableBlobs.tooltip": "Unspawned vehicles will appear as colored spheres (blobs)",
     "ui.options.beammp.showSpectators": "Show spectators' nametag under vehicle nametags",

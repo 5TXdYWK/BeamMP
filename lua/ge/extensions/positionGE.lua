@@ -82,15 +82,19 @@ local function applyPos(data, serverVehicleID)
 	end
 
 	vehicle.posPackets = (vehicle.posPackets or 0) + 1 -- counted for the fps, as not every packet is decoded
+	vehicle.proxyPktCount = (vehicle.proxyPktCount or 0) + 1 -- MPProxyGE handover waits for a fresh packet
+	local inHandover = vehicle.proxyHandover ~= nil
 
 	local owner = vehicle:getOwner()
-	if owner and not owner.hasUpdatedPing or not veh then -- only update twice a second per player unless the vehicle is not spawned, spawned vehicles already gets their position and rotation in MPvehicleGE
+	if owner and not owner.hasUpdatedPing or not veh or inHandover then -- only update twice a second per player unless the vehicle is not spawned, spawned vehicles already gets their position and rotation in MPvehicleGE
 		local decoded = jsonDecode(data)
 		local deltaDt = math.max((decoded.tim or 0) - (vehicle.lastDt or 0), 0.001)
 		vehicle.lastDt = decoded.tim
 
 		if not veh and vehicle.isProxy and MPProxyGE then
 			MPProxyGE.onPositionPacket(vehicle, decoded) -- proxies predict and smooth their own position
+		elseif inHandover and MPProxyGE then
+			MPProxyGE.onPositionPacket(vehicle, decoded) -- the proxy is still drawn while the real vehicle spawns
 		else
 			vehicle.position:set(decoded.pos[1],decoded.pos[2],decoded.pos[3])
 			vehicle.rotation:set(decoded.rot[1],decoded.rot[2],decoded.rot[3],decoded.rot[4])

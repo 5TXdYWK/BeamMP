@@ -1567,7 +1567,8 @@ local function applyVehSpawn(event)
 		vehicle.gameVehicleID = spawnedVehID
 		vehicle.isSpawned = true
 		vehicle.isProxy = false
-		if vehicle.proxy and MPProxyMeshGE then MPProxyMeshGE.release(vehicle.proxy) end
+		-- during a proxy -> real handover the proxy stays drawn until the real vehicle is placed (MPProxyGE)
+		if vehicle.proxy and MPProxyMeshGE and not vehicle.proxyHandover then MPProxyMeshGE.release(vehicle.proxy) end
 		vehicle.jbeam = vehicleName
 		vehicle.protected = protected
 		vehicle.absMode = absMode
@@ -1829,6 +1830,7 @@ local function demoteToProxy(serverVehicleID)
 	local current = getPlayerVehicle(0)
 	if current and current:getID() == gameVehicleID then return false end -- never pull the vehicle the camera is in
 	if vehicle.editQueue then vehicle.editQueue = nil end -- already merged into players_vehicle_configs
+	vehicle.proxyHandover = nil
 	if MPProxyGE then MPProxyGE.seedFromVehicle(vehicle, veh) end
 	proxyDemoting[gameVehicleID] = true
 	log("I", "demoteToProxy", "Swapping "..serverVehicleID.." ("..gameVehicleID..") to a proxy")
@@ -2967,7 +2969,7 @@ local function onPreRender(dt)
 					end
 				end
 
-				if settings.getValue("fadeVehicles") and veh then
+				if settings.getValue("fadeVehicles") and veh and not (MPProxyGE and MPProxyGE.isInHandover(v)) then
 					if activeVehID == gameVehicleID then veh:setMeshAlpha(1, "", false)
 					else veh:setMeshAlpha(1 - clamp(linearScale(distfloat, 20, 0, 0, 1), 0, 1), "", false) end
 				end
@@ -3114,6 +3116,8 @@ local function onVehicleReady(gameVehicleID)
 	if vehiclesMap[gameVehicleID] then
 		veh:queueLuaCommand("MPVehicleVE.setServerID(mime.unb64(\'".. MPHelpers.b64encode(vehiclesMap[gameVehicleID]) .."\'))")
 	end
+	local vehicle = getVehicleByGameID(gameVehicleID)
+	if MPProxyGE and vehicle and not vehicle.isLocal then MPProxyGE.onRealVehicleReady(vehicle, veh) end
 end
 
 

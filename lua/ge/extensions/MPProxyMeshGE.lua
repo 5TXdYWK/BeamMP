@@ -671,7 +671,7 @@ local function decide(vehicles, refPos)
 	for _, v in pairs(vehicles) do
 		local p = v.proxy
 		if p then
-			local usable = cfg.enabled and v.isProxy and not v.isSpawned and not v.isDeleted and not v.proxyColliderID and p.hasData
+			local usable = cfg.enabled and ((v.isProxy and not v.isSpawned) or v.proxyHandover ~= nil) and not v.isDeleted and not v.proxyColliderID and p.hasData
 			local d = usable and refPos:distance(p.rpos) or math.huge
 			if p.meshObjects and (not usable or (d > release and not v.isFakeTest)) then detach(p) end
 			-- MPProxyTest vehicles ignore the mesh distance (they are never drawn as boxes)

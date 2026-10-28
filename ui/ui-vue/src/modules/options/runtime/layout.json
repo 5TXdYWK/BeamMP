@@ -5371,6 +5371,31 @@
             "tooltip",
             "setting"
           ]
+        },
+        {
+          "version": "0.38",
+          "label": "ui.options.beammp.proxySmoothHandover",
+          "tooltip": "ui.options.beammp.proxySmoothHandover.tooltip",
+          "setting": "proxySmoothHandover",
+          "interactive": true,
+          "condition_always_off": false,
+          "condition_not_shipping": false,
+          "condition_simplemenu": "",
+          "condition_visible": "",
+          "condition_enabled": "beammpEnableProxyVehicles",
+          "itemType": "checkbox",
+          "component": "OptionsCheckbox",
+          "separateLabel": true,
+          "lua": "",
+          "luaOff": "",
+          "valueOn": true,
+          "valueOff": false,
+          "search": [
+            "label",
+            "caption",
+            "tooltip",
+            "setting"
+          ]
         }
       ],
       "reroute": "",

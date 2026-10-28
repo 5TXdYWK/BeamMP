@@ -28,6 +28,7 @@ local cfg = {
 	collisionRadius = 40,
 	poolSize = 4,
 	colliderModel = "simple_traffic",
+	smoothHandover = true,
 }
 
 local DESPAWN_INTERVAL = 0.5   -- seconds between two real -> proxy swaps (despawns are cheap, but not free)
@@ -52,6 +53,7 @@ local function readSettings()
 	cfg.collisionRadius = tonumber(settings.getValue("proxyCollisionRadius", 40)) or 40
 	cfg.poolSize = math.max(0, math.floor(tonumber(settings.getValue("proxyColliderPoolSize", 4)) or 4))
 	cfg.colliderModel = settings.getValue("proxyColliderModel", "simple_traffic") or "simple_traffic"
+	cfg.smoothHandover = settings.getValue("proxySmoothHandover", true) ~= false
 end
 
 -- ============= DIMENSIONS =============
@@ -136,6 +138,7 @@ local nextColliderSpawnAllowed = 0
 -- garbage free temporaries
 local tmpQ = quat()
 local tmpV = vec3()
+local tmpPosSave, tmpRotSave = vec3(), quat()
 local axX, axY, axZ = vec3(), vec3(), vec3()
 local unitX, unitY, unitZ = vec3(1,0,0), vec3(0,1,0), vec3(0,0,1)
 local center = vec3()
@@ -464,6 +467,98 @@ local function updateColliders(vehicles)
 	end
 end
 
+-- ============= PROXY -> REAL HANDOVER =============
+-- A freshly spawned real vehicle appears where the proxy was when the spawn was requested, which can be seconds
+-- ago. So the proxy keeps being drawn (and predicted) while the real vehicle spawns hidden. Once its VE side is
+-- ready it is moved onto the predicted pose (keeping its state, no reset), gets the proxy's velocity, and stays
+-- hidden until a fresh position packet came in, then the proxy goes away.
+local HANDOVER_SPAWN_TIMEOUT = 30 -- seconds from the spawn request until we give up and just show the vehicle
+local HANDOVER_SYNC_TIMEOUT = 1.5 -- seconds after ready without a fresh packet
+local HANDOVER_MIN_HIDDEN = 0.1   -- seconds the placed vehicle stays hidden at least (positionVE settles)
+
+local handoverFwd, handoverUp, handoverCog = vec3(), vec3(), vec3()
+
+local function startHandover(vehicle)
+	if not cfg.smoothHandover or not vehicle.proxy or not vehicle.proxy.hasData then return end
+	vehicle.proxyHandover = { state = "spawning", started = clock }
+end
+
+local function finishHandover(vehicle, reason)
+	local h = vehicle.proxyHandover
+	if not h then return end
+	vehicle.proxyHandover = nil
+	local veh = vehicle.gameVehicleID and vehicle.gameVehicleID > 0 and getObjectByID(vehicle.gameVehicleID) or nil
+	if veh then veh:setMeshAlpha(1, "", false) end
+	if vehicle.proxy and MPProxyMeshGE then MPProxyMeshGE.release(vehicle.proxy) end
+	log('D', 'MPProxyGE', string.format("Handover of %s done (%s, %.2f s)", tostring(vehicle.serverVehicleString), reason, clock - h.started))
+end
+
+--- Moves a just spawned real vehicle onto its proxy's predicted pose, without resetting it.
+local function placeOnProxy(veh, p)
+	handoverFwd:set(veh:getDirectionVectorXYZ())
+	handoverFwd:setScaled(-1)
+	handoverUp:set(veh:getDirectionVectorUpXYZ())
+	local vehRot = quatFromDir(handoverFwd, handoverUp) -- position packet convention (see seedFromVehicle)
+	local diffRot = vehRot:inversed() * p.rrot
+	local refPos = vec3(veh:getPositionXYZ())
+	handoverCog:set(be:getObjectOOBBCenterXYZ(veh:getID()))
+	-- ref node offset from the box center, carried over into the target orientation
+	local offset = p.rrot * (vehRot:inversed() * (refPos - handoverCog))
+	local target = p.rpos + offset
+	local refNode = veh:getRefNodeId()
+	veh:setClusterPosRelRot(refNode, target.x, target.y, target.z, diffRot.x, diffRot.y, diffRot.z, diffRot.w)
+	veh:applyClusterVelocityScaleAdd(refNode, 0, p.vel.x, p.vel.y, p.vel.z) -- scale 0: replace the velocity
+	local turned = math.deg(2 * math.acos(math.min(1, math.abs(diffRot.w))))
+	return refPos:distance(target), turned
+end
+
+--- Called by MPVehicleGE.onVehicleReady for every remote vehicle.
+local function onRealVehicleReady(vehicle, veh)
+	local h = vehicle and vehicle.proxyHandover
+	if not h or h.state ~= "spawning" or not veh then return end
+	local p = vehicle.proxy
+	if p and p.hasData then
+		local ok, moved, turned = pcall(placeOnProxy, veh, p)
+		if ok then
+			log('D', 'MPProxyGE', string.format("Handover of %s: moved %.1f m, turned %.0f deg onto the proxy pose", tostring(vehicle.serverVehicleString), moved, turned))
+		else
+			log('W', 'MPProxyGE', "Placing the real vehicle onto its proxy failed: "..tostring(moved))
+		end
+	end
+	veh:queueLuaCommand("if positionVE then positionVE.onReset() end") -- drop stale smoothing state
+	veh:setMeshAlpha(0, "", false)
+	h.state = "syncing"
+	h.readyAt = clock
+	h.packets = vehicle.proxyPktCount or 0
+end
+
+local function updateHandovers(vehicles)
+	for _, v in pairs(vehicles) do
+		local h = v.proxyHandover
+		if h then
+			local veh = v.isSpawned and v.gameVehicleID and v.gameVehicleID > 0 and getObjectByID(v.gameVehicleID) or nil
+			if not v.isSpawned and not v.spawnQueue and not v.isProxy then
+				v.proxyHandover = nil
+			elseif h.state == "spawning" then
+				if veh then veh:setMeshAlpha(0, "", false) end -- hidden until ready
+				if clock - h.started > HANDOVER_SPAWN_TIMEOUT then finishHandover(v, "spawn timeout") end
+			elseif h.state == "syncing" then
+				if not veh then finishHandover(v, "vehicle gone")
+				else
+					local age = clock - h.readyAt
+					if (v.proxyPktCount or 0) > h.packets and age >= HANDOVER_MIN_HIDDEN then finishHandover(v, "synced")
+					elseif age > HANDOVER_SYNC_TIMEOUT then finishHandover(v, "no fresh packet")
+					else veh:setMeshAlpha(0, "", false) end
+				end
+			end
+		end
+	end
+end
+
+local function isInHandover(vehicle)
+	return vehicle ~= nil and vehicle.proxyHandover ~= nil
+end
+
 -- ============= SWAP MANAGER =============
 local function isEligibleForReal(v)
 	return v.isProxy and not v.isSpawned and not v.isDeleted and not v.isIllegal and not v.spawnQueue
@@ -531,10 +626,13 @@ local function decide(vehicles, activeVehID)
 	if (realCount < limit or nearestCand.proxyForceReal) and (clock >= nextSpawnAllowed or nearestCand.proxyForceReal) then
 		nextSpawnAllowed = clock + cfg.spawnInterval
 		if nearestCand.proxyColliderID then releaseCollider(nearestCand.proxyColliderID) end
-		if MPProxyMeshGE then MPProxyMeshGE.release(nearestCand.proxy) end
 		nearestCand.proxyForceReal = nil
+		startHandover(nearestCand) -- keeps the proxy drawn until the real vehicle is placed and synced
+		if not nearestCand.proxyHandover and MPProxyMeshGE then MPProxyMeshGE.release(nearestCand.proxy) end
 		if MPVehicleGE.promoteToReal(nearestCand.serverVehicleString) then
 			nearestCand.proxy.cooldownUntil = clock + cfg.cooldown
+		else
+			finishHandover(nearestCand, "spawn not started")
 		end
 	end
 end
@@ -575,8 +673,15 @@ local function update(dt, cameraPos, activeVehID)
 
 	for _, v in pairs(vehicles) do
 		local p = v.proxy
-		if v.isProxy and not v.isSpawned and not v.isLocal and p and p.hasData then
-			predict(v, p, dt)
+		if ((v.isProxy and not v.isSpawned) or v.proxyHandover) and not v.isLocal and p and p.hasData then
+			if v.proxyHandover then
+				-- the vehicle table position belongs to the real vehicle now, only move the proxy itself
+				tmpPosSave:set(v.position) tmpRotSave:set(v.rotation)
+				predict(v, p, dt)
+				v.position:set(tmpPosSave) v.rotation:set(tmpRotSave)
+			else
+				predict(v, p, dt)
+			end
 			if not v.proxyColliderID and not v.isDeleted then
 				local d2 = camPos:squaredDistance(p.rpos)
 				if d2 < drawDist2 then
@@ -598,6 +703,8 @@ local function update(dt, cameraPos, activeVehID)
 	end
 
 	stats.mesh, stats.box, stats.prism, stats.hidden = nMesh, nBox, nPrism, nHidden
+
+	updateHandovers(vehicles)
 
 	decisionTimer = decisionTimer - dt
 	local decideStart = perfTimer and perfTimer:stop() or 0
@@ -707,6 +814,9 @@ M.isCollider          = isCollider
 M.onColliderReady     = onColliderReady
 M.onColliderDestroyed = onColliderDestroyed
 M.onSettingsChanged   = onSettingsChanged
+M.onRealVehicleReady  = onRealVehicleReady
+M.isInHandover        = isInHandover
+M.finishHandover      = finishHandover
 M.onExtensionLoaded   = onExtensionLoaded
 M.onInit = function() setExtensionUnloadMode(M, "manual") end
 
