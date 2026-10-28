@@ -143,6 +143,10 @@ local currentJob = nil
 local fallbackOf = {}     -- [config key] = key of the model's default config (shown while the config builds)
 local defaultKeys = {}    -- [model] = key | false
 local prebuildJobs = {}   -- background builds of default configs (proxyPrebuildModels), only when jobs is empty
+-- prebuild progress: compile = paths to import once (.dae -> .cdae), counts for the summary, overlay text state
+local pb = { started = false, compile = {}, queued = 0, built = 0, compiled = 0, skipped = 0, done = 0, summary = false,
+	current = nil, verb = nil, showUntil = 0 }
+local cdaeCache = {} -- [dae path] = true/false: compiled .cdae seen on disk
 local importedPaths = {}  -- [dae path] = true once a TSStatic used it this session (engine keeps the shape loaded)
 local waitingLoad = {}    -- models with a ready shape waiting for the first-use interval (overlay)
 local clock = 0
@@ -1614,6 +1618,16 @@ local function runJob(job)
 	shape.state = "ready"
 end
 
+local function hasCdae(path)
+	local v = cdaeCache[path]
+	if v == nil then
+		local c = string.gsub(path, "%.dae$", ".cdae")
+		v = FS:fileExists("/temp" .. c) or FS:fileExists(c)
+		cdaeCache[path] = v
+	end
+	return v
+end
+
 local function stepJobs()
 	if not currentJob then
 		local job = table.remove(jobs, 1)
@@ -1621,6 +1635,7 @@ local function stepJobs()
 		if not job and cfg.prebuild then
 			job = table.remove(prebuildJobs, 1)
 			while job and shapes[job.key] and shapes[job.key].state ~= "queued" do job = table.remove(prebuildJobs, 1) end
+			if job then pb.current, pb.verb, pb.showUntil = job.model, "Prebuilding", clock + 0.5 end
 		end
 		if not job then return end
 		currentJob = { job = job, co = coroutine.create(job.wheelJob and runWheelJob or runJob), started = clock, maxStepMs = 0, maxStepPhase = "", frames = 0,
@@ -1649,6 +1664,17 @@ local function stepJobs()
 		elseif coroutine.status(currentJob.co) == "dead" then
 			local sh = not cj.job.wheelJob and shapes[cj.job.key] or nil
 			if sh and sh.state == "ready" then queueWheelMeshes(sh, cj.job.model) end
+			if cj.job.prebuild then
+				pb.done = pb.done + 1
+				if sh and sh.state == "ready" then
+					if not sh.fromCache then pb.built = pb.built + 1 end
+					for _, path in ipairs(sh.paths or {}) do
+						if not hasCdae(path) then pb.compile[#pb.compile + 1] = { path = path, model = cj.job.model } end
+					end
+				end
+				log('I', 'MPProxyMeshGE', string.format("Prebuild %d/%d %s: %s in %.1f ms over %d frames", pb.done, pb.queued, cj.job.model,
+					(sh and sh.state == "ready") and (sh.fromCache and "from disk cache" or "built") or "failed", cj.totalMs, cj.frames))
+			end
 			local phases = {}
 			for name, ms in pairs(cj.phaseMs) do if ms >= 0.05 then phases[#phases + 1] = string.format("%s %.1f", name, ms) end end
 			table.sort(phases)
@@ -1693,11 +1719,18 @@ local function requestDefault(model, toBackground)
 	local vcf = defaultConfig(model)
 	if not vcf then defaultKeys[model] = false return nil end
 	local key, parts = configKey(model, vcf)
+	if toBackground and not shapes[key] then
+		-- already built and compiled: nothing to do now (left out of defaultKeys so a later real request still queues it)
+		local meta = FS:fileExists(CACHE_DIR .. key .. ".json") and jsonReadFile(CACHE_DIR .. key .. ".json") or nil
+		local all = type(meta) == "table" and type(meta.paths) == "table" and #meta.paths > 0
+		for _, path in ipairs(all and meta.paths or {}) do if not hasCdae(path) then all = false end end
+		if all then pb.skipped = pb.skipped + 1 return nil end
+	end
 	defaultKeys[model] = key
 	if not shapes[key] then
 		shapes[key] = { state = "queued" }
 		local job = { key = key, model = model, parts = parts, vcf = vcf }
-		if toBackground then prebuildJobs[#prebuildJobs + 1] = job
+		if toBackground then job.prebuild = true pb.queued = pb.queued + 1 prebuildJobs[#prebuildJobs + 1] = job
 		elseif FS:fileExists(CACHE_DIR .. key .. ".json") then table.insert(jobs, 1, job)
 		else jobs[#jobs + 1] = job end
 	end
@@ -1744,16 +1777,6 @@ local function tierPaths(shape, tier)
 	return shape.tiers and (shape.tiers[tier] or shape.tiers[tostring(tier)]) or shape.paths
 end
 
-local cdaeCache = {} -- [dae path] = true/false: compiled .cdae seen on disk
-local function hasCdae(path)
-	local v = cdaeCache[path]
-	if v == nil then
-		local c = string.gsub(path, "%.dae$", ".cdae")
-		v = FS:fileExists("/temp" .. c) or FS:fileExists(c)
-		cdaeCache[path] = v
-	end
-	return v
-end
 
 -- nil when every file of the tier is loaded this session, else the wait between two such first uses
 local function importInterval(shape, tier)
@@ -2259,10 +2282,18 @@ end
 local overlayFlags = nil
 local function drawOverlay()
 	if not imgui or not imgui.Begin then return end
-	local current = currentJob and currentJob.job.model or jobs[1] and jobs[1].model or waitingLoad[1]
-	if not current then return end
-	local more = #jobs + #waitingLoad + (currentJob and 1 or 0) - 1
-	local text = "Loading vehicle " .. niceName(current) .. "..." .. (more > 0 and string.format(" (+%d more)", more) or "")
+	local cjob = currentJob and not currentJob.job.prebuild and currentJob.job or nil
+	local current = cjob and cjob.model or jobs[1] and jobs[1].model or waitingLoad[1]
+	local text
+	if current then
+		local more = #jobs + #waitingLoad + (cjob and 1 or 0) - 1
+		text = "Loading vehicle " .. niceName(current) .. "..." .. (more > 0 and string.format(" (+%d more)", more) or "")
+	elseif pb.current and (clock < pb.showUntil or #pb.compile > 0 or #prebuildJobs > 0 or (currentJob and currentJob.job.prebuild)) then
+		-- prebuild / compile: the current item stays up while the queue is not empty (and at least 0.5 s), no flicker
+		text = string.format("%s vehicle %s... (%d/%d)", pb.verb or "Prebuilding", niceName(pb.current), math.min(pb.done + 1, math.max(pb.queued, 1)), math.max(pb.queued, 1))
+		if pb.verb == "Compiling" then text = string.format("Compiling vehicle %s... (%d left)", niceName(pb.current), #pb.compile) end
+	end
+	if not text then return end
 	if not overlayFlags then
 		overlayFlags = imgui.flags(imgui.WindowFlags_NoTitleBar, imgui.WindowFlags_NoResize, imgui.WindowFlags_NoMove,
 			imgui.WindowFlags_NoScrollbar, imgui.WindowFlags_NoCollapse, imgui.WindowFlags_NoDocking, imgui.WindowFlags_NoInputs,
@@ -2367,7 +2398,6 @@ local function cleanOldCache()
 	if removed > 0 then log('I', 'MPProxyMeshGE', string.format("Removed %d old proxy mesh cache files (%.0f MB)", removed, bytes / 1048576)) end
 end
 
-local prebuildStarted = false
 
 local function onUpdate(dtReal)
 	clock = clock + (dtReal or 0)
@@ -2387,10 +2417,37 @@ local function onUpdate(dtReal)
 			if ms > buildStats.maxMs then buildStats.maxMs = ms end
 		end
 	end
+	-- prebuild: its own queue, kept going whenever enabled (stepJobs only takes it when nothing else is queued)
+	if cfg.prebuild and not currentJob and #jobs == 0 and #wheelJobs == 0 and #prebuildJobs > 0 then stepJobs() end
 	updatePreload()
-	if not preload then drawOverlay() end -- the loading screen shows progress during preload
-	if cfg.prebuild and not preload and not prebuildStarted and MPCoreNetwork and MPCoreNetwork.isMPSession and MPCoreNetwork.isMPSession() then
-		prebuildStarted = true
+	-- compile prebuilt / cached sets (.dae -> .cdae through the engine import): one per frame on the loading screen,
+	-- else paced like first uses and only when no proxy needs anything
+	local nc = pb.compile[1]
+	if nc then
+		local idle = not (currentJob and not currentJob.job.prebuild) and #jobs == 0 and #waitingLoad == 0
+		if preload or (idle and clock >= nextNewShapeAllowed) then
+			table.remove(pb.compile, 1)
+			if not importedPaths[nc.path] and not hasCdae(nc.path) then
+				local t = TIMER()
+				importedPaths[nc.path] = true
+				local id = takeStatic(nc.path)
+				if id then returnStatic(nc.path, id) end
+				cdaeCache[nc.path] = nil
+				pb.compiled = pb.compiled + 1
+				pb.current, pb.verb, pb.showUntil = nc.model, "Compiling", clock + 0.5
+				if not preload then nextNewShapeAllowed = clock + NEW_SHAPE_INTERVAL end
+				log('I', 'MPProxyMeshGE', string.format("Prebuild compile of %s (%s): %.1f ms, .cdae now %s%s", string.match(nc.path, "([^/]+)$") or nc.path,
+					nc.model, t:stop(), hasCdae(nc.path) and "on disk" or "not found yet", preload and ", loading screen" or ""))
+			end
+		end
+	end
+	drawOverlay() -- also on the loading screen (whether ImGui shows above the loading UI depends on the UI layering)
+	if pb.started and not pb.summary and #prebuildJobs == 0 and #pb.compile == 0 and not (currentJob and currentJob.job.prebuild) then
+		pb.summary = true
+		log('I', 'MPProxyMeshGE', string.format("Prebuild: %d models queued, %d built, %d compiled, %d skipped (cached)", pb.queued, pb.built, pb.compiled, pb.skipped))
+	end
+	if cfg.prebuild and not pb.started and MPCoreNetwork and MPCoreNetwork.isMPSession and MPCoreNetwork.isMPSession() then
+		pb.started = true
 		local ok, list = pcall(function() return core_vehicles.getModelList().models end) -- once per session
 		local n = 0
 		for name, info in pairs(ok and type(list) == "table" and list or {}) do
@@ -2433,7 +2490,8 @@ local function reset()
 	wheelFiles = {}
 	fallbackOf = {}
 	defaultKeys = {}
-	prebuildStarted = false
+	pb.started, pb.summary, pb.compile = false, false, {}
+	pb.queued, pb.built, pb.compiled, pb.skipped, pb.done, pb.current = 0, 0, 0, 0, 0, nil
 	currentJob = nil
 end
 
