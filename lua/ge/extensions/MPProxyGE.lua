@@ -29,12 +29,15 @@ local cfg = {
 	poolSize = 4,
 	colliderModel = "simple_traffic",
 	smoothHandover = true,
+	maxPredict = 0.3,
 }
 
 local DESPAWN_INTERVAL = 0.5   -- seconds between two real -> proxy swaps (despawns are cheap, but not free)
 local DECISION_INTERVAL = 0.25 -- seconds between two swap decision passes
 local CAP_SWAP_MARGIN = 50     -- a real vehicle is only evicted for the cap if a proxy is this much closer
-local MAX_EXTRAPOLATION = 0.6  -- seconds a packet is extrapolated at most
+local MAX_ACC = 100            -- m/s^2, cap of the acceleration worked out from two packets
+local MAX_RACC = 50            -- rad/s^2
+local OFFSET_SMOOTHING = 2     -- 1/s, how fast the sender clock offset follows new packets
 local SNAP_DISTANCE = 25       -- render position snaps instead of blending above this error
 local POS_BLEND = 12           -- 1/s, how fast the rendered pose converges to the prediction
 local DETAIL_DISTANCE = 600    -- full shaded box below, a single prism above
@@ -54,6 +57,7 @@ local function readSettings()
 	cfg.poolSize = math.max(0, math.floor(tonumber(settings.getValue("proxyColliderPoolSize", 4)) or 4))
 	cfg.colliderModel = settings.getValue("proxyColliderModel", "simple_traffic") or "simple_traffic"
 	cfg.smoothHandover = settings.getValue("proxySmoothHandover", true) ~= false
+	cfg.maxPredict = math.min(math.max(tonumber(settings.getValue("proxyMaxPrediction", 0.3)) or 0.3, 0.05), 2)
 end
 
 -- ============= DIMENSIONS =============
@@ -156,7 +160,8 @@ local function initProxy(vehicle, spawnData)
 	local p = vehicle.proxy
 	if not p then
 		p = {
-			pos = vec3(), rot = quat(), vel = vec3(), rvel = vec3(),
+			pos = vec3(), rot = quat(), vel = vec3(), rvel = vec3(), acc = vec3(), racc = vec3(), svel = vec3(),
+			tim = nil, offset = nil,
 			rpos = vec3(), rrot = quat(), t = clock, hasData = false, cooldownUntil = 0,
 		}
 		vehicle.proxy = p
@@ -194,14 +199,46 @@ local function initProxy(vehicle, spawnData)
 	return p
 end
 
+local ownPing = 0 -- seconds, our own round trip to the server (positionGE.setPing)
+local tmpVel, tmpRvel = vec3(), vec3()
+
+local function capLength(v, maxLen)
+	local l = v:length()
+	if l > maxLen then v:setScaled(maxLen / l) end
+end
+
 --- Called by positionGE for every decoded position packet of a vehicle without game object.
+-- The pose is predicted like positionVE does for real remote vehicles: the sender's clock (tim) is mapped onto
+-- ours with a smoothed offset (arrival time minus half of both pings), and the pose is moved on by velocity and
+-- the acceleration worked out from the last two packets.
 local function onPositionPacket(vehicle, decoded)
 	if not decoded or type(decoded.pos) ~= "table" or type(decoded.rot) ~= "table" then return end
 	local p = vehicle.proxy or initProxy(vehicle, nil)
+	local tim = tonumber(decoded.tim)
+	if tim and p.tim and tim < p.tim then
+		if tim > p.tim - 1 then return end -- late packet, an older one than what we have
+		p.tim, p.offset = nil, nil -- the sender's timer started over (vehicle reset)
+		p.acc:set(0,0,0) p.racc:set(0,0,0)
+	end
+	if type(decoded.vel) == "table" then tmpVel:set(decoded.vel[1] or 0, decoded.vel[2] or 0, decoded.vel[3] or 0) else tmpVel:set(0,0,0) end
+	if type(decoded.rvel) == "table" then tmpRvel:set(decoded.rvel[1] or 0, decoded.rvel[2] or 0, decoded.rvel[3] or 0) else tmpRvel:set(0,0,0) end
+	if tim and p.tim and p.hasData then
+		local remoteDt = math.max(tim - p.tim, 0.001)
+		p.acc:set(tmpVel) p.acc:setSub(p.vel) p.acc:setScaled(1 / remoteDt) capLength(p.acc, MAX_ACC)
+		p.racc:set(tmpRvel) p.racc:setSub(p.rvel) p.racc:setScaled(1 / remoteDt) capLength(p.racc, MAX_RACC)
+	else
+		p.acc:set(0,0,0) p.racc:set(0,0,0)
+	end
 	p.pos:set(decoded.pos[1], decoded.pos[2], decoded.pos[3])
 	p.rot:set(decoded.rot[1], decoded.rot[2], decoded.rot[3], decoded.rot[4])
-	if type(decoded.vel) == "table" then p.vel:set(decoded.vel[1], decoded.vel[2], decoded.vel[3]) else p.vel:set(0,0,0) end
-	if type(decoded.rvel) == "table" then p.rvel:set(decoded.rvel[1], decoded.rvel[2], decoded.rvel[3]) else p.rvel:set(0,0,0) end
+	p.vel:set(tmpVel)
+	p.rvel:set(tmpRvel)
+	if tim then
+		local offset = clock - tim - ownPing * 0.5 - (tonumber(decoded.ping) or 0) * 0.5
+		if not p.offset or math.abs(offset - p.offset) > 1 then p.offset = offset end
+		p.rawOffset = offset
+		p.tim = tim
+	end
 	p.t = clock
 	if not p.hasData then
 		p.rpos:set(p.pos)
@@ -221,6 +258,8 @@ local function seedFromVehicle(vehicle, veh)
 	p.rot:setFromDir(tmpV, axZ) -- same convention as the position packets (positionVE.getVehicleRotation)
 	p.vel:set(veh:getVelocityXYZ())
 	p.rvel:set(0,0,0)
+	p.acc:set(0,0,0) p.racc:set(0,0,0)
+	p.tim, p.offset = nil, nil
 	p.t = clock
 	p.rpos:set(p.pos)
 	p.rrot:set(p.rot)
@@ -235,6 +274,8 @@ local function snapProxy(vehicle, pos, rot)
 	if rot and (rot.w or rot[4]) then p.rot:set(rot.x or rot[1], rot.y or rot[2], rot.z or rot[3], rot.w or rot[4]) end
 	p.vel:set(0,0,0)
 	p.rvel:set(0,0,0)
+	p.acc:set(0,0,0) p.racc:set(0,0,0)
+	p.tim, p.offset = nil, nil
 	p.t = clock
 	p.rpos:set(p.pos)
 	p.rrot:set(p.rot)
@@ -254,12 +295,26 @@ end
 
 --- Dead reckoning + smoothing for one proxy. Writes vehicle.position / vehicle.rotation.
 local function predict(vehicle, p, dt)
-	local age = math.min(math.max(clock - p.t, 0), MAX_EXTRAPOLATION)
-	-- predicted position
-	tmpV:set(p.vel)
+	local maxPredict = cfg.maxPredict
+	local age
+	if p.tim and p.offset and p.rawOffset then
+		-- follow the clock offset slowly, so jitter in packet arrival does not shake the proxy
+		p.offset = p.offset + (p.rawOffset - p.offset) * math.min(1, dt * OFFSET_SMOOTHING)
+		age = clock - (p.tim + p.offset)
+	else
+		age = clock - p.t
+	end
+	age = math.min(math.max(age, -maxPredict), maxPredict)
+	local stale = clock - p.t > maxPredict -- no packets for a while: stand still where the prediction ended
+	-- predicted position: pos + vel t + acc t^2 / 2
+	tmpV:set(p.acc)
+	tmpV:setScaled(0.5 * age)
+	tmpV:setAdd(p.vel)
 	tmpV:setScaled(age)
 	tmpV:setAdd(p.pos)
-	-- predicted rotation, same formula as positionVE (rot * quatFromEuler(rvel * t))
+	if stale then p.svel:set(0,0,0) else p.svel:set(p.acc) p.svel:setScaled(age) p.svel:setAdd(p.vel) end
+	-- predicted rotation, same formula as positionVE (rot * quatFromEuler(rvel * t)); only the rotation velocity,
+	-- a noisy rvel would shake the proxy through the worked out angular acceleration
 	tmpQ:setFromEuler(p.rvel.x * age, p.rvel.y * age, p.rvel.z * age)
 	tmpQ:setMul2(p.rot, tmpQ)
 
@@ -507,7 +562,7 @@ local function placeOnProxy(veh, p)
 	local target = p.rpos + offset
 	local refNode = veh:getRefNodeId()
 	veh:setClusterPosRelRot(refNode, target.x, target.y, target.z, diffRot.x, diffRot.y, diffRot.z, diffRot.w)
-	veh:applyClusterVelocityScaleAdd(refNode, 0, p.vel.x, p.vel.y, p.vel.z) -- scale 0: replace the velocity
+	veh:applyClusterVelocityScaleAdd(refNode, 0, p.svel.x, p.svel.y, p.svel.z) -- scale 0: replace the velocity
 	local turned = math.deg(2 * math.acos(math.min(1, math.abs(diffRot.w))))
 	return refPos:distance(target), turned
 end
@@ -773,6 +828,12 @@ local function requestReal(vehicle)
 	return false
 end
 
+--- Our own ping in milliseconds (positionGE.setPing), used to map the senders' clocks onto ours.
+local function setOwnPing(ping)
+	local s = (tonumber(ping) or 0) / 1000
+	if s > 0 and s < 5 then ownPing = s end
+end
+
 local function isEnabled()
 	return cfg.enabled
 end
@@ -816,6 +877,7 @@ M.onColliderDestroyed = onColliderDestroyed
 M.onSettingsChanged   = onSettingsChanged
 M.onRealVehicleReady  = onRealVehicleReady
 M.isInHandover        = isInHandover
+M.setOwnPing          = setOwnPing
 M.finishHandover      = finishHandover
 M.onExtensionLoaded   = onExtensionLoaded
 M.onInit = function() setExtensionUnloadMode(M, "manual") end

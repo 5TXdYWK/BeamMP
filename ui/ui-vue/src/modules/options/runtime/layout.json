@@ -5396,6 +5396,35 @@
             "tooltip",
             "setting"
           ]
+        },
+        {
+          "version": "0.38",
+          "label": "ui.options.beammp.proxyMaxPrediction",
+          "tooltip": "ui.options.beammp.proxyMaxPrediction.tooltip",
+          "setting": "proxyMaxPrediction",
+          "interactive": true,
+          "condition_always_off": false,
+          "condition_not_shipping": false,
+          "condition_simplemenu": "",
+          "condition_visible": "",
+          "condition_enabled": "beammpEnableProxyVehicles",
+          "itemType": "slider",
+          "component": "BngSlider",
+          "separateLabel": true,
+          "min": 0.05,
+          "max": 1.0,
+          "step": 0.05,
+          "compact": false,
+          "valueMultiplier": 1,
+          "unit": "s",
+          "lua": "",
+          "basic_interaction": false,
+          "search": [
+            "label",
+            "caption",
+            "tooltip",
+            "setting"
+          ]
         }
       ],
       "reroute": "",

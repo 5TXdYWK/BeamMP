@@ -63,6 +63,31 @@ local function sendVehiclePosRot(data, gameVehicleID)
 end
 
 
+-- Cheap parse of a position packet for vehicles that are drawn as proxies (no VE side to do it), every
+-- packet of every proxy is decoded, so this avoids a full jsonDecode. Falls back to jsonDecode if the
+-- layout is not the expected one.
+local NUM = "%s*([^,%s%]}]+)%s*"
+local VEC3_PAT = "%[" .. NUM .. "," .. NUM .. "," .. NUM .. "%]"
+local QUAT_PAT = "%[" .. NUM .. "," .. NUM .. "," .. NUM .. "," .. NUM .. "%]"
+local POS_PAT, ROT_PAT = '"pos"%s*:%s*' .. VEC3_PAT, '"rot"%s*:%s*' .. QUAT_PAT
+local VEL_PAT, RVEL_PAT = '"vel"%s*:%s*' .. VEC3_PAT, '"rvel"%s*:%s*' .. VEC3_PAT
+local TIM_PAT, PING_PAT = '"tim"%s*:' .. NUM, '"ping"%s*:' .. NUM
+local function parsePosPacket(data)
+	local match, num = string.match, tonumber
+	local x, y, z = match(data, POS_PAT)
+	local rx, ry, rz, rw = match(data, ROT_PAT)
+	x, y, z, rx, ry, rz, rw = num(x), num(y), num(z), num(rx), num(ry), num(rz), num(rw)
+	local tim = num(match(data, TIM_PAT))
+	if not (x and y and z and rx and ry and rz and rw and tim) then return jsonDecode(data) end
+	local vx, vy, vz = match(data, VEL_PAT)
+	local wx, wy, wz = match(data, RVEL_PAT)
+	return {
+		pos = {x, y, z}, rot = {rx, ry, rz, rw},
+		vel = {num(vx) or 0, num(vy) or 0, num(vz) or 0}, rvel = {num(wx) or 0, num(wy) or 0, num(wz) or 0},
+		tim = tim, ping = num(match(data, PING_PAT)) or 0,
+	}
+end
+
 --- This function serves to send the position data received for another players vehicle from GE to VE, where it is handled.
 -- @param encoded json The data to be applied to a vehicle, needs to contain "pos", "rot", "vel", "rvel", "ping" and "tim"
 -- @param serverVehicleID string The VehicleID according to the server.
@@ -87,7 +112,8 @@ local function applyPos(data, serverVehicleID)
 
 	local owner = vehicle:getOwner()
 	if owner and not owner.hasUpdatedPing or not veh or inHandover then -- only update twice a second per player unless the vehicle is not spawned, spawned vehicles already gets their position and rotation in MPvehicleGE
-		local decoded = jsonDecode(data)
+		local decoded = ((not veh) or inHandover) and parsePosPacket(data) or jsonDecode(data)
+		if not decoded then return end
 		local deltaDt = math.max((decoded.tim or 0) - (vehicle.lastDt or 0), 0.001)
 		vehicle.lastDt = decoded.tim
 
@@ -206,6 +232,7 @@ end
 --- This function is for setting a ping value for use in the math of predition of the positions 
 -- @param ping number The Ping value
 local function setPing(ping)
+	if MPProxyGE then MPProxyGE.setOwnPing(ping) end
 	local p = ping/1000
 	be:queueAllObjectLua("if positionVE then positionVE.setPing("..p..") end")
 end
@@ -314,6 +341,7 @@ M.handle                      = handle
 M.sendVehiclePosRot           = sendVehiclePosRot
 M.setPosition                 = setPosition
 M.setPositionRotationVelocity = setPositionRotationVelocity
+M.parsePosPacket = parsePosPacket
 M.setPing                     = setPing
 M.setActualSimSpeed           = setActualSimSpeed
 M.getActualSimSpeed           = getActualSimSpeed

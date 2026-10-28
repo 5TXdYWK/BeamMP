@@ -56,6 +56,7 @@
   "proxyMaxMeshProxies"         : [ "local", 48 ],
   "proxyMeshWheels"             : [ "local", true ],
   "proxySmoothHandover"         : [ "local", true ],
+  "proxyMaxPrediction"          : [ "local", 0.3 ],
   "showPlayerIDs"               : [ "cloud", true  ],
   "licensePlateUsesPlayerName"  : [ "cloud", true ],
   "protectConfigFromClone"      : [ "cloud", false ],
