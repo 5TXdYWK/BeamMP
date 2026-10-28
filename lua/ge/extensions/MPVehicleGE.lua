@@ -1141,6 +1141,7 @@ function Vehicle:delete()
 	if self.serverVehicleString then vehicles[self.serverVehicleString] = nil end
 
 	players_vehicle_configs[self.serverVehicleString] = nil
+	if self.proxy and MPProxyMeshGE then MPProxyMeshGE.release(self.proxy) end -- return pooled proxy meshes
 
 	self = nil
 end
@@ -1553,6 +1554,7 @@ local function applyVehSpawn(event)
 		vehicle.gameVehicleID = spawnedVehID
 		vehicle.isSpawned = true
 		vehicle.isProxy = false
+		if vehicle.proxy and MPProxyMeshGE then MPProxyMeshGE.release(vehicle.proxy) end
 		vehicle.jbeam = vehicleName
 		vehicle.protected = protected
 		vehicle.absMode = absMode

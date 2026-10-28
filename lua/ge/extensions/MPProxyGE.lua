@@ -163,6 +163,15 @@ local function initProxy(vehicle, spawnData)
 	p.r, p.g, p.b = c.r, c.g, c.b
 	p.vcfPaint = spawnData and spawnData.vcf and spawnData.vcf.paints and spawnData.vcf.paints[1] or nil
 	p.validModel = info.valid
+	p.dimsFromMesh = nil
+	if spawnData and spawnData.vcf then
+		p.vcf = spawnData.vcf
+		if MPProxyMeshGE and info.valid then
+			local key = MPProxyMeshGE.request(spawnData.jbm or vehicle.jbeam, spawnData.vcf) -- async, box until ready
+			if key ~= p.meshKey then MPProxyMeshGE.release(p) end
+			p.meshKey = key
+		end
+	end
 	return p
 end
 
@@ -341,6 +350,7 @@ local function assignCollider(gameVehicleID, vehicle)
 	if not c or not veh or not p then return end
 	c.serverVehicleID = vehicle.serverVehicleString
 	vehicle.proxyColliderID = gameVehicleID
+	if MPProxyMeshGE then MPProxyMeshGE.release(p) end
 	veh:setActive(1)
 	-- same rotation convention as the reset packets (onServerVehicleResetted)
 	veh:setPositionRotation(p.rpos.x, p.rpos.y, p.rpos.z, p.rrot.x, p.rrot.y, p.rrot.z, p.rrot.w)
@@ -494,6 +504,7 @@ local function decide(vehicles, activeVehID)
 	if (realCount < limit or nearestCand.proxyForceReal) and (clock >= nextSpawnAllowed or nearestCand.proxyForceReal) then
 		nextSpawnAllowed = clock + cfg.spawnInterval
 		if nearestCand.proxyColliderID then releaseCollider(nearestCand.proxyColliderID) end
+		if MPProxyMeshGE then MPProxyMeshGE.release(nearestCand.proxy) end
 		nearestCand.proxyForceReal = nil
 		if MPVehicleGE.promoteToReal(nearestCand.serverVehicleString) then
 			nearestCand.proxy.cooldownUntil = clock + cfg.cooldown
@@ -524,7 +535,13 @@ local function update(dt, cameraPos, activeVehID)
 			predict(v, p, dt)
 			if not v.proxyColliderID and not v.isDeleted then
 				local d2 = camPos:squaredDistance(p.rpos)
-				if d2 < drawDist2 then drawProxy(p, camPos, math.sqrt(d2)) end
+				if d2 < drawDist2 then
+					local dist = math.sqrt(d2)
+					-- tier 1: real body meshes (MPProxyMeshGE), tier 2: box, tier 3 (beyond drawDist): nametag only
+					if not (p.meshObjects and MPProxyMeshGE and MPProxyMeshGE.drawProxy(p, dist)) then
+						drawProxy(p, camPos, dist)
+					end
+				end
 			end
 		end
 	end
@@ -534,6 +551,19 @@ local function update(dt, cameraPos, activeVehID)
 		decisionTimer = DECISION_INTERVAL
 		decide(vehicles, activeVehID)
 		updateColliders(vehicles)
+		if MPProxyMeshGE then
+			MPProxyMeshGE.decide(vehicles, refPos)
+			for _, v in pairs(vehicles) do -- use the real mesh bounds for the box fallback once known
+				local p = v.proxy
+				if p and p.meshKey and not p.dimsFromMesh then
+					local shape = MPProxyMeshGE.getShape(p.meshKey)
+					if shape and shape.state == "ready" and shape.minX then
+						p.L, p.W, p.H = shape.maxY - shape.minY, shape.maxX - shape.minX, shape.maxZ - (shape.groundZ or shape.minZ)
+						p.dimsFromMesh = true
+					end
+				end
+			end
+		end
 	end
 end
 
@@ -557,6 +587,7 @@ end
 
 local function reset()
 	removeAllColliders()
+	if MPProxyMeshGE then MPProxyMeshGE.reset() end
 	nextSpawnAllowed, nextDespawnAllowed, nextColliderSpawnAllowed = 0, 0, 0
 end
 

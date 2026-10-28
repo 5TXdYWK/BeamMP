@@ -277,6 +277,9 @@ export default function (deps) {
     beammpEnableProxyVehicles(values) {
         return values.enableProxyVehicles!==false
     },
+    beammpProxyMesh(values) {
+        return values.enableProxyVehicles!==false && values.proxyMeshEnabled!==false
+    },
     beammpProxyCollision(values) {
         return values.enableProxyVehicles!==false && values.proxyCollision===true
     },
