@@ -925,6 +925,7 @@ local function scanDae(filename, keepGeom, onNode, geomsOnly, header, geoms, kep
 	local find, sub, match = string.find, string.sub, string.match
 	local mode = "header"
 	local buf, at = "", 1 -- unconsumed data is buf[at..]; buf is only rebuilt once per read chunk
+	local pendGeom = nil -- a geometry longer than a chunk, collected in pieces
 	local eof = false
 	while true do
 		if not eof then
@@ -975,11 +976,45 @@ local function scanDae(filename, keepGeom, onNode, geomsOnly, header, geoms, kep
 						at = e + 11
 						progressed = true
 						checkBudget()
+					elseif #buf - s > READ_CHUNK then
+						-- long geometry: collect it in pieces (no re-copy and re-search of the growing buffer per chunk)
+						local id, name = match(buf, '^<geometry id="([^"]*)" name="([^"]*)"', s)
+						local keep = id and keepGeom(id, name)
+						pendGeom = { id = id, keep = keep, parts = keep and { sub(buf, s, #buf - 11) } or nil }
+						at = #buf - 10 -- the last bytes stay, "</geometry>" may start there
+						mode = "ingeom"
 					else
 						at = s -- wait for the rest of this geometry
 					end
 				elseif #buf - at > 32 then
 					at = #buf - 31
+				end
+			elseif mode == "ingeom" then
+				local e = find(buf, "</geometry>", at, true)
+				local pg = pendGeom
+				if e then
+					if pg.keep then
+						pg.parts[#pg.parts + 1] = sub(buf, at, e + 10)
+						local block = table.concat(pg.parts)
+						geoms[#geoms + 1] = block
+						keptIds[pg.id] = true
+						checkBudget()
+						if bbox then
+							local gb = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
+							updateBBox(gb, block)
+							checkBudget()
+							gb.tris = countTriangles(block)
+							bbox[pg.id] = gb
+						end
+					end
+					pendGeom = nil
+					at = e + 11
+					mode = "geoms"
+					progressed = true
+					checkBudget()
+				elseif #buf - at > 11 then
+					if pg.keep then pg.parts[#pg.parts + 1] = sub(buf, at, #buf - 11) end
+					at = #buf - 10
 				end
 			elseif mode == "prescene" then
 				local s = find(buf, "<visual_scene", at, true)
@@ -1125,14 +1160,49 @@ end
 -- All filtered parts of one config go into a single .dae, so the engine imports one shape per mesh set.
 -- ids are prefixed per source file (Blender names like "Mesh_038-mesh" repeat across files), materials,
 -- effects and images are deduplicated by id. Files with a different <unit>/<up_axis> get their own output.
-local function prefixIds(block, pre, refsToo)
-	block = string.gsub(block, ' id="', ' id="' .. pre)
-	if refsToo then
-		block = string.gsub(block, '="#', '="#' .. pre) -- geometry internal references (sources, vertices)
-	else
-		block = string.gsub(block, 'url="#', 'url="#' .. pre) -- node -> geometry, material targets stay
+local function prefixIds(block, pre, refsToo, out)
+	-- big geometries (several MB) in slices cut at a '<' (the patterns hold no '<', so none straddles a cut),
+	-- appended to out with a budget check between slices instead of one long gsub over the whole block
+	local gsub, find, sub = string.gsub, string.find, string.sub
+	local n, at = #block, 1
+	while at <= n do
+		local cut = at + READ_CHUNK <= n and (find(block, "<", at + READ_CHUNK, true) or n + 1) or n + 1
+		local piece = sub(block, at, cut - 1)
+		piece = gsub(piece, ' id="', ' id="' .. pre)
+		if refsToo then
+			piece = gsub(piece, '="#', '="#' .. pre) -- geometry internal references (sources, vertices)
+		else
+			piece = gsub(piece, 'url="#', 'url="#' .. pre) -- node -> geometry, material targets stay
+		end
+		out[#out + 1] = piece
+		at = cut
+		checkBudget()
 	end
-	return block
+end
+
+-- writes the pieces to path.tmp across frames (budget checks between writes), then renames it into place
+local function writePieces(path, pieces)
+	local tmp = path .. ".tmp"
+	local f = io.open(tmp, "wb")
+	if not f then return writeFile(path, table.concat(pieces)) end -- fallback: one step
+	local buf, size = {}, 0
+	for i = 1, #pieces do
+		buf[#buf + 1] = pieces[i]
+		size = size + #pieces[i]
+		if size >= READ_CHUNK * 2 or i == #pieces then
+			if not f:write(table.concat(buf)) then f:close() FS:removeFile(tmp) return false end
+			buf, size = {}, 0
+			checkBudget()
+		end
+	end
+	f:close()
+	if FS:fileExists(path) then FS:removeFile(path) end
+	if FS:renameFile(tmp, path) ~= 0 and not FS:fileExists(path) then -- rename failed: copy through memory once
+		local ok = writeFile(path, table.concat(pieces))
+		FS:removeFile(tmp)
+		return ok
+	end
+	return FS:fileExists(path)
 end
 
 local function collectLib(header, lib, tag, seen, out)
@@ -1159,25 +1229,25 @@ local function mergeDae(list)
 	out[#out + 1] = "<library_geometries>\n"
 	for i, part in ipairs(list) do
 		local pre = "f" .. i .. "_"
-		for _, g in ipairs(part.geoms) do out[#out + 1] = prefixIds(g, pre, true) out[#out + 1] = "\n" checkBudget() end
+		for _, g in ipairs(part.geoms) do prefixIds(g, pre, true, out) out[#out + 1] = "\n" checkBudget() end
 	end
 	out[#out + 1] = '</library_geometries>\n<library_visual_scenes>\n<visual_scene id="Scene" name="Scene">\n'
 	for i, part in ipairs(list) do
 		local pre = "f" .. i .. "_"
-		for _, n in ipairs(part.nodes) do out[#out + 1] = prefixIds(n, pre, false) end
+		for _, n in ipairs(part.nodes) do prefixIds(n, pre, false, out) end
 		checkBudget()
 	end
 	out[#out + 1] = '</visual_scene>\n</library_visual_scenes>\n<scene>\n<instance_visual_scene url="#Scene"/>\n</scene>\n</COLLADA>\n'
-	return table.concat(out)
+	return out -- pieces, written by writePieces
 end
 
 
-local MAX_LEN, MAX_WIDTH, MAX_HEIGHT = 25, 6, 6
+-- plausible vehicle bounds: length up to 25 m, width and height up to 6 m
 local function validBBox(b)
 	if type(b) ~= "table" or #b ~= 6 then return false end
 	for i = 1, 6 do if type(b[i]) ~= "number" or b[i] ~= b[i] or b[i] == math.huge or b[i] == -math.huge then return false end end
 	local w, l, h = b[4] - b[1], b[5] - b[2], b[6] - b[3]
-	return w > 0.1 and l > 0.1 and h > 0.1 and w <= MAX_WIDTH and l <= MAX_LEN and h <= MAX_HEIGHT
+	return w > 0.1 and l > 0.1 and h > 0.1 and w <= 6 and l <= 25 and h <= 6
 		and math.abs(b[1] + b[4]) < 20 and math.abs(b[2] + b[5]) < 30 -- roughly centered on the jbeam origin
 end
 
@@ -1285,8 +1355,11 @@ local function sceneNodeNames(file, out)
 	f:close()
 	if not text then return end
 	local sceneAt = string.find(text, "<visual_scene", 1, true) or 1
+	local n = 0
 	for name in string.gmatch(string.sub(text, sceneAt), '<node [^>]-name="([^"]+)"') do
 		if out[name] == nil then out[name] = file end
+		n = n + 1
+		if n >= 200 then n = 0 checkBudget() end
 	end
 	checkBudget()
 end
@@ -1426,7 +1499,7 @@ local function runWheelJob(job)
 	FS:directoryCreate(CACHE_DIR, true)
 	local text = mergeDae(order)
 	coroutine.yield()
-	if not writeFile(job.key, text) then wheelFiles[job.key] = "failed" return end
+	if not writePieces(job.key, text) then wheelFiles[job.key] = "failed" return end
 	text = nil
 	setPhase("materials")
 	for _, g in ipairs(order) do loadMaterialsNear(g.file) end
@@ -1580,8 +1653,8 @@ local function runJob(job)
 					setPhase("merge")
 					local text = mergeDae(lists)
 					coroutine.yield()
-					setPhase("write") -- table.concat + writeFile of one file: one step, measured as the worst step
-					if writeFile(out, text) then tiers[t][#tiers[t] + 1] = out paths[#paths + 1] = out end
+					setPhase("write") -- streamed in slices, budget checks between them
+					if writePieces(out, text) then tiers[t][#tiers[t] + 1] = out paths[#paths + 1] = out end
 					text = nil
 					coroutine.yield()
 				end
