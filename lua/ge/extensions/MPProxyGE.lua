@@ -1435,6 +1435,7 @@ end
 -- ============= SWAP MANAGER =============
 local function isEligibleForReal(v)
 	return v.isProxy and not v.isSpawned and not v.isDeleted and not v.isIllegal and not v.spawnQueue
+		and (not v.proxyUserUnloaded or v.proxyForceReal) -- removed by the user: only when asked for again
 		and v.proxy and v.proxy.validModel ~= false and MPVehicleGE.hasSpawnData(v.serverVehicleString)
 end
 
@@ -1659,6 +1660,7 @@ local function requestReal(vehicle)
 		return true
 	end
 	if vehicle and vehicle.isProxy and not vehicle.isSpawned then
+		vehicle.proxyUserUnloaded = nil -- asked for (Tab, spectate, restore): normal rules again
 		vehicle.proxyForceReal = true
 		decisionTimer = 0
 		return true

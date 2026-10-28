@@ -1742,6 +1742,7 @@ local function spawnDestroyedVehicles(serverVehID)
 		end
 		vehicles[serverVehID].isDeleted = false
 		vehicles[serverVehID].isProxy = true
+		vehicles[serverVehID].proxyUserUnloaded = nil
 		MPProxyGE.initProxy(vehicles[serverVehID], vehdata)
 		UI.showNotification('Restored '..vehicles[serverVehID].ownerName.."'s "..tostring(vehicles[serverVehID].jbeam), ''..serverVehID..'respawn', 'directions_car')
 		return
@@ -1948,6 +1949,27 @@ local function onVehicleDestroyed(gameVehicleID)
 
 		if not vehicle then return end
 		local serverVehicleID = vehicle.serverVehicleString -- Get the serverVehicleID
+
+		-- proxies replace the "deleted" blob: a remote vehicle removed here (ctrl+delete, the game's remove, ...) stays
+		-- tracked as a proxy. Nothing is sent to the server (only own vehicles send a delete), and it is marked as
+		-- unloaded by the user so it is not spawned for real again until asked for (Tab, spectate, restore)
+		if onVehicleDestroyedAllowed and not vehicle.isLocal and serverVehicleID and MPProxyGE and MPProxyGE.isEnabled()
+			and players_vehicle_configs[serverVehicleID] and not vehicle.isIllegal then
+			if vehiclesMap[gameVehicleID] then vehiclesMap[gameVehicleID] = nil end
+			vehicle.gameVehicleID = -1
+			vehicle.isSpawned = false
+			vehicle.isDeleted = false
+			vehicle.isProxy = true
+			vehicle.vehicleHeight = nil
+			local hadQueue = vehicle.spawnQueue or vehicle.editQueue
+			vehicle.spawnQueue, vehicle.editQueue = nil, nil -- the stored config already holds queued edits
+			vehicle.proxyHandover = nil
+			vehicle.proxyUserUnloaded = true
+			if hadQueue then UI.updateQueue(getQueueCounts()) end
+			MPProxyGE.initProxy(vehicle, players_vehicle_configs[serverVehicleID])
+			log('I', 'onVehicleDestroyed', string.format("Vehicle %i (%s) removed by local player, kept as a proxy (user unloaded)", gameVehicleID, serverVehicleID))
+			return
+		end
 
 		vehicle.isSpawned = false
 		vehicle.isDeleted = true
