@@ -187,11 +187,17 @@ end
 -- beams, triangles of a body) took tens of ms in one jsonDecode. Strings, // and /* */ comments are skipped,
 -- out[partName] = text of the part's flexbodies array (decoded alone, it is small). Returns false if the text
 -- did not look like a jbeam (the caller then decodes the whole file).
-local function extractFlexbodies(text, out, sections)
+-- array sections read for the wheel placement (wheelSecs[partName][key] = array text); nodes only of parts
+-- that also have a wheel section (hubs, wheels, suspension), body node lists are big and not needed
+local WHEEL_KEYS = { slots = true, slots2 = true, pressureWheels = true, hubWheels = true, variables = true, nodes = true }
+
+local function extractFlexbodies(text, out, sections, wheelSecs)
 	local find, sub, byte, match = string.find, string.sub, string.byte, string.match
 	local pos, depth, n = 1, 0, 0
 	local partName, flexStart = nil, nil
 	local secStart, secKey = nil, nil -- engine / sound sections (sections[partName][key] = object text)
+	local arrStart, arrKey = nil, nil -- wheel related array sections
+	local partSecs, nodesFrom, nodesTo = nil, nil, nil
 	local lastString, lastDepth, lastEnd = nil, -1, 0
 	while true do
 		local s = find(text, '[{}%[%]"/]', pos)
@@ -214,8 +220,9 @@ local function extractFlexbodies(text, out, sections)
 		elseif c == 123 or c == 91 then
 			depth = depth + 1
 			local isKey = lastString and lastDepth == depth - 1 and match(sub(text, lastEnd + 1, s - 1), "^%s*:%s*$")
-			if depth == 2 and c == 123 then partName = isKey and lastString or nil
+			if depth == 2 and c == 123 then partName = isKey and lastString or nil partSecs, nodesFrom = nil, nil
 			elseif depth == 3 and c == 91 and isKey and lastString == "flexbodies" and partName then flexStart = s
+			elseif depth == 3 and c == 91 and isKey and partName and wheelSecs and WHEEL_KEYS[lastString] then arrStart, arrKey = s, lastString
 			elseif depth == 3 and c == 123 and isKey and partName and sections
 				and (lastString == "mainEngine" or sub(lastString, 1, 11) == "soundConfig") then secStart, secKey = s, lastString end
 			lastString = nil
@@ -227,7 +234,18 @@ local function extractFlexbodies(text, out, sections)
 				sections[partName][secKey] = sub(text, secStart, s)
 				secStart = nil
 			end
-			if depth == 2 then partName = nil end
+			if depth == 3 and arrStart and c == 93 then
+				if arrKey == "nodes" then nodesFrom, nodesTo = arrStart, s
+				else partSecs = partSecs or {} partSecs[arrKey] = sub(text, arrStart, s) end
+				arrStart = nil
+			end
+			if depth == 2 then
+				if partSecs then
+					if nodesFrom and (partSecs.pressureWheels or partSecs.hubWheels) then partSecs.nodes = sub(text, nodesFrom, nodesTo) end
+					wheelSecs[partName] = partSecs
+				end
+				partName, partSecs, nodesFrom = nil, nil, nil
+			end
 			depth = depth - 1
 			if depth < 0 then return false end
 			lastString = nil
@@ -243,7 +261,7 @@ end
 local ENGINE_FIELDS = { idleRPM = true, maxRPM = true, revLimiterRPM = true, soundConfig = true, soundConfigExhaust = true, requiredEnergyType = true }
 local SOUND_FIELDS = { sampleName = true, sampleFolder = true, mainGain = true, onLoadGain = true, offLoadGain = true,
 	intakeMuffling = true, exhaustAudioMufflingBaseCoef = true }
-local ENGINE_INDEX_VERSION = 1 -- part index files without this are rebuilt once
+local ENGINE_INDEX_VERSION = 2 -- part index files without this are rebuilt once (2: wheel sections)
 
 local function keepFields(decoded, fields)
 	local out, any = {}, false
@@ -271,6 +289,130 @@ end
 
 local engineIndex = {} -- [model] = engine sections by part (see addEngineSections)
 
+-- ============= WHEEL SECTIONS (compact, for the wheel placement) =============
+local WHEEL_OPTS = { radius = true, tireWidth = true, hubRadius = true, hubWidth = true, wheelOffset = true, offsetFromNode = true }
+local wheelIndex = {}         -- [model] = { [partName] = compact wheel data } (model and /vehicles/common/<model>/)
+local commonWheelIndex = nil  -- same for the shared tire / wheel / hubcap folders of /vehicles/common/
+local COMMON_WHEEL_DIRS = { "tires", "wheels", "wheels_square", "hubcaps" }
+
+local function scalar(v) return (type(v) == "number" or type(v) == "string") and v or nil end
+local function vec3Raw(o) return type(o) == "table" and { scalar(o.x) or 0, scalar(o.y) or 0, scalar(o.z) or 0 } or false end
+
+local function headerIndex(row, names)
+	local idx = {}
+	if type(row) ~= "table" then return idx end
+	for i, v in ipairs(row) do if names[v] then idx[v] = i end end
+	return idx
+end
+
+-- slots (child slot types / names, slot nodeOffset), variable defaults, wheel rows and options in order,
+-- and node positions with their nodeOffset modifiers
+local function compactWheelPart(secs, filename)
+	local function dec(key)
+		local t = secs[key]
+		if not t then return nil end
+		local ok, d = pcall(jsonDecode, t, filename)
+		checkBudget()
+		return ok and type(d) == "table" and d or nil
+	end
+	local out, any = {}, false
+	local is2 = secs.slots2 ~= nil
+	local sl = dec(is2 and "slots2" or "slots")
+	if sl then
+		local list = {}
+		for _, row in ipairs(sl) do
+			if type(row) == "table" and type(row[1]) == "string" and row[1] ~= "type" and row[1] ~= "name" then
+				local e = { n = row[1], t = row[1] }
+				if is2 then local a = row[2] e.t = type(a) == "table" and a[1] or (type(a) == "string" and a) or row[1] end
+				for i = 2, #row do
+					if type(row[i]) == "table" and row[i].nodeOffset then e.o = vec3Raw(row[i].nodeOffset) end
+				end
+				list[#list + 1] = e
+			end
+		end
+		if #list > 0 then out.slots = list any = true end
+	end
+	local vars = dec("variables")
+	if vars then
+		local h = headerIndex(vars[1], { name = true, default = true })
+		local di = h.default or 5
+		local v = {}
+		for i, row in ipairs(vars) do
+			if i > 1 and type(row) == "table" and type(row[1]) == "string" and scalar(row[di]) then v[row[1]] = row[di] any = true end
+		end
+		if any then out.vars = v end
+	end
+	local pw = dec("pressureWheels") or dec("hubWheels")
+	if pw then
+		local h = headerIndex(pw[1], { ["node1:"] = true, ["node2:"] = true, wheelDir = true })
+		local list = {}
+		for i, row in ipairs(pw) do
+			if type(row) == "table" then
+				if row[1] == nil then -- options
+					local o, has = {}, false
+					for k in pairs(WHEEL_OPTS) do if scalar(row[k]) then o[k] = row[k] has = true end end
+					if has then list[#list + 1] = { o = o } end
+				elseif i > 1 and type(row[1]) == "string" and h["node1:"] and h["node2:"] then
+					local last = row[#row]
+					list[#list + 1] = { w = row[1], a = row[h["node1:"]], b = row[h["node2:"]], d = tonumber(row[h.wheelDir or 0]) or 1,
+						s = type(last) == "table" and (last["steerAxisUp:"] ~= nil or last.steerAxisUp ~= nil) or nil }
+				end
+			end
+		end
+		if #list > 0 then out.pw = list any = true end
+	end
+	local nodes = dec("nodes")
+	if nodes and out.pw then
+		local list = {}
+		for _, row in ipairs(nodes) do
+			if type(row) == "table" then
+				if row[1] == nil then
+					if row.nodeOffset ~= nil then list[#list + 1] = { off = vec3Raw(row.nodeOffset) } end
+				elseif type(row[1]) == "string" and row[1] ~= "id" and scalar(row[2]) then
+					list[#list + 1] = { row[1], scalar(row[2]), scalar(row[3]), scalar(row[4]) }
+				end
+			end
+		end
+		if #list > 0 then out.nodes = list end
+	end
+	return any and out or nil
+end
+
+local function addWheelParts(into, wheelSecs, filename)
+	for partName, secs in pairs(wheelSecs) do
+		local c = compactWheelPart(secs, filename)
+		if c then into[partName] = c end
+	end
+end
+
+-- the shared tire / wheel folders, once (disk cached, rebuilt when the game version or file count changes)
+local function buildCommonWheelIndex()
+	local files = {}
+	for _, dir in ipairs(COMMON_WHEEL_DIRS) do
+		for _, f in ipairs(FS:findFiles("/vehicles/common/" .. dir .. "/", "*.jbeam", -1, false, false) or {}) do files[#files + 1] = f end
+		checkBudget()
+	end
+	local sig = tostring(beamng_version or "?") .. "|" .. #files .. "|" .. ENGINE_INDEX_VERSION
+	local diskFile = CACHE_DIR .. "common_" .. CACHE_VERSION .. "_wheels.json"
+	local cached = FS:fileExists(diskFile) and jsonReadFile(diskFile) or nil
+	if cached and cached.sig == sig and type(cached.parts) == "table" then return cached.parts end
+	local parts, flexTexts, wheelSecs = {}, {}, {}
+	for _, filename in ipairs(files) do
+		local text = readFile(filename)
+		checkBudget()
+		if text then
+			table.clear(flexTexts) table.clear(wheelSecs)
+			if extractFlexbodies(text, flexTexts, nil, wheelSecs) then addWheelParts(parts, wheelSecs, filename) end
+		end
+		text = nil
+		checkBudget()
+	end
+	FS:directoryCreate(CACHE_DIR, true)
+	jsonWriteFile(diskFile, { sig = sig, parts = parts }, false)
+	log('I', 'MPProxyMeshGE', string.format("Indexed wheel and tire parts of %d shared jbeam files", #files))
+	return parts
+end
+
 local function buildPartIndex(model)
 	local diskFile = CACHE_DIR .. model .. "_parts_" .. CACHE_VERSION .. ".json"
 	local files = FS:findFiles("/vehicles/" .. model .. "/", "*.jbeam", -1, false, false) or {}
@@ -278,20 +420,25 @@ local function buildPartIndex(model)
 	local cached = FS:fileExists(diskFile) and jsonReadFile(diskFile) or nil
 	if cached and cached.sig == sig and type(cached.parts) == "table" and cached.engineV == ENGINE_INDEX_VERSION then
 		engineIndex[model] = type(cached.engine) == "table" and cached.engine or {}
+		wheelIndex[model] = type(cached.wheels) == "table" and cached.wheels or {}
 		return cached.parts
 	end
 
 	local parts = {}
 	local engine = {}
-	local flexTexts, sectionTexts = {}, {}
+	local wheels = {}
+	local flexTexts, sectionTexts, wheelSecs = {}, {}, {}
 	-- engines and their sound sections often live in /vehicles/common/<model>/ (only those sections are read there)
 	local commonFiles = FS:findFiles("/vehicles/common/" .. model .. "/", "*.jbeam", -1, false, false) or {}
 	for _, filename in ipairs(commonFiles) do
 		local text = readFile(filename)
 		checkBudget()
-		if text and string.find(text, "soundConfig", 1, true) then
-			table.clear(flexTexts) table.clear(sectionTexts)
-			if extractFlexbodies(text, flexTexts, sectionTexts) then addEngineSections(engine, sectionTexts, filename) end
+		if text then -- engine / sound sections and the hubs, suspensions and their slots
+			table.clear(flexTexts) table.clear(sectionTexts) table.clear(wheelSecs)
+			if extractFlexbodies(text, flexTexts, sectionTexts, wheelSecs) then
+				addEngineSections(engine, sectionTexts, filename)
+				addWheelParts(wheels, wheelSecs, filename)
+			end
 		end
 		text = nil
 		checkBudget()
@@ -299,13 +446,15 @@ local function buildPartIndex(model)
 	for _, filename in ipairs(files) do
 		table.clear(flexTexts)
 		table.clear(sectionTexts)
+		table.clear(wheelSecs)
 		local data = nil
 		local text = readFile(filename)
 		checkBudget()
 		local hasSound = text and string.find(text, "soundConfig", 1, true)
-		if text and (hasSound or string.find(text, "flexbodies", 1, true)) then
-			if extractFlexbodies(text, flexTexts, hasSound and sectionTexts or nil) then
+		if text then
+			if extractFlexbodies(text, flexTexts, hasSound and sectionTexts or nil, wheelSecs) then
 				addEngineSections(engine, sectionTexts, filename)
+				addWheelParts(wheels, wheelSecs, filename)
 				data = {}
 				for partName, arr in pairs(flexTexts) do
 					local ok, rows = pcall(jsonDecode, arr, filename)
@@ -339,9 +488,177 @@ local function buildPartIndex(model)
 		checkBudget()
 	end
 	FS:directoryCreate(CACHE_DIR, true)
-	jsonWriteFile(diskFile, { sig = sig, fileCount = #files, parts = parts, engine = engine, engineV = ENGINE_INDEX_VERSION }, false)
+	jsonWriteFile(diskFile, { sig = sig, fileCount = #files, parts = parts, engine = engine, wheels = wheels, engineV = ENGINE_INDEX_VERSION }, false)
 	engineIndex[model] = engine
+	wheelIndex[model] = wheels
 	return parts
+end
+
+-- ============= WHEEL PLACEMENT OF A CONFIG =============
+-- Follows the jbeam loader: the part tree of the config is walked in slot order (child sections come after the
+-- parent's), later node definitions replace earlier ones, a slot's nodeOffset moves the nodes of its subtree
+-- (x away from the center line: posX + sign(posX) * x, lua/common/jbeam/utils.lua), pressureWheels options apply
+-- to the wheel rows after them, and each wheel is placed like lua/common/jbeam/sections/wheelTypes/pressureWheels.lua:
+-- midpoint of node1/node2 (or offsetFromNode), moved by wheelOffset along the axis, tireWidth wide, radius.
+local WHEEL_VERSION = 1
+
+-- jbeam values: numbers, "$var", or "$=expression" (arithmetic, comparisons, and/or/not, case(c1, v1, ..., default),
+-- min/max/abs...). Unknown variables (also "$components.x") become nil like in the game's evaluator.
+local EXPR_NAMES = { ["nil"] = true, ["true"] = true, ["false"] = true, ["and"] = true, ["or"] = true, ["not"] = true,
+	__case = true, min = true, max = true, abs = true, floor = true, ceil = true, sqrt = true, clamp = true }
+local EXPR_ENV = { min = math.min, max = math.max, abs = math.abs, floor = math.floor, ceil = math.ceil, sqrt = math.sqrt,
+	clamp = function(x, a, b) return math.min(math.max(x, a), b) end,
+	__case = function(...)
+		local n = select("#", ...)
+		local args = { ... }
+		for i = 1, n - 1, 2 do if args[i] then return args[i + 1] end end
+		if n % 2 == 1 then return args[n] end
+		return nil
+	end }
+local exprCache = {}
+
+local function evalVal(v, vars)
+	if type(v) == "number" then return v end
+	if type(v) ~= "string" then return nil end
+	if string.sub(v, 1, 2) == "$=" then
+		local expr = string.gsub(string.sub(v, 3), "%$([%w_%.]+)", function(n)
+			local x = tonumber(vars["$" .. n])
+			return x and string.format("(%.17g)", x) or "nil"
+		end)
+		expr = string.gsub(expr, "!=", "~=")
+		expr = string.gsub(expr, "&&", " and ")
+		expr = string.gsub(expr, "||", " or ")
+		expr = string.gsub(expr, "case%(", "__case(")
+		for name in string.gmatch(expr, "[%a_][%w_]*") do
+			if not EXPR_NAMES[name] and not string.match(name, "^[eE]%d*$") then return nil end
+		end
+		if string.find(expr, "[^%w_%.%+%-%*/%(%)%s,<>=~^%%]") then return nil end
+		local fn = exprCache[expr]
+		if fn == nil then
+			fn = loadstring("return " .. expr) or false
+			if fn then setfenv(fn, EXPR_ENV) end
+			exprCache[expr] = fn
+		end
+		if not fn then return nil end
+		local ok, r = pcall(fn)
+		return ok and tonumber(r) or nil
+	elseif string.sub(v, 1, 1) == "$" then
+		return tonumber(vars[v])
+	end
+	return tonumber(v)
+end
+
+local function resolveWheels(job)
+	local vcf = job.vcf
+	if type(vcf) ~= "table" or type(vcf.parts) ~= "table" then return nil, "no config data" end
+	if commonWheelIndex == nil then
+		setPhase("wheel index")
+		commonWheelIndex = buildCommonWheelIndex()
+	end
+	setPhase("wheels")
+	local idx, cidx = wheelIndex[job.model] or {}, commonWheelIndex or {}
+	local function get(name) return idx[name] or cidx[name] end
+	local vars = {}
+	for _, partName in ipairs(job.parts) do
+		local d = get(partName)
+		if d and d.vars then for k, v in pairs(d.vars) do vars[k] = v end end
+	end
+	if type(vcf.vars) == "table" then for k, v in pairs(vcf.vars) do vars[k] = v end end
+	local nodes, items, visited = {}, {}, {}
+	local function visit(name, off, path, depth)
+		if depth > 30 or visited[name] then return end
+		visited[name] = true
+		local d = get(name)
+		if not d then return end
+		if d.nodes then
+			local cur = off
+			for _, r in ipairs(d.nodes) do
+				if r.off ~= nil then cur = r.off or off
+				else nodes[r[1]] = { r[2], r[3], r[4], cur } end
+			end
+		end
+		if d.pw then for _, it in ipairs(d.pw) do items[#items + 1] = it end end
+		if d.slots then
+			for _, sl in ipairs(d.slots) do
+				local p = path .. sl.n .. "/"
+				local child = vcf.parts[p] or vcf.parts[sl.n] or vcf.parts[sl.t]
+				if type(child) == "string" and child ~= "" then visit(child, sl.o or off, p, depth + 1) end
+			end
+		end
+		checkBudget()
+	end
+	visit(vcf.mainPartName or job.model, nil, "/", 0)
+	local function nodePos(name)
+		local n = nodes[name]
+		if not n then return nil end
+		local x, y, z = evalVal(n[1], vars), evalVal(n[2], vars), evalVal(n[3], vars)
+		if not (x and y and z) then return nil end
+		local o = n[4]
+		if o then
+			local ox, oy, oz = evalVal(o[1], vars) or 0, evalVal(o[2], vars) or 0, evalVal(o[3], vars) or 0
+			x = x + (x > 0 and 1 or (x < 0 and -1 or 0)) * ox
+			y, z = y + oy, z + oz
+		end
+		return x, y, z
+	end
+	local opts, wheels = {}, {}
+	for _, it in ipairs(items) do
+		if it.o then for k, v in pairs(it.o) do opts[k] = v end
+		elseif it.w then
+			local x1, y1, z1 = nodePos(it.a)
+			local x2, y2, z2 = nodePos(it.b)
+			if x1 and x2 then
+				local ax, ay, az = x2 - x1, y2 - y1, z2 - z1
+				local len = math.sqrt(ax * ax + ay * ay + az * az)
+				if len > 1e-4 then
+					ax, ay, az = ax / len, ay / len, az / len
+					local hubWidth = evalVal(opts.hubWidth, vars) or len
+					local mx, my, mz = (x1 + x2) * 0.5, (y1 + y2) * 0.5, (z1 + z2) * 0.5
+					local ofn = evalVal(opts.offsetFromNode, vars)
+					if ofn == 1 then mx, my, mz = x1 + ax * hubWidth * 0.5, y1 + ay * hubWidth * 0.5, z1 + az * hubWidth * 0.5
+					elseif ofn == 2 then mx, my, mz = x2 - ax * hubWidth * 0.5, y2 - ay * hubWidth * 0.5, z2 - az * hubWidth * 0.5 end
+					local wo = evalVal(opts.wheelOffset, vars)
+					if wo then mx, my, mz = mx + ax * wo, my + ay * wo, mz + az * wo end
+					local radius = evalVal(opts.radius, vars) or evalVal(opts.hubRadius, vars) or 0.5
+					local width = evalVal(opts.tireWidth, vars) or hubWidth
+					-- steered: rows with a steering axis, else the front wheels by name (FR, FL, F2R...)
+					local steered = it.s or (type(it.w) == "string" and string.sub(it.w, 1, 1) == "F")
+					wheels[#wheels + 1] = { mx, my, mz, ax, ay, az, radius, width, s = steered or nil, n = it.w }
+				end
+			end
+		end
+	end
+	return wheels
+end
+
+-- keeps the wheels that make sense next to the body bounds; nil if none left
+local function checkWheels(wheels, shape)
+	if type(wheels) ~= "table" then return nil end
+	local out = {}
+	for _, w in ipairs(wheels) do
+		local ok = w[7] >= 0.1 and w[7] <= 1.6 and w[8] >= 0.04 and w[8] <= 1.5
+		if ok and shape.minX then
+			ok = w[1] > shape.minX - 1 and w[1] < shape.maxX + 1 and w[2] > shape.minY - 1 and w[2] < shape.maxY + 1
+				and w[3] > shape.minZ - 1 and w[3] < shape.maxZ + 1
+		end
+		if ok then out[#out + 1] = w end
+	end
+	return #out > 0 and out or nil
+end
+
+local function logWheels(job, wheels, note)
+	if wheels then
+		local rmin, rmax, wmin, wmax = math.huge, 0, math.huge, 0
+		for _, w in ipairs(wheels) do
+			rmin, rmax = math.min(rmin, w[7]), math.max(rmax, w[7])
+			wmin, wmax = math.min(wmin, w[8]), math.max(wmax, w[8])
+		end
+		log('I', 'MPProxyMeshGE', string.format("Proxy wheels for %s/%s: %d wheels, radius %.2f-%.2f m, width %.2f-%.2f m (source: jbeam%s)",
+			job.model, string.sub(job.key, -16), #wheels, rmin, rmax, wmin, wmax, note or ""))
+	else
+		log('I', 'MPProxyMeshGE', string.format("Proxy wheels for %s/%s: estimated from the body bounds (source: estimate, %s)",
+			job.model, string.sub(job.key, -16), note or "no wheel rows resolved"))
+	end
 end
 
 -- ============= ENGINE SOUND OF A CONFIG =============
@@ -745,6 +1062,17 @@ local function runJob(job)
 				log('I', 'MPProxyMeshGE', string.format("Proxy engine sound for %s/%s: %s (source: %s, cached)", job.model, string.sub(job.key, -16), meta.sound.event or "type mapping", tostring(meta.sound.source)))
 			end
 			shape.sound = meta.sound
+			finishBBox(shape, meta.bbox, job.model)
+			if meta.wheelV ~= WHEEL_VERSION then
+				local w, why = resolveWheels(job)
+				meta.wheels = checkWheels(w, shape) or false
+				meta.wheelV = WHEEL_VERSION
+				logWheels(job, meta.wheels or nil, why)
+				jsonWriteFile(metaFile, meta, false)
+			elseif meta.wheels then
+				logWheels(job, meta.wheels, ", cached")
+			end
+			shape.wheels = meta.wheels or nil
 			setPhase("materials")
 			loadModelMaterials(job.model)
 			ensureMaterials(meta.materials)
@@ -785,8 +1113,13 @@ local function runJob(job)
 			loadModelMaterials(job.model)
 			ensureMaterials(mm.materials)
 			mm.sound = shape.sound -- per config, the mesh set is shared by configs with other engines
+			finishBBox(shape, mm.bbox, job.model)
+			local w, why = resolveWheels(job)
+			shape.wheels = checkWheels(w, shape)
+			logWheels(job, shape.wheels, why)
+			mm.wheels, mm.wheelV = shape.wheels or false, WHEEL_VERSION
 			jsonWriteFile(metaFile, mm, false)
-			mm.sound = nil
+			mm.sound, mm.wheels, mm.wheelV = nil, nil, nil
 			shape.paths = mm.paths
 			shape.tiers = mm.tiers
 			shape.fromCache = true
@@ -869,11 +1202,14 @@ local function runJob(job)
 	ensureMaterials(matList)
 	local metaData = { sig = sig, paths = paths, tiers = tiers, bbox = validBBox(bbox) and bbox or nil, materials = matList }
 	jsonWriteFile(meshMetaFile, metaData, false)
-	metaData.sound = shape.sound
+	finishBBox(shape, bbox, job.model)
+	local wl, why = resolveWheels(job)
+	shape.wheels = checkWheels(wl, shape)
+	logWheels(job, shape.wheels, why)
+	metaData.sound, metaData.wheels, metaData.wheelV = shape.sound, shape.wheels or false, WHEEL_VERSION
 	jsonWriteFile(metaFile, metaData, false)
 	shape.paths = paths
 	shape.tiers = tiers
-	finishBBox(shape, bbox, job.model)
 	shape.state = "ready"
 end
 
@@ -944,7 +1280,7 @@ local function defaultConfig(model)
 	if not pcName then return nil end
 	local pc = jsonReadFile("/vehicles/" .. model .. "/" .. pcName .. ".pc")
 	if type(pc) ~= "table" or type(pc.parts) ~= "table" then return nil end
-	return { parts = pc.parts, mainPartName = pc.mainPartName or model }
+	return { parts = pc.parts, mainPartName = pc.mainPartName or model, vars = type(pc.vars) == "table" and pc.vars or nil }
 end
 
 -- queues (or finds) the default config build of a model; cached ones go first, they resolve from disk at once
@@ -956,7 +1292,7 @@ local function requestDefault(model, toBackground)
 	defaultKeys[model] = key
 	if not shapes[key] then
 		shapes[key] = { state = "queued" }
-		local job = { key = key, model = model, parts = parts }
+		local job = { key = key, model = model, parts = parts, vcf = vcf }
 		if toBackground then prebuildJobs[#prebuildJobs + 1] = job
 		elseif FS:fileExists(CACHE_DIR .. key .. ".json") then table.insert(jobs, 1, job)
 		else jobs[#jobs + 1] = job end
@@ -976,7 +1312,7 @@ local function request(model, vcf)
 	if M._onRequest then M._onRequest() end
 	if not shapes[key] then
 		shapes[key] = { state = "queued" }
-		jobs[#jobs + 1] = { key = key, model = model, parts = parts }
+		jobs[#jobs + 1] = { key = key, model = model, parts = parts, vcf = vcf }
 	end
 	if fallbackOf[key] == nil then
 		local dkey = requestDefault(model, false)
@@ -1207,7 +1543,19 @@ local function drawProxy(p, dist)
 			obj:updateInstanceRenderData()
 		end
 	end
-	if cfg.wheels and shape.minX then
+	if cfg.wheels and shape.wheels then
+		-- jbeam wheels: centers, axes, radius and width in the same jbeam space as the body mesh
+		local steer = math.max(-1, math.min(1, p.steer or 0)) * MAX_STEER
+		local sc, ss = math.cos(steer), math.sin(steer)
+		for _, w in ipairs(shape.wheels) do
+			local ax, ay, az = w[4], w[5], w[6]
+			if w.s and steer ~= 0 then ax, ay = ax * sc - ay * ss, ax * ss + ay * sc end
+			local h = w[8] * 0.5
+			local x1, y1, z1 = toWorld(w[1] - ax * h, w[2] - ay * h, w[3] - az * h)
+			local x2, y2, z2 = toWorld(w[1] + ax * h, w[2] + ay * h, w[3] + az * h)
+			drawCylinder(x1, y1, z1, x2, y2, z2, w[7], wheelColor, true)
+		end
+	elseif cfg.wheels and shape.minX then
 		local W, L, H = shape.maxX - shape.minX, shape.maxY - shape.minY, shape.maxZ - shape.minZ
 		local radius = math.min(math.max(H * 0.22, 0.28), 0.55)
 		local gz = (shape.groundZ or 0) + radius
