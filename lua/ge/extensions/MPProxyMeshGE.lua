@@ -96,6 +96,26 @@ local function isOffsetModifier(row)
 	return nz(row.pos) or nz(row.rot) or (type(s) == "table" and ((s.x or 1) ~= 1 or (s.y or 1) ~= 1 or (s.z or 1) ~= 1))
 end
 
+-- ============= CACHE VALIDATION =============
+-- game version + count and total size of the model's jbeam/dae/json files (works for zips and mods alike)
+local modelSigs = {}
+local function modelSignature(model)
+	if modelSigs[model] then return modelSigs[model] end
+	local files = FS:findFiles("/vehicles/" .. model .. "/", "*", -1, false, false) or {}
+	local n, total = 0, 0
+	for i, f in ipairs(files) do
+		local ext = string.match(f, "%.(%w+)$")
+		if ext == "jbeam" or ext == "dae" or ext == "json" then
+			local st = FS:stat(f)
+			n, total = n + 1, total + (st and tonumber(st.filesize) or 0)
+		end
+		if i % 64 == 0 then coroutine.yield() end
+	end
+	local sig = tostring(beamng_version or "?") .. "|" .. n .. "|" .. total
+	modelSigs[model] = sig
+	return sig
+end
+
 local function buildPartIndex(model)
 	local diskFile = CACHE_DIR .. model .. "_parts_" .. CACHE_VERSION .. ".json"
 	local files = FS:findFiles("/vehicles/" .. model .. "/", "*.jbeam", -1, false, false) or {}
@@ -380,25 +400,6 @@ local function mergeDae(list)
 	return table.concat(out)
 end
 
--- ============= CACHE VALIDATION =============
--- game version + count and total size of the model's jbeam/dae/json files (works for zips and mods alike)
-local modelSigs = {}
-local function modelSignature(model)
-	if modelSigs[model] then return modelSigs[model] end
-	local files = FS:findFiles("/vehicles/" .. model .. "/", "*", -1, false, false) or {}
-	local n, total = 0, 0
-	for i, f in ipairs(files) do
-		local ext = string.match(f, "%.(%w+)$")
-		if ext == "jbeam" or ext == "dae" or ext == "json" then
-			local st = FS:stat(f)
-			n, total = n + 1, total + (st and tonumber(st.filesize) or 0)
-		end
-		if i % 64 == 0 then coroutine.yield() end
-	end
-	local sig = tostring(beamng_version or "?") .. "|" .. n .. "|" .. total
-	modelSigs[model] = sig
-	return sig
-end
 
 local MAX_LEN, MAX_WIDTH, MAX_HEIGHT = 25, 6, 6
 local function validBBox(b)
