@@ -113,6 +113,8 @@
     "ui.options.beammp.proxyEngineSoundDistance.tooltip": "Proxies closer than this get an engine sound.",
     "ui.options.beammp.proxyEngineSoundMax": "Proxy engine sound sources",
     "ui.options.beammp.proxyEngineSoundMax.tooltip": "How many proxies can play an engine sound at once, nearest first.",
+    "ui.options.beammp.proxyMeshFrameBudgetMs": "Proxy mesh build time per frame",
+    "ui.options.beammp.proxyMeshFrameBudgetMs.tooltip": "Milliseconds per frame spent building proxy meshes. Lower is smoother, higher builds faster.",
     "ui.options.beammp.enableBlobs": "Enable blobs for unspawned vehicles",
     "ui.options.beammp.enableBlobs.tooltip": "Unspawned vehicles will appear as colored spheres (blobs)",
     "ui.options.beammp.showSpectators": "Show spectators' nametag under vehicle nametags",

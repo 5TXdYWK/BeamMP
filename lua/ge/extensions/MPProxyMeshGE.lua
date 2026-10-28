@@ -24,18 +24,19 @@ setmetatable(_G,{}) -- temporarily disable global notifications
 local TIMER = (HighPerfTimer or hptimer)
 local CACHE_DIR = "/temp/beammp/proxymeshes/"
 local CACHE_VERSION = "v5" -- v5: three LOD tier mesh sets per config, v4: triangle budget (smallest parts dropped), v3: one merged .dae per mesh set, signatures
-local READ_CHUNK = 256 * 1024     -- bytes per read step (smaller steps keep each resume near the frame budget)
-local FRAME_BUDGET_MS = 2         -- coroutine work per frame in game
+local READ_CHUNK = 128 * 1024     -- bytes per read step (smaller steps keep each resume near the frame budget)
+local FRAME_BUDGET_MS = 2         -- coroutine work per frame in game (proxyMeshFrameBudgetMs)
 local PRELOAD_BUDGET_MS = 40      -- while the join loading screen hides the stutter
 local frameBudget = FRAME_BUDGET_MS
 local MAX_MESHES = 250            -- per config (the full tier keeps everything the config shows)
 local MAX_NEW_OBJECTS_PER_PASS = 4
 local MAX_DETACHES_PER_PASS = 6   -- mesh -> box changes per pass, farthest first, so a group leaving range spreads out
 local NEW_SHAPE_INTERVAL = 2      -- seconds between first uses of not yet loaded shapes (engine import hitch)
+local CACHED_SHAPE_INTERVAL = 0.5 -- same, when the engine already has a compiled .cdae of every file (cheaper load)
 local RELEASE_MARGIN = 50
 
 local cfg = { enabled = true, distance = 500, maxProxies = 48, wheels = true, targetFps = 0, triBudget = 60000, prebuild = false,
-	lodFull = 20, lodParts = 60, lodShell = 150 }
+	lodFull = 20, lodParts = 60, lodShell = 150, frameBudget = FRAME_BUDGET_MS }
 
 -- ============= LOD TIERS =============
 -- Every config is built into three mesh sets: 1 = full (every mesh of the config), 2 = parts (interior, mechanical
@@ -56,6 +57,7 @@ local function readSettings()
 	cfg.lodFull = math.max(0, tonumber(settings.getValue("proxyLodFullDistance", 20)) or 20)
 	cfg.lodParts = math.max(cfg.lodFull, tonumber(settings.getValue("proxyLodPartsDistance", 60)) or 60)
 	cfg.lodShell = math.max(cfg.lodParts, tonumber(settings.getValue("proxyLodShellDistance", 150)) or 150)
+	cfg.frameBudget = math.min(math.max(tonumber(settings.getValue("proxyMeshFrameBudgetMs", FRAME_BUDGET_MS)) or FRAME_BUDGET_MS, 0.25), 20)
 end
 
 -- the mesh tier for a distance, nil beyond the mesh tiers; cur is the tier the proxy has now (hysteresis)
@@ -148,6 +150,8 @@ local function hashString(s)
 end
 
 local budgetTimer = nil
+local jobPhase = "start" -- what the running job does now, for the per step timings in the job log
+local function setPhase(name) jobPhase = name end
 local function checkBudget()
 	if budgetTimer and budgetTimer:stop() > frameBudget then coroutine.yield() end
 end
@@ -172,11 +176,59 @@ local function modelSignature(model)
 			local st = FS:stat(f)
 			n, total = n + 1, total + (st and tonumber(st.filesize) or 0)
 		end
-		if i % 64 == 0 then coroutine.yield() end
+		checkBudget()
 	end
 	local sig = tostring(beamng_version or "?") .. "|" .. n .. "|" .. total
 	modelSigs[model] = sig
 	return sig
+end
+
+-- Finds the "flexbodies" array of every part in a jbeam text without decoding the file: a large jbeam (nodes,
+-- beams, triangles of a body) took tens of ms in one jsonDecode. Strings, // and /* */ comments are skipped,
+-- out[partName] = text of the part's flexbodies array (decoded alone, it is small). Returns false if the text
+-- did not look like a jbeam (the caller then decodes the whole file).
+local function extractFlexbodies(text, out)
+	local find, sub, byte, match = string.find, string.sub, string.byte, string.match
+	local pos, depth, n = 1, 0, 0
+	local partName, flexStart = nil, nil
+	local lastString, lastDepth, lastEnd = nil, -1, 0
+	while true do
+		local s = find(text, '[{}%[%]"/]', pos)
+		if not s then break end
+		local c = byte(text, s)
+		if c == 34 then -- string
+			local e = s + 1
+			while true do
+				local q = find(text, '["\\]', e)
+				if not q then return false end
+				if byte(text, q) == 92 then e = q + 2 else e = q break end
+			end
+			lastString, lastDepth, lastEnd = sub(text, s + 1, e - 1), depth, e
+			pos = e + 1
+		elseif c == 47 then -- comment
+			local nx = byte(text, s + 1)
+			if nx == 47 then local e = find(text, "\n", s + 2, true) pos = e and e + 1 or #text + 1
+			elseif nx == 42 then local e = find(text, "*/", s + 2, true) pos = e and e + 2 or #text + 1
+			else pos = s + 1 end
+		elseif c == 123 or c == 91 then
+			depth = depth + 1
+			local isKey = lastString and lastDepth == depth - 1 and match(sub(text, lastEnd + 1, s - 1), "^%s*:%s*$")
+			if depth == 2 and c == 123 then partName = isKey and lastString or nil
+			elseif depth == 3 and c == 91 and isKey and lastString == "flexbodies" and partName then flexStart = s end
+			lastString = nil
+			pos = s + 1
+		else
+			if depth == 3 and flexStart and c == 93 then out[partName] = sub(text, flexStart, s) flexStart = nil end
+			if depth == 2 then partName = nil end
+			depth = depth - 1
+			if depth < 0 then return false end
+			lastString = nil
+			pos = s + 1
+		end
+		n = n + 1
+		if n >= 400 then n = 0 checkBudget() end
+	end
+	return depth == 0
 end
 
 local function buildPartIndex(model)
@@ -187,9 +239,27 @@ local function buildPartIndex(model)
 	if cached and cached.sig == sig and type(cached.parts) == "table" then return cached.parts end
 
 	local parts = {}
+	local flexTexts = {}
 	for _, filename in ipairs(files) do
-		local ok, data = pcall(jsonReadFile, filename)
-		if ok and type(data) == "table" then
+		table.clear(flexTexts)
+		local data = nil
+		local text = readFile(filename)
+		checkBudget()
+		if text and string.find(text, "flexbodies", 1, true) then
+			if extractFlexbodies(text, flexTexts) then
+				data = {}
+				for partName, arr in pairs(flexTexts) do
+					local ok, rows = pcall(jsonDecode, arr, filename)
+					if ok and type(rows) == "table" then data[partName] = { flexbodies = rows } end
+					checkBudget()
+				end
+			else
+				local ok, decoded = pcall(jsonDecode, text, filename) -- unusual file: whole decode (one step)
+				data = ok and decoded or nil
+			end
+		end
+		text = nil
+		if type(data) == "table" then
 			for partName, part in pairs(data) do
 				if type(part) == "table" and type(part.flexbodies) == "table" then
 					local list, offset = {}, false
@@ -207,7 +277,7 @@ local function buildPartIndex(model)
 				end
 			end
 		end
-		coroutine.yield() -- one jbeam file per step
+		checkBudget()
 	end
 	FS:directoryCreate(CACHE_DIR, true)
 	jsonWriteFile(diskFile, { sig = sig, fileCount = #files, parts = parts }, false)
@@ -345,6 +415,7 @@ local function scanDae(filename, keepGeom, onNode, geomsOnly, header, geoms, kep
 						end
 						at = e + 7
 						progressed = true
+						checkBudget()
 					else
 						at = s
 					end
@@ -496,13 +567,13 @@ local function mergeDae(list)
 	out[#out + 1] = "<library_geometries>\n"
 	for i, part in ipairs(list) do
 		local pre = "f" .. i .. "_"
-		for _, g in ipairs(part.geoms) do out[#out + 1] = prefixIds(g, pre, true) out[#out + 1] = "\n" end
-		checkBudget()
+		for _, g in ipairs(part.geoms) do out[#out + 1] = prefixIds(g, pre, true) out[#out + 1] = "\n" checkBudget() end
 	end
 	out[#out + 1] = '</library_geometries>\n<library_visual_scenes>\n<visual_scene id="Scene" name="Scene">\n'
 	for i, part in ipairs(list) do
 		local pre = "f" .. i .. "_"
 		for _, n in ipairs(part.nodes) do out[#out + 1] = prefixIds(n, pre, false) end
+		checkBudget()
 	end
 	out[#out + 1] = '</visual_scene>\n</library_visual_scenes>\n<scene>\n<instance_visual_scene url="#Scene"/>\n</scene>\n</COLLADA>\n'
 	return table.concat(out)
@@ -542,6 +613,7 @@ local function ensureMaterials(list)
 				mat.canSave = false
 				mat:registerObject(name)
 			end
+			checkBudget()
 		end
 	end
 end
@@ -549,6 +621,7 @@ end
 local function runJob(job)
 	local shape = shapes[job.key]
 	shape.state = "building"
+	setPhase("cache check")
 	local metaFile = CACHE_DIR .. job.key .. ".json"
 	local sig = modelSignature(job.model)
 	local meta = FS:fileExists(metaFile) and jsonReadFile(metaFile) or nil
@@ -556,6 +629,7 @@ local function runJob(job)
 		local allExist = true
 		for _, p in ipairs(meta.paths) do if not FS:fileExists(p) then allExist = false end end
 		if allExist then
+			setPhase("materials")
 			loadModelMaterials(job.model)
 			ensureMaterials(meta.materials)
 			shape.paths = meta.paths
@@ -568,7 +642,9 @@ local function runJob(job)
 	end
 
 	if type(partIndex[job.model]) ~= "table" then
+		setPhase("part index")
 		partIndex[job.model] = buildPartIndex(job.model)
+		setPhase("cache check")
 	end
 	local index = partIndex[job.model]
 	local wanted, count = {}, 0
@@ -592,6 +668,7 @@ local function runJob(job)
 		local ok = mm and mm.sig == sig and type(mm.paths) == "table" and #mm.paths > 0 and type(mm.tiers) == "table"
 		if ok then for _, p in ipairs(mm.paths) do if not FS:fileExists(p) then ok = false end end end
 		if ok then
+			setPhase("materials")
 			loadModelMaterials(job.model)
 			ensureMaterials(mm.materials)
 			jsonWriteFile(metaFile, mm, false)
@@ -614,6 +691,7 @@ local function runJob(job)
 	local paths, mats = {}, {}
 	FS:directoryCreate(CACHE_DIR, true)
 	local groups, groupOrder = {}, {}
+	setPhase("dae scan")
 	for _, dae in ipairs(daes) do
 		local part = filterDae(dae, wanted, bbox, nil)
 		if part then
@@ -648,9 +726,12 @@ local function runJob(job)
 				end
 				if #lists > 0 then
 					local out = CACHE_DIR .. meshKey .. "_t" .. t .. "_" .. g .. ".dae"
+					setPhase("merge")
 					local text = mergeDae(lists)
 					coroutine.yield()
+					setPhase("write") -- table.concat + writeFile of one file: one step, measured as the worst step
 					if writeFile(out, text) then tiers[t][#tiers[t] + 1] = out paths[#paths + 1] = out end
+					text = nil
 					coroutine.yield()
 				end
 			end
@@ -665,6 +746,7 @@ local function runJob(job)
 		return
 	end
 	log('I', 'MPProxyMeshGE', string.format("Proxy mesh for %s ready (%d meshes, %d files)", job.model, count, #paths))
+	setPhase("materials")
 	loadModelMaterials(job.model)
 	local matList = {}
 	for name in pairs(mats) do matList[#matList + 1] = name end
@@ -687,25 +769,37 @@ local function stepJobs()
 			while job and shapes[job.key] and shapes[job.key].state ~= "queued" do job = table.remove(prebuildJobs, 1) end
 		end
 		if not job then return end
-		currentJob = { job = job, co = coroutine.create(runJob), started = clock, maxStepMs = 0, frames = 0 }
+		currentJob = { job = job, co = coroutine.create(runJob), started = clock, maxStepMs = 0, maxStepPhase = "", frames = 0,
+			totalMs = 0, worstFrameMs = 0, phaseMs = {} }
+		jobPhase = "start"
 	end
 	budgetTimer = TIMER()
 	currentJob.frames = currentJob.frames + 1
+	local cj = currentJob
+	local frameMs = 0
 	while currentJob and budgetTimer:stop() < frameBudget do
 		local before = budgetTimer:stop()
+		local phase = jobPhase
 		local ok, err = coroutine.resume(currentJob.co, currentJob.job)
 		local stepMs = budgetTimer:stop() - before
-		if stepMs > currentJob.maxStepMs then currentJob.maxStepMs = stepMs end
+		frameMs = frameMs + stepMs
+		cj.totalMs = cj.totalMs + stepMs
+		cj.phaseMs[phase] = (cj.phaseMs[phase] or 0) + stepMs
+		if stepMs > cj.maxStepMs then cj.maxStepMs, cj.maxStepPhase = stepMs, phase end
+		if frameMs > cj.worstFrameMs then cj.worstFrameMs = frameMs end
 		if not ok then
 			log('E', 'MPProxyMeshGE', "Building proxy mesh for "..tostring(currentJob.job.model).." failed: "..tostring(err))
 			shapes[currentJob.job.key].state = "failed"
 			currentJob = nil
 		elseif coroutine.status(currentJob.co) == "dead" then
 			local sh = shapes[currentJob.job.key]
-			if sh and not sh.fromCache then
-				log('I', 'MPProxyMeshGE', string.format("Build of %s took %.1f s over %d frames, longest step %.1f ms",
-					currentJob.job.model, clock - currentJob.started, currentJob.frames, currentJob.maxStepMs))
-			end
+			local phases = {}
+			for name, ms in pairs(cj.phaseMs) do if ms >= 0.05 then phases[#phases + 1] = string.format("%s %.1f", name, ms) end end
+			table.sort(phases)
+			log(cj.worstFrameMs > frameBudget * 3 and 'W' or 'I', 'MPProxyMeshGE', string.format(
+				"Mesh job %s%s: total %.1f ms over %d frames (%.1f s), worst frame %.1f ms, longest step %.1f ms (%s); ms per step: %s",
+				cj.job.model, (sh and sh.fromCache) and " (from disk cache)" or "", cj.totalMs, cj.frames, clock - cj.started,
+				cj.worstFrameMs, cj.maxStepMs, cj.maxStepPhase, table.concat(phases, ", ")))
 			currentJob = nil
 		end
 	end
@@ -779,6 +873,34 @@ local function getShape(key)
 	return key and shapes[key]
 end
 
+-- ============= ENGINE IMPORTS =============
+-- The first TSStatic of a .dae makes the engine load the shape synchronously (compiling a .cdae next to a /temp
+-- copy the first time, loading that .cdae later). That cannot be sliced from Lua, so new imports are spread out.
+local function tierPaths(shape, tier)
+	return shape.tiers and (shape.tiers[tier] or shape.tiers[tostring(tier)]) or shape.paths
+end
+
+local cdaeCache = {} -- [dae path] = true/false: compiled .cdae seen on disk
+local function hasCdae(path)
+	local v = cdaeCache[path]
+	if v == nil then
+		local c = string.gsub(path, "%.dae$", ".cdae")
+		v = FS:fileExists("/temp" .. c) or FS:fileExists(c)
+		cdaeCache[path] = v
+	end
+	return v
+end
+
+-- nil when every file of the tier is loaded this session, else the wait between two such first uses
+local function importInterval(shape, tier)
+	local cached, any = true, false
+	for _, path in ipairs(tierPaths(shape, tier)) do
+		if not importedPaths[path] then any = true if not hasCdae(path) then cached = false end end
+	end
+	if not any then return nil end
+	return cached and CACHED_SHAPE_INTERVAL or NEW_SHAPE_INTERVAL
+end
+
 -- ============= TSSTATIC POOL =============
 local function createStatic(path)
 	local obj = createObject('TSStatic')
@@ -815,20 +937,21 @@ local function paintString(paint)
 	return string.format("%.3f %.3f %.3f %.3f", c[1] or 0.6, c[2] or 0.6, c[3] or 0.6, c[4] or 1)
 end
 
-local function tierPaths(shape, tier)
-	return shape.tiers and (shape.tiers[tier] or shape.tiers[tostring(tier)]) or shape.paths
-end
-
 local function attach(p, shape, tier)
 	p.meshObjects = {}
 	p.meshTier = tier
-	local importTimer = TIMER()
-	local newImport = false
 	local list = tierPaths(shape, tier)
-	for _, path in ipairs(list) do if not importedPaths[path] then newImport = true end end
 	for _, path in ipairs(list) do
+		local newImport = not importedPaths[path]
+		local importTimer = newImport and TIMER() or nil
 		importedPaths[path] = true
 		local id = takeStatic(path)
+		if importTimer then -- engine side shape import (synchronous); .cdae compiled the first time, then reused
+			local ms = importTimer:stop()
+			log(ms > 20 and 'W' or 'I', 'MPProxyMeshGE', string.format("Engine import of %s tier %d (%s): %.1f ms, compiled .cdae was %s",
+				tostring(string.match(p.meshKey or "", "^(.-)_v%d")), tier, string.match(path, "([^/]+)$") or path, ms,
+				cdaeCache[path] and "on disk" or "not on disk (compiled now)"))
+		end
 		if id then
 			local obj = scenetree.findObjectById(id)
 			if obj then
@@ -842,9 +965,6 @@ local function attach(p, shape, tier)
 		end
 	end
 	p.meshShape = shape
-	if newImport then -- engine side shape import (synchronous, .cdae cached by the engine after the first time)
-		log('I', 'MPProxyMeshGE', string.format("First use of %s mesh took %.1f ms", tostring(string.match(p.meshKey or "", "^(.-)_v%d")), importTimer:stop()))
-	end
 end
 
 local function detach(p)
@@ -861,7 +981,6 @@ local candidates = {}
 local function decide(vehicles, refPos)
 	table.clear(candidates)
 	table.clear(waitingLoad)
-	table.clear(importedPaths)
 	local meshMax = math.min(cfg.distance, cfg.lodShell)
 	local release = meshMax * (1 + LOD_HYSTERESIS) + 3
 	local leaving = {}
@@ -911,20 +1030,18 @@ local function decide(vehicles, refPos)
 				if fb and fb.state == "ready" then shape = fb p.meshFallback = true end
 			end
 			if shape and shape.state == "ready" and created < MAX_NEW_OBJECTS_PER_PASS then
-				shape.loadedTier = shape.loadedTier or {}
-				if shape.loaded then shape.loadedTier[want] = true end -- preloaded: every tier imported
-				if not shape.loadedTier[want] and not c.v.isFakeTest and not shape.fromCache then
-					-- first use of this tier: the engine imports it synchronously, so only one per interval
+				-- first use of a file this session (disk cached shapes too): the engine imports it synchronously,
+				-- so only one such attach per interval (shorter when the compiled .cdae already exists)
+				local interval = not c.v.isFakeTest and importInterval(shape, want) or nil
+				if interval then
 					if clock >= nextNewShapeAllowed then
-						nextNewShapeAllowed = clock + NEW_SHAPE_INTERVAL
-						shape.loadedTier[want] = true
+						nextNewShapeAllowed = clock + interval
 						attach(p, shape, want)
 						created = created + 1
 					else
 						waitingLoad[#waitingLoad + 1] = c.v.jbeam or string.match(p.meshKey, "^(.-)_v%d") or "?"
 					end
 				else
-					shape.loadedTier[want] = true
 					attach(p, shape, want)
 					created = created + 1
 				end
@@ -1046,7 +1163,7 @@ local function finishPreload(reason)
 	if not preload then return end
 	log('I', 'MPProxyMeshGE', string.format("Join preload finished after %.1f s (%s)", clock - preload.started, reason))
 	preload = nil
-	frameBudget = FRAME_BUDGET_MS
+	frameBudget = cfg.frameBudget
 	guihooks.trigger('LoadingInfo', { message = "" })
 	if core_gamestate and core_gamestate.requestExitLoadingScreen then core_gamestate.requestExitLoadingScreen(PRELOAD_TAG) end
 end
@@ -1073,10 +1190,12 @@ local function preImport()
 			for _, path in ipairs(shape.paths) do -- every tier
 				if not importedPaths[path] then
 					local t = TIMER()
+					local cdae = hasCdae(path)
 					importedPaths[path] = true
 					local id = takeStatic(path)
 					if id then returnStatic(path, id) end
-					log('I', 'MPProxyMeshGE', string.format("First use of %s mesh took %.1f ms (preload)", path, t:stop()))
+					log('I', 'MPProxyMeshGE', string.format("Engine import of %s (loading screen preload): %.1f ms, compiled .cdae was %s",
+						string.match(path, "([^/]+)$") or path, t:stop(), cdae and "on disk" or "not on disk (compiled now)"))
 					done = done + 1
 				end
 			end
@@ -1166,6 +1285,7 @@ end
 local function reset()
 	table.clear(waitingLoad)
 	table.clear(importedPaths)
+	table.clear(cdaeCache)
 	for id, _ in pairs(allObjects) do
 		local obj = scenetree.findObjectById(id)
 		if obj then obj:delete() end
@@ -1193,9 +1313,10 @@ local function forget(p)
 	if p then p.meshObjects = nil p.meshShape = nil p.meshKey = nil end
 end
 
-local function onSettingsChanged() readSettings() end
+local function onSettingsChanged() readSettings() if not preload then frameBudget = cfg.frameBudget end end
 local function onExtensionLoaded()
 	readSettings()
+	frameBudget = cfg.frameBudget
 	local ok, err = pcall(cleanOldCache)
 	if not ok then log('W', 'MPProxyMeshGE', "Cache cleanup failed: " .. tostring(err)) end
 end
