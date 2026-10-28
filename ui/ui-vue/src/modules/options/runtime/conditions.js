@@ -274,6 +274,12 @@ export default function (deps) {
     beammpEnableQueueAutoEnabled(values) {
         return values.enableQueueAuto===true
     },
+    beammpEnableProxyVehicles(values) {
+        return values.enableProxyVehicles!==false
+    },
+    beammpProxyCollision(values) {
+        return values.enableProxyVehicles!==false && values.proxyCollision===true
+    },
     beammpEnableBlobs(values) {
         return values.enableBlobs===true
     },
