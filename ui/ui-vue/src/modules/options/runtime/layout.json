@@ -4984,6 +4984,31 @@
         },
         {
           "version": "0.38",
+          "label": "ui.options.beammp.proxyAutoReal",
+          "tooltip": "ui.options.beammp.proxyAutoReal.tooltip",
+          "setting": "proxyAutoReal",
+          "interactive": true,
+          "condition_always_off": false,
+          "condition_not_shipping": false,
+          "condition_simplemenu": "",
+          "condition_visible": "",
+          "condition_enabled": "beammpEnableProxyVehicles",
+          "itemType": "checkbox",
+          "component": "OptionsCheckbox",
+          "separateLabel": true,
+          "lua": "",
+          "luaOff": "",
+          "valueOn": true,
+          "valueOff": false,
+          "search": [
+            "label",
+            "caption",
+            "tooltip",
+            "setting"
+          ]
+        },
+        {
+          "version": "0.38",
           "label": "ui.options.beammp.proxyRealSpawnDistance",
           "tooltip": "ui.options.beammp.proxyRealSpawnDistance.tooltip",
           "setting": "proxyRealSpawnDistance",

@@ -40,6 +40,7 @@
   "showBlobIllegal"             : [ "cloud", true ],
   "enablePosSmoother"           : [ "cloud", false ],
   "enableProxyVehicles"         : [ "local", true ],
+  "proxyAutoReal"               : [ "local", false ],
   "proxyRealSpawnDistance"      : [ "local", 200 ],
   "proxyRealDespawnDistance"    : [ "local", 260 ],
   "proxyMaxRealVehicles"        : [ "local", 12 ],

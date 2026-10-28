@@ -41,6 +41,7 @@ local COLLIDER_RELEASE_MARGIN = 15
 
 local function readSettings()
 	cfg.enabled = settings.getValue("enableProxyVehicles", true) ~= false
+	cfg.autoReal = settings.getValue("proxyAutoReal", false) == true -- opt in: distance based real spawns
 	cfg.spawnDist = tonumber(settings.getValue("proxyRealSpawnDistance", 200)) or 200
 	cfg.despawnDist = math.max(tonumber(settings.getValue("proxyRealDespawnDistance", 260)) or 260, cfg.spawnDist + 20)
 	cfg.maxReal = math.max(0, math.floor(tonumber(settings.getValue("proxyMaxRealVehicles", 12)) or 12))
@@ -490,13 +491,14 @@ local function decide(vehicles, activeVehID)
 				if cooled and not isActive and not v.proxyForceReal then
 					if not cfg.enabled then
 						-- proxy mode off: nothing gets demoted
-					elseif d > despawn2 and d > despawnCandD then
+					elseif d > despawn2 and d > despawnCandD then -- demotion stays on, it never spawns anything
 						despawnCand, despawnCandD = v, d
 					end
 					if d > farthestRealD then farthestReal, farthestRealD = v, d end
 				end
 			elseif isEligibleForReal(v) and cooled then
-				local wanted = (not cfg.enabled) or v.proxyForceReal or d < cfg.spawnDist
+				-- only explicit requests (spectate / requestRealVehicle) unless distance based real spawns are enabled
+				local wanted = (not cfg.enabled) or v.proxyForceReal or (cfg.autoReal and d < cfg.spawnDist)
 				local dd = v.proxyForceReal and -1 or d
 				if wanted and dd < nearestCandD then nearestCand, nearestCandD = v, dd end
 			end
@@ -516,7 +518,7 @@ local function decide(vehicles, activeVehID)
 	local limit = cfg.enabled and cfg.maxReal or math.huge
 
 	-- real -> proxy: make room for a much closer proxy (cap reached)
-	if realCount >= limit and cfg.enabled and farthestReal and farthestReal ~= despawnCand
+	if realCount >= limit and cfg.enabled and cfg.autoReal and farthestReal and farthestReal ~= despawnCand
 		and farthestRealD > nearestCandD + CAP_SWAP_MARGIN and clock >= nextDespawnAllowed then
 		nextDespawnAllowed = clock + DESPAWN_INTERVAL
 		if MPVehicleGE.demoteToProxy(farthestReal.serverVehicleString) then

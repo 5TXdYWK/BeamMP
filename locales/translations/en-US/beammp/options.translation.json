@@ -47,6 +47,8 @@
     "ui.options.beammp.simplifyRemoteVehicles.tooltip": "This setting will replace remote vehicles with the BeamNG provided 'traffic' versions. Reduces accuracy of collisions and visuals, but improves performance",
     "ui.options.beammp.enableProxyVehicles": "Use proxies for distant vehicles",
     "ui.options.beammp.enableProxyVehicles.tooltip": "Remote vehicles that are far away are drawn as simple coloured boxes instead of being spawned. Only the closest vehicles are spawned as real vehicles. Greatly improves performance on busy servers. Disable to always spawn every vehicle (old behaviour, unspawned vehicles show as blobs).",
+    "ui.options.beammp.proxyAutoReal": "Spawn nearby vehicles as real",
+    "ui.options.beammp.proxyAutoReal.tooltip": "Off: other players' vehicles always stay placeholders, a real vehicle only spawns when you spectate it. On: placeholders closer than the distance below become real vehicles.",
     "ui.options.beammp.proxyRealSpawnDistance": "Real vehicle spawn distance",
     "ui.options.beammp.proxyRealSpawnDistance.tooltip": "Proxies closer than this are swapped for real vehicles (subject to the limit below).",
     "ui.options.beammp.proxyRealDespawnDistance": "Real vehicle despawn distance",
