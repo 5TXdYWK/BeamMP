@@ -29,6 +29,7 @@ local cfg = {
 	poolSize = 4,
 	colliderModel = "simple_traffic",
 	smoothHandover = true,
+	replayState = true,
 	maxPredict = 0.3,
 	farShape = true,
 }
@@ -58,6 +59,7 @@ local function readSettings()
 	cfg.poolSize = math.max(0, math.floor(tonumber(settings.getValue("proxyColliderPoolSize", 4)) or 4))
 	cfg.colliderModel = settings.getValue("proxyColliderModel", "simple_traffic") or "simple_traffic"
 	cfg.smoothHandover = settings.getValue("proxySmoothHandover", true) ~= false
+	cfg.replayState = settings.getValue("proxyReplayState", true) ~= false
 	cfg.farShape = settings.getValue("proxyFarShape", true) ~= false
 	cfg.maxPredict = math.min(math.max(tonumber(settings.getValue("proxyMaxPrediction", 0.3)) or 0.3, 0.05), 2)
 end
@@ -634,10 +636,15 @@ local function placeOnProxy(veh, p)
 	return refPos:distance(target), turned
 end
 
+local flushReplayLater -- set in the STATE REPLAY section below (defined after this one)
+
 --- Called by MPVehicleGE.onVehicleReady for every remote vehicle.
 local function onRealVehicleReady(vehicle, veh)
 	local h = vehicle and vehicle.proxyHandover
-	if not h or h.state ~= "spawning" or not veh then return end
+	if not h or h.state ~= "spawning" or not veh then
+		if vehicle and veh and flushReplayLater then flushReplayLater(vehicle) end
+		return
+	end
 	local p = vehicle.proxy
 	if p and p.hasData then
 		local ok, moved, turned = pcall(placeOnProxy, veh, p)
@@ -652,6 +659,7 @@ local function onRealVehicleReady(vehicle, veh)
 	h.state = "syncing"
 	h.readyAt = clock
 	h.packets = vehicle.proxyPktCount or 0
+	if flushReplayLater then flushReplayLater(vehicle) end -- after the placement, so damage lands on the placed car
 end
 
 local function updateHandovers(vehicles)
@@ -680,6 +688,94 @@ end
 local function isInHandover(vehicle)
 	return vehicle ~= nil and vehicle.proxyHandover ~= nil
 end
+
+-- ============= STATE REPLAY =============
+-- Inputs, electrics, powertrain and damage packets go to the vehicle's VE side, which a proxy does not have (and a
+-- spawning vehicle does not have yet). They are kept per vehicle, merged where packets only carry changes, and
+-- replayed through the regular handlers once the real vehicle is ready, so lights, gear, engine state and broken
+-- parts are right from the start instead of after the next change.
+local REPLAY_MERGED = { electrics = { e = true }, powertrain = { l = true, e = true } }
+local REPLAY_ORDER = { { "nodes", "n" }, { "nodes", "g" }, { "powertrain", "e" }, { "powertrain", "l" }, { "powertrain", "h" },
+	{ "electrics", "e" }, { "inputs", "i" } }
+local REPLAY_HANDLERS = { nodes = "nodesGE", powertrain = "MPPowertrainGE", electrics = "MPElectricsGE", inputs = "MPInputsGE" }
+
+local function deepMerge(into, from)
+	for k, v in pairs(from) do
+		if type(v) == "table" and type(into[k]) == "table" then deepMerge(into[k], v) else into[k] = v end
+	end
+end
+
+-- true while packets for this vehicle would be lost: no game object, or it is still spawning, or paused
+local function isHeld(vehicle)
+	if not vehicle or vehicle.isLocal then return false end
+	if vehicle.hybridPaused then return true end
+	if vehicle.proxyHandover and vehicle.proxyHandover.state == "spawning" then return true end
+	return vehicle.isProxy == true and not vehicle.isSpawned
+end
+
+--- Called by the packet handlers before they apply a packet. Returns true if the packet was kept for later.
+-- @tparam string kind "inputs", "electrics", "powertrain" or "nodes"
+local function captureState(kind, vehicle, code, data)
+	if not cfg.replayState or not isHeld(vehicle) or type(data) ~= "string" then return false end
+	if kind == "nodes" and code ~= "n" and code ~= "g" then return false end
+	local store = vehicle.proxyReplay or {}
+	vehicle.proxyReplay = store
+	local key = kind .. ":" .. tostring(code)
+	if kind == "nodes" and code == "g" then
+		local groups = jsonDecode(data)
+		if type(groups) == "table" then
+			local set = store[key] or {}
+			for _, name in pairs(groups) do set[tostring(name)] = true end
+			store[key] = set
+		end
+	elseif REPLAY_MERGED[kind] and REPLAY_MERGED[kind][code] then
+		local decoded = jsonDecode(data)
+		if type(decoded) == "table" then
+			local merged = store[key] or {}
+			deepMerge(merged, decoded)
+			store[key] = merged
+		end
+	else
+		store[key] = data -- only the latest one matters
+	end
+	return true
+end
+
+--- The owner reset the vehicle: kept damage no longer applies.
+local function onVehicleResetWhileHeld(vehicle)
+	local store = vehicle and vehicle.proxyReplay
+	if store then store["nodes:n"], store["nodes:g"] = nil, nil end
+end
+
+--- Sends what was kept to the now ready vehicle, through the regular handlers.
+local function flushReplay(vehicle)
+	local store = vehicle and vehicle.proxyReplay
+	if not store then return end
+	vehicle.proxyReplay = nil
+	local sid = vehicle.serverVehicleString
+	local sent = 0
+	for _, item in ipairs(REPLAY_ORDER) do
+		local kind, code = item[1], item[2]
+		local value = store[kind .. ":" .. code]
+		local handler = _G[REPLAY_HANDLERS[kind]]
+		if value ~= nil and handler and handler.handle then
+			local data
+			if kind == "nodes" and code == "g" then
+				local list = {}
+				for name in pairs(value) do list[#list + 1] = name end
+				data = jsonEncode(list)
+			elseif type(value) == "table" then
+				data = jsonEncode(value)
+			else
+				data = value
+			end
+			local ok, err = pcall(handler.handle, code .. ":" .. sid .. ":" .. data)
+			if ok then sent = sent + 1 else log('W', 'MPProxyGE', "Replaying "..kind.." "..code.." for "..sid.." failed: "..tostring(err)) end
+		end
+	end
+	if sent > 0 then log('D', 'MPProxyGE', string.format("Replayed %d kept state packets to %s", sent, sid)) end
+end
+flushReplayLater = flushReplay
 
 -- ============= SWAP MANAGER =============
 local function isEligibleForReal(v)
@@ -945,6 +1041,9 @@ M.onSettingsChanged   = onSettingsChanged
 M.onRealVehicleReady  = onRealVehicleReady
 M.isInHandover        = isInHandover
 M.setOwnPing          = setOwnPing
+M.captureState        = captureState
+M.flushReplay         = flushReplay
+M.onVehicleResetWhileHeld = onVehicleResetWhileHeld
 M.finishHandover      = finishHandover
 M.onExtensionLoaded   = onExtensionLoaded
 M.onInit = function() setExtensionUnloadMode(M, "manual") end

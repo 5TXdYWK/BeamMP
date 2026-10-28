@@ -83,6 +83,8 @@
     "ui.options.beammp.proxyFarShape.tooltip": "Proxies without a mesh are drawn as a simple low poly car outline instead of a box.",
     "ui.options.beammp.proxyTargetFps": "Proxy mesh FPS target",
     "ui.options.beammp.proxyTargetFps.tooltip": "While the frame rate is below this, fewer proxies get body meshes (the rest are drawn as shapes). 0 turns this off.",
+    "ui.options.beammp.proxyReplayState": "Replay state when a proxy becomes real",
+    "ui.options.beammp.proxyReplayState.tooltip": "Lights, gear, engine state, inputs and broken parts received while a vehicle was a proxy are kept and applied when its real vehicle is ready.",
     "ui.options.beammp.enableBlobs": "Enable blobs for unspawned vehicles",
     "ui.options.beammp.enableBlobs.tooltip": "Unspawned vehicles will appear as colored spheres (blobs)",
     "ui.options.beammp.showSpectators": "Show spectators' nametag under vehicle nametags",

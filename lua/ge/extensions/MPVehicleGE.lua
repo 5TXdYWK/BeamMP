@@ -2332,6 +2332,7 @@ local function onServerVehicleResetted(serverVehicleID, data)
 	if resetVehicle and resetVehicle.isProxy and not resetVehicle.isSpawned then
 		local pr = jsonDecode(data)
 		if pr and MPProxyGE then MPProxyGE.snapProxy(resetVehicle, pr.pos, pr.rot) end
+		if MPProxyGE then MPProxyGE.onVehicleResetWhileHeld(resetVehicle) end
 		lastResetTime[serverVehicleID] = localCounter
 		return
 	end
