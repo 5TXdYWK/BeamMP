@@ -128,7 +128,7 @@
     "ui.options.beammp.proxyEngineAutoShift": "Automatic gear shifts",
     "ui.options.beammp.proxyEngineAutoShift.tooltip": "For proxies driving in an automatic gear (D), the engine sound shifts through the gears with a short shift time and kickdown, instead of jumping to the gear that fits the speed.",
     "ui.options.beammp.proxyTabCycle": "Tab cycles through proxies",
-    "ui.options.beammp.proxyTabCycle.tooltip": "After your real vehicles, Tab moves the camera to each proxy vehicle (orbit it with the usual camera controls) and spawns it for real in the background, then enters it once ready.",
+    "ui.options.beammp.proxyTabCycle.tooltip": "After your real vehicles, Tab moves the camera to each proxy vehicle so you can watch it and orbit it with the usual camera controls.",
     "ui.options.beammp.proxyComRideHeight": "Ride height from the centre of mass",
     "ui.options.beammp.proxyComRideHeight.tooltip": "Places the proxy mesh using the vehicle's centre of mass worked out from its jbeam node weights, instead of a guess from the body bounds. Fixes proxies that float or sink.",
     "ui.options.beammp.proxyLiveries": "Show liveries",

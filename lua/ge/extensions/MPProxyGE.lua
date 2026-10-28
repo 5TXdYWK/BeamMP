@@ -1670,8 +1670,8 @@ end
 
 
 -- Tab cycling: after the real vehicles, Tab walks through the proxies. The camera orbits the proxy (free camera
--- placed every frame, driven by the same MoveManager yaw/pitch/zoom values the orbit camera mode reads) while a
--- real spawn is requested through requestReal, then we enter the real vehicle once it is ready.
+-- placed every frame, driven by the same MoveManager yaw/pitch/zoom values the orbit camera mode reads). Camera only,
+-- Tab never spawns anything.
 local tab = { v = nil, home = nil, yaw = 0, pitch = 12, dist = 8, target = vec3(), seeded = false }
 local origSwitchCycle = nil
 
@@ -1727,8 +1727,7 @@ local function tabFocus(v)
 		tab.speed = core_camera.getSpeed() or 30
 		core_camera.setSpeed(0)
 	end
-	requestReal(v)
-	log('I', 'MPProxyGE', "Tab: camera on proxy " .. tostring(v.serverVehicleID) .. ", real spawn requested")
+	log('I', 'MPProxyGE', "Tab: camera on proxy " .. tostring(v.serverVehicleID))
 end
 
 local function switchCycle(player, dir)
@@ -1781,7 +1780,8 @@ tabUpdate = function(dt)
 		return tabStop(tab.home)
 	end
 	if v.isSpawned and not v.proxyHandover and not v.hybridPaused and v.gameVehicleID and getObjectByID(v.gameVehicleID) then
-		log('I', 'MPProxyGE', "Tab: real vehicle ready, entering " .. tostring(v.serverVehicleID))
+		-- spawned for real by the normal rules (distance, auto real) while watched: the proxy is gone, enter the car
+		log('I', 'MPProxyGE', "Tab: watched proxy became a real vehicle, entering " .. tostring(v.serverVehicleID))
 		return tabStop(v.gameVehicleID)
 	end
 	if tab.seeded and not commands.isFreeCamera(0) then -- user changed camera, let go
@@ -1790,7 +1790,6 @@ tabUpdate = function(dt)
 		return
 	end
 	tab.seeded = true
-	if not v.proxyForceReal and v.isProxy and not v.isSpawned then requestReal(v) end
 	-- same inputs as cameraModes/orbit.lua (MoveManager yaw/pitch relative and axis values, zoomIn/zoomOut)
 	local mm = MoveManager
 	if mm then
