@@ -1727,6 +1727,13 @@ local function spawnDestroyedVehicles(serverVehID)
 		return
 	end
 
+	-- removed by the user while proxies were on: it is a proxy now, restoring means spawning it for real again
+	if vehicles[serverVehID].proxyUserUnloaded and MPProxyGE and MPProxyGE.isEnabled() then
+		MPProxyGE.requestReal(vehicles[serverVehID])
+		UI.showNotification('Restoring '..tostring(vehicles[serverVehID].ownerName).."'s "..tostring(vehicles[serverVehID].jbeam), ''..serverVehID..'respawn', 'directions_car')
+		return
+	end
+
 	if vehicles[serverVehID].isDeleted == false then
 		UI.showNotification(''..vehicles[serverVehID].ownerName.."'s "..vehicles[serverVehID].jbeam.." hasn't been deleted yet?", ''..serverVehID..'delete', 'warning')
 		log("I", "restorePlayerVehicle", "This vehicle hasn't been deleted yet")
