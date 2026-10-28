@@ -1488,6 +1488,8 @@ local function tabStop(enterId)
 	local hadFocus = tab.v ~= nil
 	tab.v = nil
 	if not hadFocus then return end
+	if tab.speed and core_camera.setSpeed then core_camera.setSpeed(tab.speed) end
+	tab.speed = nil
 	if commands and commands.setGameCamera then commands.setGameCamera(0) end
 	local veh = enterId and getObjectByID(enterId)
 	if veh then
@@ -1505,6 +1507,11 @@ local function tabFocus(v)
 	local fwd = v.proxy.rrot * vec3(0, -1, 0) -- BeamNG vehicles face -Y
 	tab.yaw = math.deg(math.atan2(fwd.x, fwd.y))
 	if commands and commands.setFreeCamera and not commands.isFreeCamera(0) then commands.setFreeCamera(0) end
+	-- the free camera would also fly on WASD; fly speed 0 while we place it (restored in tabStop)
+	if not tab.speed and core_camera.getSpeed and core_camera.setSpeed then
+		tab.speed = core_camera.getSpeed() or 30
+		core_camera.setSpeed(0)
+	end
 	requestReal(v)
 	log('I', 'MPProxyGE', "Tab: camera on proxy " .. tostring(v.serverVehicleID) .. ", real spawn requested")
 end
@@ -1562,7 +1569,11 @@ tabUpdate = function(dt)
 		log('I', 'MPProxyGE', "Tab: real vehicle ready, entering " .. tostring(v.serverVehicleID))
 		return tabStop(v.gameVehicleID)
 	end
-	if tab.seeded and not commands.isFreeCamera(0) then tab.v = nil return end -- user changed camera, let go
+	if tab.seeded and not commands.isFreeCamera(0) then -- user changed camera, let go
+		if tab.speed and core_camera.setSpeed then core_camera.setSpeed(tab.speed) end
+		tab.v, tab.speed = nil, nil
+		return
+	end
 	tab.seeded = true
 	if not v.proxyForceReal and v.isProxy and not v.isSpawned then requestReal(v) end
 	-- same inputs as cameraModes/orbit.lua (MoveManager yaw/pitch relative and axis values, zoomIn/zoomOut)
