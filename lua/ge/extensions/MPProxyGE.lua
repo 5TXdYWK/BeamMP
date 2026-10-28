@@ -516,7 +516,16 @@ end
 -- @tparam number dt
 -- @tparam vec3 cameraPos distance reference (active vehicle, or camera in free cam)
 -- @tparam number activeVehID game id of the vehicle the local player is in, or nil
+-- perf / tier statistics for MPProxyTest (cheap counters, no allocations)
+local hasHptimer = type(hptimer) == "function"
+local perfTimer = hasHptimer and hptimer() or nil
+local stats = { frames = 0, totalMs = 0, maxMs = 0, decideMs = 0, decides = 0, mesh = 0, box = 0, prism = 0, hidden = 0 }
+local function resetPerf()
+	stats.frames, stats.totalMs, stats.maxMs, stats.decideMs, stats.decides = 0, 0, 0, 0, 0
+end
+
 local function update(dt, cameraPos, activeVehID)
+	if perfTimer then perfTimer:stopAndReset() end
 	clock = clock + dt
 	refPos:set(cameraPos)
 	local activeVeh = activeVehID and getObjectByID(activeVehID)
@@ -528,6 +537,7 @@ local function update(dt, cameraPos, activeVehID)
 	tmpV:set(camX, camY, camZ)
 	local camPos = vec3(tmpV) -- one allocation per frame, not per proxy
 	local drawDist2 = cfg.drawDist * cfg.drawDist
+	local nMesh, nBox, nPrism, nHidden = 0, 0, 0, 0
 
 	for _, v in pairs(vehicles) do
 		local p = v.proxy
@@ -538,16 +548,25 @@ local function update(dt, cameraPos, activeVehID)
 				if d2 < drawDist2 then
 					local dist = math.sqrt(d2)
 					-- tier 1: real body meshes (MPProxyMeshGE), tier 2: box, tier 3 (beyond drawDist): nametag only
-					if not (p.meshObjects and MPProxyMeshGE and MPProxyMeshGE.drawProxy(p, dist)) then
+					if p.meshObjects and MPProxyMeshGE and MPProxyMeshGE.drawProxy(p, dist) then
+						nMesh = nMesh + 1
+					else
 						drawProxy(p, camPos, dist)
+						if dist > DETAIL_DISTANCE then nPrism = nPrism + 1 else nBox = nBox + 1 end
 					end
+				else
+					nHidden = nHidden + 1
 				end
 			end
 		end
 	end
 
+	stats.mesh, stats.box, stats.prism, stats.hidden = nMesh, nBox, nPrism, nHidden
+
 	decisionTimer = decisionTimer - dt
-	if decisionTimer <= 0 then
+	local decideStart = perfTimer and perfTimer:stop() or 0
+	local didDecide = decisionTimer <= 0
+	if didDecide then
 		decisionTimer = DECISION_INTERVAL
 		decide(vehicles, activeVehID)
 		updateColliders(vehicles)
@@ -565,7 +584,41 @@ local function update(dt, cameraPos, activeVehID)
 			end
 		end
 	end
+	if perfTimer then
+		local ms = perfTimer:stop()
+		stats.frames = stats.frames + 1
+		stats.totalMs = stats.totalMs + ms
+		if ms > stats.maxMs then stats.maxMs = ms end
+		if didDecide then
+			stats.decides = stats.decides + 1
+			stats.decideMs = stats.decideMs + (ms - decideStart)
+		end
+	end
 end
+
+--- Returns tier counts, collider usage and per frame cost of update(). Resets the perf window if resetWindow is set.
+local function getStats(resetWindow)
+	local out = { mesh = stats.mesh, box = stats.box, prism = stats.prism, hidden = stats.hidden,
+		real = 0, realQueued = 0, proxies = 0, collidersUsed = 0, collidersPool = 0, timerAvailable = perfTimer ~= nil,
+		frames = stats.frames, avgMs = stats.frames > 0 and stats.totalMs / stats.frames or 0, maxMs = stats.maxMs,
+		avgDecideMs = stats.decides > 0 and stats.decideMs / stats.decides or 0 }
+	for _, v in pairs(MPVehicleGE.getVehicles()) do
+		if not v.isLocal then
+			if v.isSpawned then out.real = out.real + 1
+			elseif v.isProxy then
+				out.proxies = out.proxies + 1
+				if v.proxyForceReal then out.realQueued = out.realQueued + 1 end
+			end
+		end
+	end
+	for _, c in pairs(colliders) do
+		out.collidersPool = out.collidersPool + 1
+		if c.serverVehicleID then out.collidersUsed = out.collidersUsed + 1 end
+	end
+	if resetWindow then resetPerf() end
+	return out
+end
+M.getStats = getStats
 
 --- Asks the manager to swap a proxy for a real vehicle as soon as possible (ignores distance, cap and interval).
 local function requestReal(vehicle)

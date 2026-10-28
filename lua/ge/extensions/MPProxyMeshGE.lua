@@ -508,10 +508,33 @@ local function drawProxy(p, dist)
 	return true
 end
 
+local buildTimer = type(hptimer) == "function" and hptimer() or nil
+local buildStats = { ms = 0, frames = 0, maxMs = 0 }
+
 local function onUpdate(dtReal)
 	clock = clock + (dtReal or 0)
 	if not cfg.enabled then return end
-	if currentJob or #jobs > 0 then stepJobs() end
+	if currentJob or #jobs > 0 then
+		if buildTimer then buildTimer:stopAndReset() end
+		stepJobs()
+		if buildTimer then
+			local ms = buildTimer:stop()
+			buildStats.ms, buildStats.frames = buildStats.ms + ms, buildStats.frames + 1
+			if ms > buildStats.maxMs then buildStats.maxMs = ms end
+		end
+	end
+end
+
+--- Cache / pool statistics for MPProxyTest.
+local function getStats(resetWindow)
+	local out = { queued = #jobs + (currentJob and 1 or 0), building = currentJob and currentJob.job and currentJob.job.key or nil,
+		ready = 0, failed = 0, liveObjects = liveCount,
+		buildFrames = buildStats.frames, avgBuildMs = buildStats.frames > 0 and buildStats.ms / buildStats.frames or 0, maxBuildMs = buildStats.maxMs }
+	for _, sh in pairs(shapes) do
+		if sh.state == "ready" then out.ready = out.ready + 1 elseif sh.state == "failed" then out.failed = out.failed + 1 end
+	end
+	if resetWindow then buildStats.ms, buildStats.frames, buildStats.maxMs = 0, 0, 0 end
+	return out
 end
 
 local function reset()
@@ -551,6 +574,7 @@ M.release           = release
 M.forget            = forget
 M.reset             = reset
 M.onUpdate          = onUpdate
+M.getStats          = getStats
 M.onSettingsChanged = onSettingsChanged
 M.onExtensionLoaded = onExtensionLoaded
 M.onClientEndMission = reset
