@@ -6068,6 +6068,31 @@
                 "tooltip",
                 "setting"
               ]
+            },
+            {
+              "version": "0.38",
+              "label": "ui.options.beammp.proxyWheelDetails",
+              "tooltip": "ui.options.beammp.proxyWheelDetails.tooltip",
+              "setting": "proxyWheelDetails",
+              "interactive": true,
+              "condition_always_off": false,
+              "condition_not_shipping": false,
+              "condition_simplemenu": "",
+              "condition_visible": "beammpProxyRealWheels",
+              "condition_enabled": "beammpProxyRealWheels",
+              "itemType": "checkbox",
+              "component": "OptionsCheckbox",
+              "separateLabel": true,
+              "lua": "",
+              "luaOff": "",
+              "valueOn": true,
+              "valueOff": false,
+              "search": [
+                "label",
+                "caption",
+                "tooltip",
+                "setting"
+              ]
             }
           ]
         },

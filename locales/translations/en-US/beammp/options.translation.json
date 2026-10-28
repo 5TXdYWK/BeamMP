@@ -133,6 +133,8 @@
     "ui.options.beammp.proxyComRideHeight.tooltip": "Places the proxy mesh using the vehicle's centre of mass worked out from its jbeam node weights, instead of a guess from the body bounds. Fixes proxies that float or sink.",
     "ui.options.beammp.proxyLiveries": "Show liveries",
     "ui.options.beammp.proxyLiveries.tooltip": "Applies the vehicle's livery (skin) from its config to the proxy mesh, like police or taxi designs.",
+    "ui.options.beammp.proxyWheelDetails": "Wheel details (brake discs, hubs)",
+    "ui.options.beammp.proxyWheelDetails.tooltip": "Adds brake discs and wheel hubs to the proxy wheels where the vehicle has them as wheel meshes. Calipers stay hidden because they don't turn with the wheel.",
     "ui.options.beammp.proxyGroup.general": "General",
     "ui.options.beammp.proxyGroup.realVehicles": "Real vehicles & spawning",
     "ui.options.beammp.proxyGroup.meshes": "Meshes & detail",

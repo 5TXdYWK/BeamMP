@@ -53,6 +53,7 @@ local function readSettings()
 	cfg.maxProxies = math.max(0, math.floor(tonumber(settings.getValue("proxyMaxMeshProxies", 48)) or 48))
 	cfg.wheels = settings.getValue("proxyMeshWheels", true) ~= false
 	cfg.realWheels = settings.getValue("proxyMeshRealWheels", true) ~= false
+	cfg.wheelDetails = settings.getValue("proxyWheelDetails", false) == true
 	cfg.liveries = settings.getValue("proxyLiveries", true) ~= false
 	cfg.comRide = settings.getValue("proxyComRideHeight", true) ~= false
 	cfg.metallicPaint = settings.getValue("proxyMetallicPaint", true) ~= false
@@ -300,7 +301,7 @@ end
 local ENGINE_FIELDS = { idleRPM = true, maxRPM = true, revLimiterRPM = true, soundConfig = true, soundConfigExhaust = true, requiredEnergyType = true }
 local SOUND_FIELDS = { sampleName = true, sampleFolder = true, mainGain = true, onLoadGain = true, offLoadGain = true,
 	intakeMuffling = true, exhaustAudioMufflingBaseCoef = true }
-local ENGINE_INDEX_VERSION = 6 -- 6: livery fields; part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists, 5: node mass buckets)
+local ENGINE_INDEX_VERSION = 7 -- 7: hub / brake disc flexbodies; 6: livery fields; part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists, 5: node mass buckets)
 local BODY_VERSION = 2 -- per config meta written before this is not reused as is (2: wheel / tire / brake meshes left out of the body)
 
 local function keepFields(decoded, fields)
@@ -438,9 +439,10 @@ end
 
 -- positioned flexbodies of the wheels (rim, tire, hubcap): mesh, the wheel names from its groups ("tire_FR" -> FR),
 -- pos / rot / scale as written (values may be "$var" / "$=" expressions, evaluated per config)
-local WHEEL_GROUPS = { wheel = true, tire = true, tyre = true, hubcap = true, rim = true }
+local WHEEL_GROUPS = { wheel = true, tire = true, tyre = true, hubcap = true, rim = true, wheelhub = "d", hub = "d", brake = "d" } -- "d": detail
 local function compactWheelFlex(text, filename)
-	if not (string.find(text, "tire_", 1, true) or string.find(text, "wheel_", 1, true) or string.find(text, "hubcap_", 1, true)) then return nil end
+	if not (string.find(text, "tire_", 1, true) or string.find(text, "wheel_", 1, true) or string.find(text, "hubcap_", 1, true)
+		or string.find(text, "hub_", 1, true) or string.find(text, "brake_", 1, true)) then return nil end
 	local ok, rows = pcall(jsonDecode, text, filename)
 	checkBudget()
 	if not ok or type(rows) ~= "table" then return nil end
@@ -449,15 +451,16 @@ local function compactWheelFlex(text, filename)
 		if type(row) == "table" and type(row[1]) == "string" and row[1] ~= "mesh" and type(row[2]) == "table" then
 			local opt = row[#row]
 			opt = (type(opt) == "table" and opt[1] == nil and type(opt.pos) == "table") and opt or nil
-			local sides, seen, tire = {}, {}, nil
+			local sides, seen, tire, detail = {}, {}, nil, true
 			for _, g in ipairs(row[2]) do
 				local pre, side = string.match(type(g) == "string" and g or "", "^(%a+)_(.+)$")
 				pre = pre and string.lower(pre)
+				if pre and WHEEL_GROUPS[pre] and WHEEL_GROUPS[pre] ~= "d" then detail = nil end
 				if pre and WHEEL_GROUPS[pre] and not seen[side] then seen[side] = true sides[#sides + 1] = side end
 				if pre == "tire" or pre == "tyre" then tire = true end
 			end
 			if opt and #sides > 0 then
-				list[#list + 1] = { m = row[1], w = sides, p = vec3Raw(opt.pos), r = vec3Raw(opt.rot) or nil, s = vec3Raw(opt.scale) or nil, t = tire }
+				list[#list + 1] = { m = row[1], w = sides, p = vec3Raw(opt.pos), r = vec3Raw(opt.rot) or nil, s = vec3Raw(opt.scale) or nil, t = tire, d = detail }
 			end
 		end
 	end
@@ -768,7 +771,9 @@ local function resolveWheels(job)
 		for _, side in ipairs(fb.w or {}) do w = w or byName[side] end
 		local p = fb.p
 		local lm = type(fb.m) == "string" and string.lower(fb.m) or ""
-		local hidden = string.find(lm, "brake", 1, true) or string.find(lm, "disc", 1, true) or string.find(lm, "caliper", 1, true)
+		-- calipers do not turn with the wheel, never; brake discs / hubs only with the wheel details setting
+		local hidden = string.find(lm, "caliper", 1, true)
+			or (not cfg.wheelDetails and (fb.d or string.find(lm, "brake", 1, true) or string.find(lm, "disc", 1, true)))
 		if w and type(fb.m) == "string" and p and not hidden then -- brake parts sit behind the rim
 			local x, y, z = evalVal(p[1], vars), evalVal(p[2], vars), evalVal(p[3], vars)
 			if x and y and z then
@@ -1451,12 +1456,12 @@ local function runJob(job)
 			end
 			shape.sound = meta.sound
 			finishBBox(shape, meta.bbox, job.model)
-			if meta.wheelV ~= WHEEL_VERSION then
+			if meta.wheelV ~= WHEEL_VERSION or (meta.wheelDet == true) ~= cfg.wheelDetails then
 				local w, why = resolveWheels(job)
 				meta.wheels = checkWheels(w, shape) or false
 				meta.com = job.com or false
 				meta.skin = job.skin or false
-				meta.wheelV = WHEEL_VERSION
+				meta.wheelV, meta.wheelDet = WHEEL_VERSION, cfg.wheelDetails
 				logWheels(job, meta.wheels or nil, why)
 				jsonWriteFile(metaFile, meta, false)
 			elseif meta.wheels then
@@ -1511,8 +1516,9 @@ local function runJob(job)
 			logWheels(job, shape.wheels, why)
 			shape.com, shape.skin = job.com, job.skin
 			mm.wheels, mm.wheelV, mm.bodyV, mm.com, mm.skin = shape.wheels or false, WHEEL_VERSION, BODY_VERSION, job.com or false, job.skin or false
+			mm.wheelDet = cfg.wheelDetails
 			jsonWriteFile(metaFile, mm, false)
-			mm.sound, mm.wheels, mm.wheelV, mm.bodyV, mm.com, mm.skin = nil, nil, nil, nil, nil, nil
+			mm.sound, mm.wheels, mm.wheelV, mm.bodyV, mm.com, mm.skin, mm.wheelDet = nil, nil, nil, nil, nil, nil, nil
 			shape.paths = mm.paths
 			shape.tiers = mm.tiers
 			shape.fromCache = true
@@ -1600,7 +1606,7 @@ local function runJob(job)
 	shape.wheels = checkWheels(wl, shape)
 	shape.com, shape.skin = job.com, job.skin
 	logWheels(job, shape.wheels, why)
-	metaData.com, metaData.skin = job.com or false, job.skin or false
+	metaData.com, metaData.skin, metaData.wheelDet = job.com or false, job.skin or false, cfg.wheelDetails
 	metaData.sound, metaData.wheels, metaData.wheelV, metaData.bodyV = shape.sound, shape.wheels or false, WHEEL_VERSION, BODY_VERSION
 	jsonWriteFile(metaFile, metaData, false)
 	shape.paths = paths
