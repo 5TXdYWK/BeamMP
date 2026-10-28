@@ -53,6 +53,7 @@ local function readSettings()
 	cfg.maxProxies = math.max(0, math.floor(tonumber(settings.getValue("proxyMaxMeshProxies", 48)) or 48))
 	cfg.wheels = settings.getValue("proxyMeshWheels", true) ~= false
 	cfg.realWheels = settings.getValue("proxyMeshRealWheels", true) ~= false
+	cfg.comRide = settings.getValue("proxyComRideHeight", true) ~= false
 	cfg.metallicPaint = settings.getValue("proxyMetallicPaint", true) ~= false
 	cfg.skipStatic = settings.getValue("proxySkipStaticUpdates", true) ~= false
 	cfg.suspension = settings.getValue("proxySuspension", false) == true
@@ -212,6 +213,9 @@ end
 -- did not look like a jbeam (the caller then decodes the whole file).
 -- array sections read for the wheel placement (wheelSecs[partName][key] = array text); nodes only of parts
 -- that also have a wheel section (hubs, wheels, suspension), body node lists are big and not needed
+-- node: default nodeWeight of the jbeam loader (lua/common/jbeam/loader.lua); wheel: pressure wheel nodes are
+-- generated at spawn, a rough wheel + tire mass instead
+local MASS = { node = 25, wheel = 30 }
 local WHEEL_KEYS = { slots = true, slots2 = true, pressureWheels = true, hubWheels = true, variables = true, nodes = true }
 
 local function extractFlexbodies(text, out, sections, wheelSecs)
@@ -263,8 +267,11 @@ local function extractFlexbodies(text, out, sections, wheelSecs)
 				arrStart = nil
 			end
 			if depth == 2 then
+				if nodesFrom then -- every part's nodes: wheel placement and the mass estimate (centre of mass)
+					partSecs = partSecs or {}
+					partSecs.nodes = sub(text, nodesFrom, nodesTo)
+				end
 				if partSecs then
-					if nodesFrom and (partSecs.pressureWheels or partSecs.hubWheels) then partSecs.nodes = sub(text, nodesFrom, nodesTo) end
 					wheelSecs[partName] = partSecs
 				end
 				partName, partSecs, nodesFrom = nil, nil, nil
@@ -284,7 +291,7 @@ end
 local ENGINE_FIELDS = { idleRPM = true, maxRPM = true, revLimiterRPM = true, soundConfig = true, soundConfigExhaust = true, requiredEnergyType = true }
 local SOUND_FIELDS = { sampleName = true, sampleFolder = true, mainGain = true, onLoadGain = true, offLoadGain = true,
 	intakeMuffling = true, exhaustAudioMufflingBaseCoef = true }
-local ENGINE_INDEX_VERSION = 4 -- part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists)
+local ENGINE_INDEX_VERSION = 5 -- part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists, 5: node mass buckets)
 local BODY_VERSION = 2 -- per config meta written before this is not reused as is (2: wheel / tire / brake meshes left out of the body)
 
 local function keepFields(decoded, fields)
@@ -386,18 +393,35 @@ local function compactWheelPart(secs, filename)
 		if #list > 0 then out.pw = list any = true end
 	end
 	local nodes = dec("nodes")
-	if nodes and out.pw then
+	if nodes then
 		local list = {}
+		-- mass buckets per nodeOffset group: weight, weighted x / y / z sums and the weight on each x side
+		-- (the slot / modifier offset moves x away from the centre line, see moved() in resolveWheels)
+		local groups, g, weight, lastOff = {}, nil, MASS.node, nil
 		for _, row in ipairs(nodes) do
 			if type(row) == "table" then
 				if row[1] == nil then
-					if row.nodeOffset ~= nil then list[#list + 1] = { off = vec3Raw(row.nodeOffset) } end
+					if row.nodeOffset ~= nil then lastOff = vec3Raw(row.nodeOffset) list[#list + 1] = { off = lastOff } g = nil end
+					if row.nodeWeight ~= nil then weight = tonumber(row.nodeWeight) or MASS.node end
 				elseif type(row[1]) == "string" and row[1] ~= "id" and scalar(row[2]) and scalar(row[3]) and scalar(row[4]) then
-					list[#list + 1] = { row[1], scalar(row[2]), scalar(row[3]), scalar(row[4]) }
+					if out.pw then list[#list + 1] = { row[1], scalar(row[2]), scalar(row[3]), scalar(row[4]) } end
+					local x, y, z = tonumber(row[2]), tonumber(row[3]), tonumber(row[4])
+					local last = row[#row]
+					local wt = type(last) == "table" and tonumber(last.nodeWeight) or weight
+					if x and y and z and wt and wt > 0 then
+						if not g then
+							-- mod: an explicit modifier row (false = reset to the slot offset), else the slot offset applies
+							g = { w = 0, x = 0, y = 0, z = 0, p = 0, n = 0, o = lastOff or nil, mod = lastOff ~= nil or nil }
+							groups[#groups + 1] = g
+						end
+						g.w, g.x, g.y, g.z = g.w + wt, g.x + wt * x, g.y + wt * y, g.z + wt * z
+						if x > 0 then g.p = g.p + wt elseif x < 0 then g.n = g.n + wt end
+					end
 				end
 			end
 		end
-		if #list > 0 then out.nodes = list end
+		if out.pw and #list > 0 then out.nodes = list end
+		if #groups > 0 then out.mass = groups any = true end
 	end
 	return any and out or nil
 end
@@ -559,7 +583,7 @@ end
 -- (x away from the center line: posX + sign(posX) * x, lua/common/jbeam/utils.lua), pressureWheels options apply
 -- to the wheel rows after them, and each wheel is placed like lua/common/jbeam/sections/wheelTypes/pressureWheels.lua:
 -- midpoint of node1/node2 (or offsetFromNode), moved by wheelOffset along the axis, tireWidth wide, radius.
-local WHEEL_VERSION = 3 -- 3: tire flag per mesh; 2: named fields (mixed tables did not survive the json round trip), rim / tire meshes
+local WHEEL_VERSION = 4 -- 4: centre of mass estimate; 3: tire flag per mesh; 2: named fields (mixed tables did not survive the json round trip), rim / tire meshes
 local MAX_WHEEL_MESHES = 6 -- per wheel
 
 -- jbeam values: numbers, "$var", or "$=expression" (arithmetic, comparisons, and/or/not, case(c1, v1, ..., default),
@@ -624,7 +648,7 @@ local function resolveWheels(job)
 		if d and d.vars then for k, v in pairs(d.vars) do vars[k] = v end end
 	end
 	if type(vcf.vars) == "table" then for k, v in pairs(vcf.vars) do vars[k] = v end end
-	local nodes, items, visited, flex = {}, {}, {}, {}
+	local nodes, items, visited, flex, mass = {}, {}, {}, {}, {}
 	local function visit(name, off, path, depth)
 		if depth > 30 or visited[name] then return end
 		visited[name] = true
@@ -637,6 +661,7 @@ local function resolveWheels(job)
 				else nodes[r[1]] = { r[2], r[3], r[4], cur } end
 			end
 		end
+		if d.mass then for _, g in ipairs(d.mass) do mass[#mass + 1] = { g, off } end end
 		if d.pw then for _, it in ipairs(d.pw) do items[#items + 1] = it end end
 		if d.fb then for _, fb in ipairs(d.fb) do flex[#flex + 1] = { fb, off } end end
 		if d.slots then
@@ -692,6 +717,24 @@ local function resolveWheels(job)
 				end
 			end
 		end
+	end
+	-- centre of mass from the node weights (offsets like the loader: x away from the centre line), plus the wheels
+	local mw, mx, my, mz = 0, 0, 0, 0
+	for _, it in ipairs(mass) do
+		local g, off = it[1], it[2]
+		local o = off
+		if g.mod then o = g.o or off end
+		local ox, oy, oz = 0, 0, 0
+		if type(o) == "table" then ox, oy, oz = evalVal(o[1], vars) or 0, evalVal(o[2], vars) or 0, evalVal(o[3], vars) or 0 end
+		mw = mw + g.w
+		mx, my, mz = mx + g.x + ox * (g.p - g.n), my + g.y + oy * g.w, mz + g.z + oz * g.w
+	end
+	for _, w in ipairs(wheels) do
+		mw, mx, my, mz = mw + MASS.wheel, mx + MASS.wheel * w.x, my + MASS.wheel * w.y, mz + MASS.wheel * w.z
+	end
+	job.com = mw > 0 and { mx / mw, my / mw, mz / mw, mw } or nil
+	if job.com then
+		log('I', 'MPProxyMeshGE', string.format("Proxy centre of mass for %s: %.2f %.2f %.2f m, %.0f kg node mass", tostring(job.model), job.com[1], job.com[2], job.com[3], mw))
 	end
 	-- rim / tire / hubcap meshes: flexbody pos moved like the part's nodes (same slot nodeOffset), stored relative
 	-- to the wheel center, so a wheel object turns and rolls around its own origin
@@ -1389,6 +1432,7 @@ local function runJob(job)
 			if meta.wheelV ~= WHEEL_VERSION then
 				local w, why = resolveWheels(job)
 				meta.wheels = checkWheels(w, shape) or false
+				meta.com = job.com or false
 				meta.wheelV = WHEEL_VERSION
 				logWheels(job, meta.wheels or nil, why)
 				jsonWriteFile(metaFile, meta, false)
@@ -1396,6 +1440,7 @@ local function runJob(job)
 				logWheels(job, meta.wheels, ", cached")
 			end
 			shape.wheels = meta.wheels or nil
+			shape.com = meta.com or nil
 			setPhase("materials")
 			loadModelMaterials(job.model)
 			ensureMaterials(meta.materials)
@@ -1440,9 +1485,10 @@ local function runJob(job)
 			local w, why = resolveWheels(job)
 			shape.wheels = checkWheels(w, shape)
 			logWheels(job, shape.wheels, why)
-			mm.wheels, mm.wheelV, mm.bodyV = shape.wheels or false, WHEEL_VERSION, BODY_VERSION
+			shape.com = job.com
+			mm.wheels, mm.wheelV, mm.bodyV, mm.com = shape.wheels or false, WHEEL_VERSION, BODY_VERSION, job.com or false
 			jsonWriteFile(metaFile, mm, false)
-			mm.sound, mm.wheels, mm.wheelV, mm.bodyV = nil, nil, nil, nil
+			mm.sound, mm.wheels, mm.wheelV, mm.bodyV, mm.com = nil, nil, nil, nil, nil
 			shape.paths = mm.paths
 			shape.tiers = mm.tiers
 			shape.fromCache = true
@@ -1528,7 +1574,9 @@ local function runJob(job)
 	finishBBox(shape, bbox, job.model)
 	local wl, why = resolveWheels(job)
 	shape.wheels = checkWheels(wl, shape)
+	shape.com = job.com
 	logWheels(job, shape.wheels, why)
+	metaData.com = job.com or false
 	metaData.sound, metaData.wheels, metaData.wheelV, metaData.bodyV = shape.sound, shape.wheels or false, WHEEL_VERSION, BODY_VERSION
 	jsonWriteFile(metaFile, metaData, false)
 	shape.paths = paths
@@ -2022,7 +2070,17 @@ local function drawProxy(p, dist)
 	-- the packet position is the center of gravity, the mesh origin is the jbeam origin
 	local cx = shape.minX and (shape.minX + shape.maxX) * 0.5 or 0
 	local cy = shape.minY and (shape.minY + shape.maxY) * 0.5 or 0
-	local cz = (shape.groundZ or 0) + (p.cogH or 0.5)
+	local com = cfg.comRide and type(shape.com) == "table" and shape.com or nil
+	local cz
+	if com then
+		-- jbeam node mass centre (the packet position is the node mass weighted COG, velocityVE calcCOG)
+		local h = com[3] - (shape.groundZ or 0)
+		if h > 0.1 and h < 2.5 and math.abs(com[1]) < 3 and math.abs(com[2]) < 6 then
+			cx, cy, cz = com[1], com[2], com[3]
+			p.cogH = h -- box / far shape and the hybrid contact use the same height
+		end
+	end
+	cz = cz or (shape.groundZ or 0) + (p.cogH or 0.5)
 	org:set(p.rpos.x - (axX.x*cx + axY.x*cy + axZ.x*cz), p.rpos.y - (axX.y*cx + axY.y*cy + axZ.y*cz), p.rpos.z - (axX.z*cx + axY.z*cy + axZ.z*cz))
 	local r = p.rrot
 	local bx, by, bz, qx, qy, qz, qw = org.x, org.y, org.z, r.x, r.y, r.z, r.w
