@@ -36,6 +36,7 @@ local cfg = {
 	hybridMaxAwake = 6,
 	maxPredict = 0.3,
 	farShape = true,
+	lodShape = 600, -- low poly car shape below, a box in the paint colour above (LOD tiers after the mesh ones)
 }
 
 local DESPAWN_INTERVAL = 0.5   -- seconds between two real -> proxy swaps (despawns are cheap, but not free)
@@ -46,7 +47,6 @@ local MAX_RACC = 50            -- rad/s^2
 local OFFSET_SMOOTHING = 2     -- 1/s, how fast the sender clock offset follows new packets
 local SNAP_DISTANCE = 25       -- render position snaps instead of blending above this error
 local POS_BLEND = 12           -- 1/s, how fast the rendered pose converges to the prediction
-local DETAIL_DISTANCE = 600    -- full shaded box below, a single prism above
 local COLLIDER_RELEASE_MARGIN = 15
 
 local function readSettings()
@@ -69,6 +69,7 @@ local function readSettings()
 	cfg.hybridWakeDist = math.max(10, tonumber(settings.getValue("proxyHybridWakeDistance", 80)) or 80)
 	cfg.hybridMaxAwake = math.max(0, math.floor(tonumber(settings.getValue("proxyHybridMaxAwake", 6)) or 6))
 	cfg.farShape = settings.getValue("proxyFarShape", true) ~= false
+	cfg.lodShape = math.max(0, tonumber(settings.getValue("proxyLodShapeDistance", 600)) or 600)
 	cfg.maxPredict = math.min(math.max(tonumber(settings.getValue("proxyMaxPrediction", 0.3)) or 0.3, 0.05), 2)
 end
 
@@ -132,8 +133,12 @@ end
 local function paintToColor(vcf)
 	local paint = vcf and vcf.paints and vcf.paints[1]
 	local c = paint and paint.baseColor
-	if type(c) == "table" and c[1] then
-		return { r = (c[1] or 0.5) * 255, g = (c[2] or 0.5) * 255, b = (c[3] or 0.5) * 255 }
+	if type(c) ~= "table" or not c[1] then -- older configs: colors = {{r, g, b, a}, ...}
+		local old = vcf and type(vcf.colors) == "table" and vcf.colors[1]
+		c = type(old) == "table" and old or nil
+	end
+	if type(c) == "table" and tonumber(c[1]) then
+		return { r = (tonumber(c[1]) or 0.5) * 255, g = (tonumber(c[2]) or 0.5) * 255, b = (tonumber(c[3]) or 0.5) * 255 }
 	end
 	return { r = 140, g = 140, b = 150 }
 end
@@ -443,7 +448,10 @@ local function drawProxy(p, camPos, dist)
 	center:setScaled(hh - p.cogH)
 	center:setAdd(p.rpos)
 
-	if dist > DETAIL_DISTANCE then
+	-- small hysteresis so a proxy sitting on the boundary does not flicker between the two
+	local farLimit = cfg.lodShape * (p.farBox and 0.95 or 1.05)
+	p.farBox = dist > farLimit
+	if p.farBox then
 		-- far: one prism along the length axis, cheap
 		tmpV:set(axY)
 		tmpV:setScaled(hl)
@@ -1075,7 +1083,7 @@ local function update(dt, cameraPos, activeVehID)
 						nHidden = nHidden + 1 -- MPProxyTest vehicles are only ever shown as meshes
 					else
 						drawProxy(p, camPos, dist)
-						if dist > DETAIL_DISTANCE then nPrism = nPrism + 1 else nBox = nBox + 1 end
+						if p.farBox then nPrism = nPrism + 1 else nBox = nBox + 1 end
 					end
 				else
 					nHidden = nHidden + 1
