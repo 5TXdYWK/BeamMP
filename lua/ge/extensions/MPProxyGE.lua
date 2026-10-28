@@ -725,6 +725,9 @@ end
 --- Called by the packet handlers before they apply a packet. Returns true if the packet was kept for later.
 -- @tparam string kind "inputs", "electrics", "powertrain" or "nodes"
 local function captureState(kind, vehicle, code, data)
+	if kind == "inputs" and vehicle and vehicle.proxy and type(data) == "string" and isHeld(vehicle) then
+		vehicle.proxy.steer = tonumber(string.match(data, '"s"%s*:%s*([^,}%s]+)')) or vehicle.proxy.steer -- drawn wheels
+	end
 	if not cfg.replayState or not isHeld(vehicle) or type(data) ~= "string" then return false end
 	if kind == "nodes" and code ~= "n" and code ~= "g" then return false end
 	local store = vehicle.proxyReplay or {}

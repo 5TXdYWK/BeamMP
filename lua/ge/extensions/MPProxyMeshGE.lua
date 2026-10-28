@@ -23,7 +23,7 @@ setmetatable(_G,{}) -- temporarily disable global notifications
 
 local TIMER = (HighPerfTimer or hptimer)
 local CACHE_DIR = "/temp/beammp/proxymeshes/"
-local CACHE_VERSION = "v3" -- v3: one merged .dae per mesh set, source signature validation
+local CACHE_VERSION = "v4" -- v4: triangle budget (smallest parts dropped), v3: one merged .dae per mesh set, signatures
 local READ_CHUNK = 256 * 1024     -- bytes per read step (smaller steps keep each resume near the frame budget)
 local FRAME_BUDGET_MS = 2         -- coroutine work per frame in game
 local PRELOAD_BUDGET_MS = 40      -- while the join loading screen hides the stutter
@@ -34,7 +34,7 @@ local MAX_DETACHES_PER_PASS = 6   -- mesh -> box changes per pass, farthest firs
 local NEW_SHAPE_INTERVAL = 2      -- seconds between first uses of not yet loaded shapes (engine import hitch)
 local RELEASE_MARGIN = 50
 
-local cfg = { enabled = true, distance = 500, maxProxies = 48, wheels = true, targetFps = 0 }
+local cfg = { enabled = true, distance = 500, maxProxies = 48, wheels = true, targetFps = 0, triBudget = 60000, prebuild = false }
 
 local function readSettings()
 	cfg.enabled = settings.getValue("proxyMeshEnabled", true) ~= false
@@ -42,6 +42,8 @@ local function readSettings()
 	cfg.maxProxies = math.max(0, math.floor(tonumber(settings.getValue("proxyMaxMeshProxies", 48)) or 48))
 	cfg.wheels = settings.getValue("proxyMeshWheels", true) ~= false
 	cfg.targetFps = math.max(0, tonumber(settings.getValue("proxyTargetFps", 0)) or 0)
+	cfg.triBudget = math.max(0, math.floor(tonumber(settings.getValue("proxyMeshTriangleBudget", 60000)) or 60000))
+	cfg.prebuild = settings.getValue("proxyPrebuildModels", false) == true
 end
 
 -- ============= FRAME RATE TARGET =============
@@ -103,6 +105,9 @@ local shapes = {}         -- [key] = { state = "queued"|"building"|"ready"|"fail
 local materialsLoaded = {} -- [model] = true
 local jobs = {}           -- FIFO of { key, model, parts }
 local currentJob = nil
+local fallbackOf = {}     -- [config key] = key of the model's default config (shown while the config builds)
+local defaultKeys = {}    -- [model] = key | false
+local prebuildJobs = {}   -- background builds of default configs (proxyPrebuildModels), only when jobs is empty
 local importedPaths = {}  -- [dae path] = true once a TSStatic used it this session (engine keeps the shape loaded)
 local waitingLoad = {}    -- models with a ready shape waiting for the first-use interval (overlay)
 local clock = 0
@@ -218,6 +223,15 @@ local function updateBBox(bbox, geometryBlock)
 	end
 end
 
+-- triangles of a geometry block (triangles / polylist / polygons primitives, polygons counted as one each)
+local function countTriangles(block)
+	local n = 0
+	for tag, count in string.gmatch(block, "<(%a+)[^>]-count=\"(%d+)\"") do
+		if tag == "triangles" or tag == "polylist" or tag == "polygons" or tag == "tristrips" then n = n + (tonumber(count) or 0) end
+	end
+	return n
+end
+
 --- Streams one .dae. keepGeom(id, name) picks geometry blocks (appended to geoms, ids to keptIds),
 -- onNode(block, name, url) sees every flat scene node. geomsOnly stops after the geometry library.
 local function scanDae(filename, keepGeom, onNode, geomsOnly, header, geoms, keptIds, bbox)
@@ -269,6 +283,7 @@ local function scanDae(filename, keepGeom, onNode, geomsOnly, header, geoms, kep
 							if bbox then -- per geometry local bounds, placed by the node transform later
 								local gb = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
 								updateBBox(gb, block)
+								gb.tris = countTriangles(block)
 								bbox[id] = gb
 							end
 						end
@@ -362,27 +377,64 @@ local function filterDae(filename, wanted, bbox, mats)
 	local missingCount = 0
 	local geomBoxes = {}
 	local function keepByName(id, name) return wanted[name] or wanted[string.gsub(id, "%-mesh$", "")] end
+	local function addNode(block, url)
+		local nb = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
+		mergeNodeBBox(nb, block, geomBoxes[url])
+		mergeNodeBBox(bbox, block, geomBoxes[url])
+		local size = nb[1] <= nb[4] and math.sqrt((nb[4]-nb[1])^2 + (nb[5]-nb[2])^2 + (nb[6]-nb[3])^2) or 0
+		nodes[#nodes + 1] = { block = block .. "\n", url = url, tris = geomBoxes[url] and geomBoxes[url].tris or 0, size = size, mats = {} }
+		collectMaterials(block, nodes[#nodes].mats)
+	end
 	local ok = scanDae(filename, keepByName, function(block, name, url)
 		if not wanted[name] then return end
-		if keptIds[url] then
-			nodes[#nodes + 1] = block .. "\n"
-			mergeNodeBBox(bbox, block, geomBoxes[url])
-			collectMaterials(block, mats)
+		if keptIds[url] then addNode(block, url)
 		elseif not missing[url] then missing[url] = block missingCount = missingCount + 1 end
 	end, false, header, geoms, keptIds, geomBoxes)
 	if not ok then return nil end
 	if missingCount > 0 then
 		scanDae(filename, function(id) return missing[id] ~= nil and not keptIds[id] end, function() end, true, {}, geoms, keptIds, geomBoxes)
 		for url, block in pairs(missing) do
-			if keptIds[url] then
-				nodes[#nodes + 1] = block .. "\n"
-				mergeNodeBBox(bbox, block, geomBoxes[url])
-				collectMaterials(block, mats)
-			end
+			if keptIds[url] then addNode(block, url) end
 		end
 	end
 	if #nodes == 0 then return nil end
-	return { header = table.concat(header), geoms = geoms, nodes = nodes }
+	local geomById = {}
+	for _, g in ipairs(geoms) do
+		local id = string.match(g, '^<geometry id="([^"]*)"')
+		if id then geomById[id] = g end
+	end
+	return { header = table.concat(header), geomById = geomById, nodes = nodes }
+end
+
+-- keeps the biggest parts (by size) that fit into the triangle budget, over all files of a mesh set, and turns
+-- the parts into the plain lists mergeDae wants (only geometries some kept node uses)
+local function applyTriangleBudget(partsList, budget, mats)
+	local all = {}
+	for _, part in ipairs(partsList) do for _, n in ipairs(part.nodes) do all[#all + 1] = n end end
+	local total = 0
+	for _, n in ipairs(all) do total = total + n.tris end
+	local dropped = 0
+	if budget > 0 and total > budget then
+		table.sort(all, function(a, b) return a.size > b.size end)
+		local sum = 0
+		for _, n in ipairs(all) do
+			if sum + n.tris <= budget or sum == 0 then sum = sum + n.tris
+			else n.drop = true dropped = dropped + 1 end
+		end
+		total = sum
+	end
+	for _, part in ipairs(partsList) do
+		local nodes, geoms, used = {}, {}, {}
+		for _, n in ipairs(part.nodes) do
+			if not n.drop then
+				nodes[#nodes + 1] = n.block
+				for m in pairs(n.mats) do mats[m] = true end
+				if not used[n.url] and part.geomById[n.url] then used[n.url] = true geoms[#geoms + 1] = part.geomById[n.url] end
+			end
+		end
+		part.nodes, part.geoms = nodes, geoms
+	end
+	return total, dropped
 end
 
 -- ============= MERGING =============
@@ -511,7 +563,7 @@ local function runJob(job)
 	local meshList = {}
 	for mesh in pairs(wanted) do meshList[#meshList + 1] = mesh end
 	table.sort(meshList)
-	local meshKey = job.model .. "_" .. CACHE_VERSION .. "_m" .. hashString(job.model .. "|" .. table.concat(meshList, ","))
+	local meshKey = job.model .. "_" .. CACHE_VERSION .. "_m" .. hashString(job.model .. "|" .. cfg.triBudget .. "|" .. table.concat(meshList, ","))
 	local meshMetaFile = CACHE_DIR .. meshKey .. ".json"
 	if count > 0 and FS:fileExists(meshMetaFile) then
 		local mm = jsonReadFile(meshMetaFile)
@@ -540,7 +592,7 @@ local function runJob(job)
 	FS:directoryCreate(CACHE_DIR, true)
 	local groups, groupOrder = {}, {}
 	for _, dae in ipairs(daes) do
-		local part = filterDae(dae, wanted, bbox, mats)
+		local part = filterDae(dae, wanted, bbox, nil)
 		if part then
 			local gsig = daeSignature(part.header)
 			if not groups[gsig] then groups[gsig] = {} groupOrder[#groupOrder + 1] = gsig end
@@ -548,12 +600,22 @@ local function runJob(job)
 		end
 		coroutine.yield()
 	end
+	local allParts = {}
+	for _, gsig in ipairs(groupOrder) do for _, part in ipairs(groups[gsig]) do allParts[#allParts + 1] = part end end
+	local tris, dropped = applyTriangleBudget(allParts, cfg.triBudget, mats)
+	if dropped > 0 then
+		log('I', 'MPProxyMeshGE', string.format("Proxy mesh for %s: dropped %d small parts to fit %d triangles (kept %d)", job.model, dropped, cfg.triBudget, tris))
+	end
 	for g, gsig in ipairs(groupOrder) do
 		local out = CACHE_DIR .. meshKey .. "_" .. g .. ".dae"
+		local any = false
+		for _, part in ipairs(groups[gsig]) do if #part.nodes > 0 then any = true end end
+		if not any then goto nextGroup end
 		local text = mergeDae(groups[gsig])
 		coroutine.yield()
 		if writeFile(out, text) then paths[#paths + 1] = out end
 		coroutine.yield()
+		::nextGroup::
 	end
 	if #paths == 0 then
 		log('W', 'MPProxyMeshGE', string.format("No proxy mesh for %s: %d wanted meshes not found in %d .dae files of /vehicles/%s/", job.model, count, #daes, job.model))
@@ -577,6 +639,10 @@ end
 local function stepJobs()
 	if not currentJob then
 		local job = table.remove(jobs, 1)
+		if not job and cfg.prebuild then
+			job = table.remove(prebuildJobs, 1)
+			while job and shapes[job.key] and shapes[job.key].state ~= "queued" do job = table.remove(prebuildJobs, 1) end
+		end
 		if not job then return end
 		currentJob = { job = job, co = coroutine.create(runJob), started = clock, maxStepMs = 0, frames = 0 }
 	end
@@ -606,6 +672,45 @@ end
 --- Returns the mesh key for a model + config and queues the build if needed.
 -- @tparam string model jbeam name
 -- @tparam table vcf vehicle config from the spawn packet (vcf.parts = { slot = partName })
+
+local function configKey(model, vcf)
+	local parts = {}
+	for _, partName in pairs(vcf.parts) do
+		if type(partName) == "string" and partName ~= "" then parts[#parts + 1] = partName end
+	end
+	if vcf.mainPartName then parts[#parts + 1] = vcf.mainPartName end
+	table.sort(parts)
+	return model .. "_" .. CACHE_VERSION .. "_" .. hashString(model .. "|" .. table.concat(parts, ",")), parts
+end
+
+-- the parts of a model's default configuration (its default .pc), or nil
+local function defaultConfig(model)
+	local ok, info = pcall(core_vehicles.getModel, model)
+	local m = ok and type(info) == "table" and info.model or nil
+	local pcName = m and m.default_pc
+	if not pcName then return nil end
+	local pc = jsonReadFile("/vehicles/" .. model .. "/" .. pcName .. ".pc")
+	if type(pc) ~= "table" or type(pc.parts) ~= "table" then return nil end
+	return { parts = pc.parts, mainPartName = pc.mainPartName or model }
+end
+
+-- queues (or finds) the default config build of a model; cached ones go first, they resolve from disk at once
+local function requestDefault(model, toBackground)
+	if defaultKeys[model] ~= nil then return defaultKeys[model] or nil end
+	local vcf = defaultConfig(model)
+	if not vcf then defaultKeys[model] = false return nil end
+	local key, parts = configKey(model, vcf)
+	defaultKeys[model] = key
+	if not shapes[key] then
+		shapes[key] = { state = "queued" }
+		local job = { key = key, model = model, parts = parts }
+		if toBackground then prebuildJobs[#prebuildJobs + 1] = job
+		elseif FS:fileExists(CACHE_DIR .. key .. ".json") then table.insert(jobs, 1, job)
+		else jobs[#jobs + 1] = job end
+	end
+	return key
+end
+
 local function request(model, vcf)
 	if not model or type(vcf) ~= "table" or type(vcf.parts) ~= "table" then return nil end
 	local parts = {}
@@ -619,6 +724,10 @@ local function request(model, vcf)
 	if not shapes[key] then
 		shapes[key] = { state = "queued" }
 		jobs[#jobs + 1] = { key = key, model = model, parts = parts }
+	end
+	if fallbackOf[key] == nil then
+		local dkey = requestDefault(model, false)
+		fallbackOf[key] = (dkey and dkey ~= key) and dkey or false
 	end
 	return key
 end
@@ -694,6 +803,7 @@ local function detach(p)
 	for _, o in ipairs(p.meshObjects) do returnStatic(o.path, o.id) end
 	p.meshObjects = nil
 	p.meshShape = nil
+	p.meshFallback = nil
 end
 
 --- Decision pass (4 Hz, called by MPProxyGE): picks the nearest proxies with a ready shape.
@@ -733,8 +843,16 @@ local function decide(vehicles, refPos)
 		local p = c.v.proxy
 		if i > limit and not c.v.isFakeTest then
 			if p.meshObjects and detached < MAX_DETACHES_PER_PASS then detach(p) detached = detached + 1 end
-		elseif not p.meshObjects then
+		elseif p.meshObjects and p.meshFallback and shapes[p.meshKey] and shapes[p.meshKey].state == "ready" and created < MAX_NEW_OBJECTS_PER_PASS then
+			detach(p) -- the exact config is ready now, swap the default config mesh out (attached again below)
+		end
+		if not p.meshObjects and not (i > limit and not c.v.isFakeTest) then
 			local shape = shapes[p.meshKey]
+			p.meshFallback = nil
+			if not (shape and shape.state == "ready") then
+				local fb = fallbackOf[p.meshKey] and shapes[fallbackOf[p.meshKey]]
+				if fb and fb.state == "ready" then shape = fb p.meshFallback = true end
+			end
 			if shape and shape.state == "ready" and created < MAX_NEW_OBJECTS_PER_PASS then
 				if not shape.loaded and shape.paths then -- files already imported by another config of the same mesh set
 					local all = true
@@ -768,6 +886,7 @@ local unitX, unitY, unitZ = vec3(1,0,0), vec3(0,1,0), vec3(0,0,1)
 local ffiFound = ffi and ffi.C and true or false
 local drawCylinder = ffiFound and ffi.C.BNG_DBG_DRAW_Cylinder or nop
 local wheelColor = color(25, 25, 25, 255)
+local MAX_STEER = math.rad(30) -- drawn front wheel angle at full steering
 
 local function toWorld(lx, ly, lz)
 	return org.x + axX.x*lx + axY.x*ly + axZ.x*lz, org.y + axX.y*lx + axY.y*ly + axZ.y*lz, org.z + axX.z*lx + axY.z*ly + axZ.z*lz
@@ -798,11 +917,19 @@ local function drawProxy(p, dist)
 		local radius = math.min(math.max(H * 0.22, 0.28), 0.55)
 		local gz = (shape.groundZ or 0) + radius
 		local xo, xi = W * 0.5 - 0.03, W * 0.5 - 0.25
-		local yf, yr = cy - L * 0.32, cy + L * 0.32
+		local yf, yr = cy - L * 0.32, cy + L * 0.32 -- -Y is the front
+		-- front wheels turn with the last steering input of the remote driver (BeamMP inputs packet, -1..1)
+		local steer = math.max(-1, math.min(1, p.steer or 0)) * MAX_STEER
+		local sx, sy = math.cos(steer), math.sin(steer)
+		local half = (xo - xi) * 0.5
 		for side = -1, 1, 2 do
-			for _, y in ipairs({yf, yr}) do
-				local x1, y1, z1 = toWorld(cx + side * xi, y, gz)
-				local x2, y2, z2 = toWorld(cx + side * xo, y, gz)
+			for w = 1, 2 do
+				local y = w == 1 and yf or yr
+				local mx = cx + side * (xi + xo) * 0.5
+				local ax, ay = half, 0
+				if w == 1 and steer ~= 0 then ax, ay = half * sx, half * sy end
+				local x1, y1, z1 = toWorld(mx - ax, y - ay, gz)
+				local x2, y2, z2 = toWorld(mx + ax, y + ay, gz)
 				drawCylinder(x1, y1, z1, x2, y2, z2, radius, wheelColor, true)
 			end
 		end
@@ -936,6 +1063,8 @@ local function cleanOldCache()
 	if removed > 0 then log('I', 'MPProxyMeshGE', string.format("Removed %d old proxy mesh cache files (%.0f MB)", removed, bytes / 1048576)) end
 end
 
+local prebuildStarted = false
+
 local function onUpdate(dtReal)
 	clock = clock + (dtReal or 0)
 	if not cfg.enabled then return end
@@ -955,6 +1084,17 @@ local function onUpdate(dtReal)
 	end
 	updatePreload()
 	if not preload then drawOverlay() end -- the loading screen shows progress during preload
+	if cfg.prebuild and not preload and not prebuildStarted and MPCoreNetwork and MPCoreNetwork.isMPSession and MPCoreNetwork.isMPSession() then
+		prebuildStarted = true
+		local ok, list = pcall(function() return core_vehicles.getModelList().models end) -- once per session
+		local n = 0
+		for name, info in pairs(ok and type(list) == "table" and list or {}) do
+			if type(info) == "table" and info.Type ~= "Prop" and name ~= "unicycle" then
+				if requestDefault(name, true) then n = n + 1 end
+			end
+		end
+		log('I', 'MPProxyMeshGE', string.format("Prebuilding default config proxy meshes of %d models in the background", n))
+	end
 end
 
 --- Cache / pool statistics for MPProxyTest.
@@ -982,6 +1122,10 @@ local function reset()
 	materialsLoaded = {} -- materials are invalidated on mission end (core_vehicle_manager does the same)
 	shapes = {} -- rebuilt from the disk cache (cheap) on the next request
 	jobs = {}
+	prebuildJobs = {}
+	fallbackOf = {}
+	defaultKeys = {}
+	prebuildStarted = false
 	currentJob = nil
 end
 
