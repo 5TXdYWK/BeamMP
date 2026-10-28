@@ -24,7 +24,7 @@ setmetatable(_G,{}) -- temporarily disable global notifications
 local TIMER = (HighPerfTimer or hptimer)
 local CACHE_DIR = "/temp/beammp/proxymeshes/"
 local CACHE_VERSION = "v2" -- v2: transform aware bounding boxes, glow map materials
-local READ_CHUNK = 1024 * 1024    -- bytes per read step
+local READ_CHUNK = 256 * 1024     -- bytes per read step (smaller steps keep each resume near the frame budget)
 local FRAME_BUDGET_MS = 2         -- coroutine work per frame
 local MAX_MESHES = 60             -- per config
 local MAX_NEW_OBJECTS_PER_PASS = 4
@@ -66,6 +66,8 @@ local shapes = {}         -- [key] = { state = "queued"|"building"|"ready"|"fail
 local materialsLoaded = {} -- [model] = true
 local jobs = {}           -- FIFO of { key, model, parts }
 local currentJob = nil
+local importedPaths = {}  -- [dae path] = true once a TSStatic used it this session (engine keeps the shape loaded)
+local waitingLoad = {}    -- models with a ready shape waiting for the first-use interval (overlay)
 local clock = 0
 local nextNewShapeAllowed = 0
 
@@ -163,41 +165,47 @@ end
 local function scanDae(filename, keepGeom, onNode, geomsOnly, header, geoms, keptIds, bbox)
 	local f = io.open(filename, "r")
 	if not f then return false end
+	local find, sub, match = string.find, string.sub, string.match
 	local mode = "header"
-	local buf = ""
+	local buf, at = "", 1 -- unconsumed data is buf[at..]; buf is only rebuilt once per read chunk
 	local eof = false
 	while true do
 		if not eof then
 			local chunk = f:read(READ_CHUNK)
-			if chunk then buf = buf .. chunk else eof = true end
+			if chunk then
+				buf = (at > 1 and sub(buf, at) or buf) .. chunk -- one copy per chunk instead of one per geometry
+				at = 1
+			else
+				eof = true
+			end
 		end
 		local progressed = true
 		while progressed do
 			progressed = false
 			if mode == "header" then
-				local s = string.find(buf, "<library_geometries>", 1, true)
+				local s = find(buf, "<library_geometries>", at, true)
 				if s then
-					header[#header + 1] = string.sub(buf, 1, s - 1)
-					buf = string.sub(buf, s + 20)
+					header[#header + 1] = sub(buf, at, s - 1)
+					at = s + 20
 					mode = "geoms"
 					progressed = true
-				elseif #buf > 64 then
-					header[#header + 1] = string.sub(buf, 1, #buf - 64)
-					buf = string.sub(buf, #buf - 63)
+				elseif #buf - at > 64 then
+					header[#header + 1] = sub(buf, at, #buf - 64)
+					at = #buf - 63
 				end
 			elseif mode == "geoms" then
-				local s = string.find(buf, "<geometry ", 1, true)
-				local libEnd = string.find(buf, "</library_geometries>", 1, true)
+				local s = find(buf, "<geometry ", at, true)
+				local libEnd = find(buf, "</library_geometries>", at, true)
 				if libEnd and (not s or libEnd < s) then
-					buf = string.sub(buf, libEnd + 21)
+					at = libEnd + 21
 					mode = geomsOnly and "done" or "prescene"
 					progressed = true
 				elseif s then
-					local e = string.find(buf, "</geometry>", s, true)
+					local e = find(buf, "</geometry>", s, true)
 					if e then
-						local block = string.sub(buf, s, e + 10)
-						local id, name = string.match(block, '^<geometry id="([^"]*)" name="([^"]*)"')
+						local id, name = match(buf, '^<geometry id="([^"]*)" name="([^"]*)"', s)
 						if id and keepGeom(id, name) then
+							local block = sub(buf, s, e + 10) -- only kept blocks are copied
 							geoms[#geoms + 1] = block
 							keptIds[id] = true
 							if bbox then -- per geometry local bounds, placed by the node transform later
@@ -206,44 +214,46 @@ local function scanDae(filename, keepGeom, onNode, geomsOnly, header, geoms, kep
 								bbox[id] = gb
 							end
 						end
-						buf = string.sub(buf, e + 11)
+						at = e + 11
 						progressed = true
+						checkBudget()
 					else
-						buf = string.sub(buf, s) -- wait for the rest of this geometry
+						at = s -- wait for the rest of this geometry
 					end
-				elseif #buf > 32 then
-					buf = string.sub(buf, #buf - 31)
+				elseif #buf - at > 32 then
+					at = #buf - 31
 				end
 			elseif mode == "prescene" then
-				local s = string.find(buf, "<visual_scene", 1, true)
+				local s = find(buf, "<visual_scene", at, true)
 				if s then
-					buf = string.sub(buf, s + 13)
+					at = s + 13
 					mode = "scene"
 					progressed = true
-				elseif #buf > 32 then
-					buf = string.sub(buf, #buf - 31)
+				elseif #buf - at > 32 then
+					at = #buf - 31
 				end
 			elseif mode == "scene" then
-				local s = string.find(buf, "<node ", 1, true)
-				local sceneEnd = string.find(buf, "</visual_scene>", 1, true)
+				local s = find(buf, "<node ", at, true)
+				local sceneEnd = find(buf, "</visual_scene>", at, true)
 				if sceneEnd and (not s or sceneEnd < s) then
 					mode = "done"
 				elseif s then
-					local e = string.find(buf, "</node>", s, true)
+					local e = find(buf, "</node>", s, true)
 					if e then
-						local block = string.sub(buf, s, e + 6)
-						if not string.find(block, "<node ", 2, true) then -- flat nodes only, nested ones are skipped
-							local name = string.match(block, 'name="([^"]*)"')
-							local url = string.match(block, 'instance_geometry url="#([^"]*)"')
+						local nested = find(buf, "<node ", s + 1, true)
+						if not nested or nested > e then -- flat nodes only, nested ones are skipped
+							local block = sub(buf, s, e + 6)
+							local name = match(block, 'name="([^"]*)"')
+							local url = match(block, 'instance_geometry url="#([^"]*)"')
 							if name and url then onNode(block, name, url) end
 						end
-						buf = string.sub(buf, e + 7)
+						at = e + 7
 						progressed = true
 					else
-						buf = string.sub(buf, s)
+						at = s
 					end
-				elseif #buf > 32 then
-					buf = string.sub(buf, #buf - 31)
+				elseif #buf - at > 32 then
+					at = #buf - 31
 				end
 			end
 		end
@@ -388,6 +398,28 @@ local function runJob(job)
 			end
 		end
 	end
+	-- configs that differ only in non visual parts (tuning, engine, paint...) resolve to the same mesh set:
+	-- share one set of files, so the engine imports (and caches as .cdae) each mesh set only once
+	local meshList = {}
+	for mesh in pairs(wanted) do meshList[#meshList + 1] = mesh end
+	table.sort(meshList)
+	local meshKey = job.model .. "_" .. CACHE_VERSION .. "_m" .. hashString(job.model .. "|" .. table.concat(meshList, ","))
+	local meshMetaFile = CACHE_DIR .. meshKey .. ".json"
+	if count > 0 and FS:fileExists(meshMetaFile) then
+		local mm = jsonReadFile(meshMetaFile)
+		local ok = mm and type(mm.paths) == "table" and #mm.paths > 0
+		if ok then for _, p in ipairs(mm.paths) do if not FS:fileExists(p) then ok = false end end end
+		if ok then
+			loadModelMaterials(job.model)
+			ensureMaterials(mm.materials)
+			jsonWriteFile(metaFile, mm, false)
+			shape.paths = mm.paths
+			shape.fromCache = true
+			finishBBox(shape, mm.bbox, job.model)
+			shape.state = "ready"
+			return
+		end
+	end
 	if count == 0 then
 		log('W', 'MPProxyMeshGE', string.format("No proxy mesh for %s: none of its %d config parts has a usable flexbody mesh in /vehicles/%s/", job.model, #job.parts, job.model))
 		shape.state = "failed" shape.reason = "no flexbody meshes for the config parts"
@@ -401,7 +433,7 @@ local function runJob(job)
 	for i, dae in ipairs(daes) do
 		local text = filterDae(dae, wanted, bbox, mats)
 		if text then
-			local out = CACHE_DIR .. job.key .. "_" .. i .. ".dae"
+			local out = CACHE_DIR .. meshKey .. "_" .. i .. ".dae"
 			if writeFile(out, text) then paths[#paths + 1] = out end
 		end
 		coroutine.yield()
@@ -417,7 +449,9 @@ local function runJob(job)
 	for name in pairs(mats) do matList[#matList + 1] = name end
 	table.sort(matList)
 	ensureMaterials(matList)
-	jsonWriteFile(metaFile, { paths = paths, bbox = validBBox(bbox) and bbox or nil, materials = matList }, false)
+	local metaData = { paths = paths, bbox = validBBox(bbox) and bbox or nil, materials = matList }
+	jsonWriteFile(metaFile, metaData, false)
+	jsonWriteFile(meshMetaFile, metaData, false)
 	shape.paths = paths
 	finishBBox(shape, bbox, job.model)
 	shape.state = "ready"
@@ -427,16 +461,25 @@ local function stepJobs()
 	if not currentJob then
 		local job = table.remove(jobs, 1)
 		if not job then return end
-		currentJob = { job = job, co = coroutine.create(runJob) }
+		currentJob = { job = job, co = coroutine.create(runJob), started = clock, maxStepMs = 0, frames = 0 }
 	end
 	budgetTimer = TIMER()
+	currentJob.frames = currentJob.frames + 1
 	while currentJob and budgetTimer:stop() < FRAME_BUDGET_MS do
+		local before = budgetTimer:stop()
 		local ok, err = coroutine.resume(currentJob.co, currentJob.job)
+		local stepMs = budgetTimer:stop() - before
+		if stepMs > currentJob.maxStepMs then currentJob.maxStepMs = stepMs end
 		if not ok then
 			log('E', 'MPProxyMeshGE', "Building proxy mesh for "..tostring(currentJob.job.model).." failed: "..tostring(err))
 			shapes[currentJob.job.key].state = "failed"
 			currentJob = nil
 		elseif coroutine.status(currentJob.co) == "dead" then
+			local sh = shapes[currentJob.job.key]
+			if sh and not sh.fromCache then
+				log('I', 'MPProxyMeshGE', string.format("Build of %s took %.1f s over %d frames, longest step %.1f ms",
+					currentJob.job.model, clock - currentJob.started, currentJob.frames, currentJob.maxStepMs))
+			end
 			currentJob = nil
 		end
 	end
@@ -504,7 +547,11 @@ end
 
 local function attach(p, shape)
 	p.meshObjects = {}
+	local importTimer = TIMER()
+	local newImport = false
+	for _, path in ipairs(shape.paths) do if not importedPaths[path] then newImport = true end end
 	for _, path in ipairs(shape.paths) do
+		importedPaths[path] = true
 		local id = takeStatic(path)
 		if id then
 			local obj = scenetree.findObjectById(id)
@@ -519,6 +566,9 @@ local function attach(p, shape)
 		end
 	end
 	p.meshShape = shape
+	if newImport then -- engine side shape import (synchronous, .cdae cached by the engine after the first time)
+		log('I', 'MPProxyMeshGE', string.format("First use of %s mesh took %.1f ms", tostring(string.match(p.meshKey or "", "^(.-)_v%d")), importTimer:stop()))
+	end
 end
 
 local function detach(p)
@@ -532,6 +582,8 @@ end
 local candidates = {}
 local function decide(vehicles, refPos)
 	table.clear(candidates)
+	table.clear(waitingLoad)
+	table.clear(importedPaths)
 	local release = cfg.distance + RELEASE_MARGIN
 	for _, v in pairs(vehicles) do
 		local p = v.proxy
@@ -554,6 +606,11 @@ local function decide(vehicles, refPos)
 		elseif not p.meshObjects then
 			local shape = shapes[p.meshKey]
 			if shape and shape.state == "ready" and created < MAX_NEW_OBJECTS_PER_PASS then
+				if not shape.loaded and shape.paths then -- files already imported by another config of the same mesh set
+					local all = true
+					for _, path in ipairs(shape.paths) do if not importedPaths[path] then all = false break end end
+					if all then shape.loaded = true end
+				end
 				if not shape.loaded and not c.v.isFakeTest and not shape.fromCache then
 					-- first use of this shape: the engine imports it synchronously, so only one per interval
 					if clock >= nextNewShapeAllowed then
@@ -561,6 +618,8 @@ local function decide(vehicles, refPos)
 						shape.loaded = true
 						attach(p, shape)
 						created = created + 1
+					else
+						waitingLoad[#waitingLoad + 1] = c.v.jbeam or string.match(p.meshKey, "^(.-)_v%d") or "?"
 					end
 				else
 					shape.loaded = true
@@ -624,6 +683,44 @@ end
 local buildTimer = nil -- lazy, see MPProxyGE.getPerfTimer
 local buildStats = { ms = 0, frames = 0, maxMs = 0 }
 
+-- ============= LOADING OVERLAY =============
+local imgui = ui_imgui
+local niceNames = {}
+local function niceName(model)
+	local n = niceNames[model]
+	if n then return n end
+	local ok, m = pcall(core_vehicles.getModel, model) -- cached by the game per model
+	local info = ok and type(m) == "table" and m.model or nil
+	if info and info.Name then
+		n = (info.Brand and info.Brand ~= "" and not string.find(info.Name, info.Brand, 1, true)) and (info.Brand .. " " .. info.Name) or info.Name
+	else
+		n = tostring(model)
+	end
+	niceNames[model] = n
+	return n
+end
+
+local overlayFlags = nil
+local function drawOverlay()
+	if not imgui or not imgui.Begin then return end
+	local current = currentJob and currentJob.job.model or jobs[1] and jobs[1].model or waitingLoad[1]
+	if not current then return end
+	local more = #jobs + #waitingLoad + (currentJob and 1 or 0) - 1
+	local text = "Loading vehicle " .. niceName(current) .. "..." .. (more > 0 and string.format(" (+%d more)", more) or "")
+	if not overlayFlags then
+		overlayFlags = imgui.flags(imgui.WindowFlags_NoTitleBar, imgui.WindowFlags_NoResize, imgui.WindowFlags_NoMove,
+			imgui.WindowFlags_NoScrollbar, imgui.WindowFlags_NoCollapse, imgui.WindowFlags_NoDocking, imgui.WindowFlags_NoInputs,
+			imgui.WindowFlags_AlwaysAutoResize, imgui.WindowFlags_NoSavedSettings, imgui.WindowFlags_NoFocusOnAppearing, imgui.WindowFlags_NoNav)
+	end
+	local vp = imgui.GetMainViewport()
+	imgui.SetNextWindowPos(imgui.ImVec2(vp.Pos.x + vp.Size.x * 0.5, vp.Pos.y + 40), imgui.Cond_Always, imgui.ImVec2(0.5, 0))
+	imgui.SetNextWindowBgAlpha(0.45)
+	if imgui.Begin("##beammpProxyLoading", nil, overlayFlags) then
+		imgui.Text(text)
+	end
+	imgui.End()
+end
+
 local function onUpdate(dtReal)
 	clock = clock + (dtReal or 0)
 	if not cfg.enabled then return end
@@ -640,6 +737,7 @@ local function onUpdate(dtReal)
 			if ms > buildStats.maxMs then buildStats.maxMs = ms end
 		end
 	end
+	drawOverlay()
 end
 
 --- Cache / pool statistics for MPProxyTest.
@@ -655,6 +753,8 @@ local function getStats(resetWindow)
 end
 
 local function reset()
+	table.clear(waitingLoad)
+	table.clear(importedPaths)
 	for id, _ in pairs(allObjects) do
 		local obj = scenetree.findObjectById(id)
 		if obj then obj:delete() end
