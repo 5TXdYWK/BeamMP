@@ -1976,7 +1976,8 @@ local function drawOverlay()
 			imgui.WindowFlags_AlwaysAutoResize, imgui.WindowFlags_NoSavedSettings, imgui.WindowFlags_NoFocusOnAppearing, imgui.WindowFlags_NoNav)
 	end
 	local vp = imgui.GetMainViewport()
-	imgui.SetNextWindowPos(imgui.ImVec2(vp.Pos.x + vp.Size.x * 0.5, vp.Pos.y + 40), imgui.Cond_Always, imgui.ImVec2(0.5, 0))
+	-- centered on its own size, horizontally in the middle and at 38% of the viewport height (any resolution)
+	imgui.SetNextWindowPos(imgui.ImVec2(vp.Pos.x + vp.Size.x * 0.5, vp.Pos.y + vp.Size.y * 0.38), imgui.Cond_Always, imgui.ImVec2(0.5, 0.5))
 	imgui.SetNextWindowBgAlpha(0.45)
 	if imgui.Begin("##beammpProxyLoading", nil, overlayFlags) then
 		imgui.Text(text)
