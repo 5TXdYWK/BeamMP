@@ -292,6 +292,9 @@ export default function (deps) {
     beammpProxyRealWheels(values) {
         return values.enableProxyVehicles!==false && values.proxyMeshEnabled!==false && values.proxyMeshRealWheels!==false
     },
+    beammpProxySuspension(values) {
+        return values.enableProxyVehicles!==false && values.proxyMeshEnabled!==false && values.proxySuspension===true
+    },
     beammpProxyAutoReal(values) {
         return values.enableProxyVehicles!==false && values.proxyAutoReal===true
     },

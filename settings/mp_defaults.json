@@ -76,6 +76,8 @@
   "proxyEngineSoundMax"         : [ "local", 6 ],
   "proxyMeshFrameBudgetMs"      : [ "local", 2 ],
   "proxyMeshRealWheels"         : [ "local", true ],
+  "proxySuspension"             : [ "local", false ],
+  "proxySuspensionDistance"     : [ "local", 40 ],
   "proxyMeshRealWheelsMax"      : [ "local", 12 ],
   "showPlayerIDs"               : [ "cloud", true  ],
   "licensePlateUsesPlayerName"  : [ "cloud", true ],

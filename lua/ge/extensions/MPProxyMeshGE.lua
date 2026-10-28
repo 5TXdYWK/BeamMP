@@ -30,6 +30,7 @@ local PRELOAD_BUDGET_MS = 40      -- while the join loading screen hides the stu
 local frameBudget = FRAME_BUDGET_MS
 local MAX_MESHES = 250            -- per config (the full tier keeps everything the config shows)
 local MAX_NEW_OBJECTS_PER_PASS = 4
+local SUSP_MAX_PROXIES = 8       -- nearest proxies with visual suspension (proxySuspension)
 local MAX_DETACHES_PER_PASS = 6   -- mesh -> box changes per pass, farthest first, so a group leaving range spreads out
 local NEW_SHAPE_INTERVAL = 2      -- seconds between first uses of not yet loaded shapes (engine import hitch)
 local CACHED_SHAPE_INTERVAL = 0.5 -- same, when the engine already has a compiled .cdae of every file (cheaper load)
@@ -52,6 +53,8 @@ local function readSettings()
 	cfg.maxProxies = math.max(0, math.floor(tonumber(settings.getValue("proxyMaxMeshProxies", 48)) or 48))
 	cfg.wheels = settings.getValue("proxyMeshWheels", true) ~= false
 	cfg.realWheels = settings.getValue("proxyMeshRealWheels", true) ~= false
+	cfg.suspension = settings.getValue("proxySuspension", false) == true
+	cfg.suspDist = math.max(0, tonumber(settings.getValue("proxySuspensionDistance", 40)) or 40)
 	cfg.realWheelsMax = math.max(0, math.floor(tonumber(settings.getValue("proxyMeshRealWheelsMax", 12)) or 12))
 	cfg.targetFps = math.max(0, tonumber(settings.getValue("proxyTargetFps", 0)) or 0)
 	cfg.triBudget = math.max(0, math.floor(tonumber(settings.getValue("proxyMeshTriangleBudget", 60000)) or 60000))
@@ -1854,6 +1857,13 @@ local function decide(vehicles, refPos)
 			end
 		end
 	end
+	-- visual suspension: nearest proxies with meshes inside proxySuspensionDistance
+	local suspLeft = cfg.suspension and SUSP_MAX_PROXIES or 0
+	for _, c in ipairs(candidates) do
+		local p = c.v.proxy
+		p.suspOn = suspLeft > 0 and p.meshObjects ~= nil and c.d < cfg.suspDist or nil
+		if p.suspOn then suspLeft = suspLeft - 1 end
+	end
 	-- real wheels: nearest proxies in the full / parts tiers
 	local wheelsLeft = cfg.realWheels and cfg.realWheelsMax or 0
 	for _, c in ipairs(candidates) do
@@ -1880,6 +1890,89 @@ local function toWorld(lx, ly, lz)
 	return org.x + axX.x*lx + axY.x*ly + axZ.x*lz, org.y + axX.y*lx + axY.y*ly + axZ.y*lz, org.z + axX.z*lx + axY.z*ly + axZ.z*lz
 end
 
+-- ============= VISUAL SUSPENSION =============
+-- Nearest proxies only (proxySuspension): each wheel follows the ground under it within a small travel (a ray
+-- down along the body's up axis, every few frames per wheel, staggered), spring-damped. The body mesh leans
+-- with the acceleration of the proxy (braking dives, cornering rolls outward) and with the wheel offsets, also
+-- spring-damped and clamped to a few degrees. The wheels stay where the ground is, only the body tilts.
+local SUSP_TRAVEL = 0.12      -- m up / down from the jbeam wheel position
+local SUSP_RAY_EVERY = 4      -- frames between two rays of the same wheel
+local SUSP_RAY_ABOVE = 0.6    -- ray start above the wheel center
+local SUSP_K, SUSP_C = 160, 18           -- wheel spring / damper (per unit mass)
+local LEAN_K, LEAN_C = 45, 9             -- body lean spring / damper
+local LEAN_MAX = math.rad(3.5)
+local LEAN_PER_ACC = 0.0045              -- rad per m/s^2
+local rayOrigin, rayDir = vec3(), vec3()
+local suspFrame = 0
+
+local function clampAbs(v, m) return v > m and m or (v < -m and -m or v) end
+
+local function updateSuspension(p, shape, dt)
+	local st = p.susp
+	if not st then
+		st = { off = {}, vel = {}, target = {}, seed = math.random(0, SUSP_RAY_EVERY - 1),
+			pitch = 0, pitchV = 0, roll = 0, rollV = 0, heave = 0, ax = 0, ay = 0 }
+		p.susp = st
+	end
+	if dt <= 0 then return st end
+	-- body acceleration in jbeam axes (forward = -Y, left = +X), lightly filtered
+	local v = p.svel
+	if v then
+		if st.lvx then
+			local axw, ayw, azw = (v.x - st.lvx) / dt, (v.y - st.lvy) / dt, (v.z - st.lvz) / dt
+			local fwd = -(axw * axY.x + ayw * axY.y + azw * axY.z)
+			local left = axw * axX.x + ayw * axX.y + azw * axX.z
+			local a = math.min(1, dt * 6)
+			st.ax = st.ax + (clampAbs(fwd, 15) - st.ax) * a
+			st.ay = st.ay + (clampAbs(left, 15) - st.ay) * a
+		end
+		st.lvx, st.lvy, st.lvz = v.x, v.y, v.z
+	end
+	-- wheels: ground under each, staggered rays
+	local wheels = shape.wheels
+	local sumF, nF, sumR, nR, sumL, nL, sumRt, nRt, sum, n = 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+	local cy = shape.minY and (shape.minY + shape.maxY) * 0.5 or 0
+	local yF, yR, xL, xR = 0, 0, 0, 0
+	if wheels then
+		rayDir:set(-axZ.x, -axZ.y, -axZ.z)
+		for i, w in ipairs(wheels) do
+			if (suspFrame + st.seed + i) % SUSP_RAY_EVERY == 0 then
+				local px, py, pz = toWorld(w.x, w.y, w.z + SUSP_RAY_ABOVE)
+				rayOrigin:set(px, py, pz)
+				local maxD = SUSP_RAY_ABOVE + w.r + SUSP_TRAVEL + 0.3
+				local d = castRayStatic(rayOrigin, rayDir, maxD)
+				-- ground at d below the start: the wheel bottom should touch it
+				st.target[i] = (d and d < maxD) and clampAbs(SUSP_RAY_ABOVE + w.r - d, SUSP_TRAVEL) or 0
+			end
+			local o, ov, t = st.off[i] or 0, st.vel[i] or 0, st.target[i] or 0
+			ov = ov + (SUSP_K * (t - o) - SUSP_C * ov) * dt
+			o = clampAbs(o + ov * dt, SUSP_TRAVEL)
+			st.off[i], st.vel[i] = o, ov
+			sum, n = sum + o, n + 1
+			if w.y < cy then sumF, nF, yF = sumF + o, nF + 1, yF + w.y else sumR, nR, yR = sumR + o, nR + 1, yR + w.y end
+			if w.x > 0 then sumL, nL, xL = sumL + o, nL + 1, xL + w.x else sumRt, nRt, xR = sumRt + o, nRt + 1, xR + w.x end
+		end
+	end
+	-- lean targets: pitch > 0 is nose down (braking), roll > 0 lowers the left (+X) side
+	local pitchT = st.ax * -LEAN_PER_ACC
+	local rollT = -st.ay * LEAN_PER_ACC -- accelerating to the left (turning left): the right side goes down
+	if nF > 0 and nR > 0 then
+		local L = (yR / nR) - (yF / nF)
+		if L > 0.5 then pitchT = pitchT + (sumR / nR - sumF / nF) / L end
+	end
+	if nL > 0 and nRt > 0 then
+		local T = (xL / nL) - (xR / nRt)
+		if T > 0.5 then rollT = rollT - (sumL / nL - sumRt / nRt) / T end
+	end
+	pitchT, rollT = clampAbs(pitchT, LEAN_MAX), clampAbs(rollT, LEAN_MAX)
+	st.pitchV = st.pitchV + (LEAN_K * (pitchT - st.pitch) - LEAN_C * st.pitchV) * dt
+	st.rollV = st.rollV + (LEAN_K * (rollT - st.roll) - LEAN_C * st.rollV) * dt
+	st.pitch = clampAbs(st.pitch + st.pitchV * dt, LEAN_MAX)
+	st.roll = clampAbs(st.roll + st.rollV * dt, LEAN_MAX)
+	st.heave = n > 0 and (sum / n) * 0.5 or 0
+	return st
+end
+
 --- Per frame, for a proxy that has mesh objects: moves them and draws the wheels. Returns true if drawn.
 local function drawProxy(p, dist)
 	local shape = p.meshShape
@@ -1893,10 +1986,35 @@ local function drawProxy(p, dist)
 	local cz = (shape.groundZ or 0) + (p.cogH or 0.5)
 	org:set(p.rpos.x - (axX.x*cx + axY.x*cy + axZ.x*cz), p.rpos.y - (axX.y*cx + axY.y*cy + axZ.y*cz), p.rpos.z - (axX.z*cx + axY.z*cy + axZ.z*cz))
 	local r = p.rrot
+	local bx, by, bz, qx, qy, qz, qw = org.x, org.y, org.z, r.x, r.y, r.z, r.w
+	local susp = nil
+	if p.suspOn and shape.wheels then
+		local sdt = math.min(math.max(clock - (p.suspT or clock), 0), 0.1)
+		p.suspT = clock
+		susp = updateSuspension(p, shape, sdt)
+		-- body: L = Rx(pitch) * Ry(roll) about the body center, then the heave along the body's up axis
+		local th, ph = susp.pitch, susp.roll
+		local ct, stt, cph, sph = math.cos(th), math.sin(th), math.cos(ph), math.sin(ph)
+		local lyx, lyy, lyz = 0, ct, stt
+		local lzx, lzy, lzz = sph, -cph * stt, cph * ct
+		wheelDir:set(axX.x*lyx + axY.x*lyy + axZ.x*lyz, axX.y*lyx + axY.y*lyy + axZ.y*lyz, axX.z*lyx + axY.z*lyy + axZ.z*lyz)
+		wheelUp:set(axX.x*lzx + axY.x*lzy + axZ.x*lzz, axX.y*lzx + axY.y*lzy + axZ.y*lzz, axX.z*lzx + axY.z*lzy + axZ.z*lzz)
+		wheelQuat:setFromDir(wheelDir, wheelUp)
+		qx, qy, qz, qw = wheelQuat.x, wheelQuat.y, wheelQuat.z, wheelQuat.w
+		-- origin moves so the pivot (cx, cy, cz) stays put: o' = o + R (P - L P) + heave * up
+		local rx_, ry_, rz_ = cx * cph + cz * sph, cy, -cx * sph + cz * cph
+		local lpx, lpy, lpz = rx_, ry_ * ct - rz_ * stt, ry_ * stt + rz_ * ct
+		local dx, dy, dz = cx - lpx, cy - lpy, cz - lpz + susp.heave
+		bx = org.x + axX.x*dx + axY.x*dy + axZ.x*dz
+		by = org.y + axX.y*dx + axY.y*dy + axZ.y*dz
+		bz = org.z + axX.z*dx + axY.z*dy + axZ.z*dz
+	else
+		p.susp, p.suspT = nil, nil
+	end
 	for _, o in ipairs(p.meshObjects) do
 		local obj = o.obj
 		if obj then
-			obj:setPosRot(org.x, org.y, org.z, r.x, r.y, r.z, r.w)
+			obj:setPosRot(bx, by, bz, qx, qy, qz, qw)
 			obj:updateInstanceRenderData()
 		end
 	end
@@ -1923,15 +2041,16 @@ local function drawProxy(p, dist)
 				wheelDir:set(axX.x*yx + axY.x*yy + axZ.x*yz, axX.y*yx + axY.y*yy + axZ.y*yz, axX.z*yx + axY.z*yy + axZ.z*yz)
 				wheelUp:set(axX.x*zx + axY.x*zy + axZ.x*zz, axX.y*zx + axY.y*zy + axZ.y*zz, axX.z*zx + axY.z*zy + axZ.z*zz)
 				wheelQuat:setFromDir(wheelDir, wheelUp)
-				local px, py, pz = toWorld(w.x, w.y, w.z)
+				local px, py, pz = toWorld(w.x, w.y, w.z + (susp and susp.off[i] or 0))
 				o.obj:setPosRot(px, py, pz, wheelQuat.x, wheelQuat.y, wheelQuat.z, wheelQuat.w)
 			end
 			if cfg.wheels and not (o and o.obj and w.mt) then -- drawn tire when there is no tire mesh
 				local ax, ay, az = w.ax, w.ay, w.az
 				if w.s and steer ~= 0 then ax, ay = ax * sc - ay * ss, ax * ss + ay * sc end
 				local h = w.wd * 0.5
-				local x1, y1, z1 = toWorld(w.x - ax * h, w.y - ay * h, w.z - az * h)
-				local x2, y2, z2 = toWorld(w.x + ax * h, w.y + ay * h, w.z + az * h)
+				local wz = w.z + (susp and susp.off[i] or 0)
+				local x1, y1, z1 = toWorld(w.x - ax * h, w.y - ay * h, wz - az * h)
+				local x2, y2, z2 = toWorld(w.x + ax * h, w.y + ay * h, wz + az * h)
 				drawCylinder(x1, y1, z1, x2, y2, z2, w.r, wheelColor, true)
 			end
 		end
@@ -2093,6 +2212,7 @@ local prebuildStarted = false
 
 local function onUpdate(dtReal)
 	clock = clock + (dtReal or 0)
+	suspFrame = suspFrame + 1
 	if not cfg.enabled then return end
 	updateFpsCap(dtReal or 0, clock)
 	if currentJob or #jobs > 0 or #wheelJobs > 0 then
