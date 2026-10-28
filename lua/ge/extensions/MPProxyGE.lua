@@ -1035,7 +1035,7 @@ local soundEvents = {}         -- [sample name] = event name
 local soundPool = {}           -- { id, event, owner (vehicle), vol, rpm, playing }
 local soundMat = nil
 
-local function soundEventFor(jbeam)
+local function typeSoundFor(jbeam)
 	local class = ENGINE_BY_MODEL[jbeam] or getModelInfo(jbeam).class
 	local sample = ENGINE_BY_CLASS[class]
 	if not sample then return nil end
@@ -1056,8 +1056,17 @@ local function proxyEngineRunning(p)
 	return true
 end
 
-local function estimateRpm(p, diesel, speed)
+-- the config's own jbeam engine sound (MPProxyMeshGE reads it with the part index), else the type mapping
+local function soundFor(v)
+	local snd = MPProxyMeshGE and MPProxyMeshGE.getSound and v.proxy and MPProxyMeshGE.getSound(v.proxy.meshKey)
+	if snd and snd.event then return snd.event, snd.diesel, snd end
+	local ev, diesel = typeSoundFor(v.jbeam)
+	return ev, (snd and snd.diesel) or diesel, snd
+end
+
+local function estimateRpm(p, diesel, speed, snd)
 	local idle, redline = diesel and 650 or 850, diesel and 2400 or 6200
+	if snd and snd.idleRPM and snd.maxRPM and snd.maxRPM > snd.idleRPM + 500 then idle, redline = snd.idleRPM, snd.maxRPM end
 	local fresh = p.sndInputT and clock - p.sndInputT < SOUND_INPUT_STALE
 	local thr = fresh and math.min(math.max(p.sndThrottle or 0, 0), 1) or (speed > 1 and 0.3 or 0)
 	local g = p.sndGear and tostring(p.sndGear) or nil
@@ -1121,7 +1130,7 @@ local function assignSounds(vehicles)
 	end
 	for v, slot in pairs(keep) do
 		if slot == true then
-			local event, diesel = soundEventFor(v.jbeam)
+			local event, diesel, snd = soundFor(v)
 			if event then
 				local entry
 				for _, e in ipairs(soundPool) do if not e.owner and e.event == event then entry = e break end end
@@ -1134,7 +1143,15 @@ local function assignSounds(vehicles)
 						entry.id = ok and id or nil
 						entry.event = event
 					end
-					entry.owner, entry.diesel, entry.leaving, entry.vol = v, diesel, false, 0
+					entry.owner, entry.diesel, entry.leaving, entry.vol, entry.snd = v, diesel, false, 0, snd
+					local src = soundSource(entry)
+					if src and snd and snd.event then -- same base parameters combustionEngine.lua sets (eq bands left out)
+						pcall(src.setParameter, src, "base_gain", math.min(0, tonumber(snd.mainGain) or 0))
+						pcall(src.setParameter, src, "main_gain", 0)
+						pcall(src.setParameter, src, "onLoadGain", tonumber(snd.onLoadGain) or 1)
+						pcall(src.setParameter, src, "offLoadGain", tonumber(snd.offLoadGain) or 1)
+						pcall(src.setParameter, src, "base_muffled", tonumber(snd.muffling) or (snd.kind == "exhaust" and 0 or 1))
+					end
 				end
 			end
 		end
@@ -1158,7 +1175,7 @@ local function updateSounds(dt)
 				if src and entry.playing then pcall(src.stop, src, -1) end
 				entry.owner, entry.playing, entry.leaving = nil, false, false
 			else
-				local rpm, load = estimateRpm(p, entry.diesel, p.svel:length())
+				local rpm, load = estimateRpm(p, entry.diesel, p.svel:length(), entry.snd)
 				entry.rpm = entry.rpm and entry.rpm + (rpm - entry.rpm) * math.min(1, dt * 6) or rpm
 				soundMat:setPosition(p.rpos)
 				src:setTransform(soundMat)

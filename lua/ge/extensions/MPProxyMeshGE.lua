@@ -187,10 +187,11 @@ end
 -- beams, triangles of a body) took tens of ms in one jsonDecode. Strings, // and /* */ comments are skipped,
 -- out[partName] = text of the part's flexbodies array (decoded alone, it is small). Returns false if the text
 -- did not look like a jbeam (the caller then decodes the whole file).
-local function extractFlexbodies(text, out)
+local function extractFlexbodies(text, out, sections)
 	local find, sub, byte, match = string.find, string.sub, string.byte, string.match
 	local pos, depth, n = 1, 0, 0
 	local partName, flexStart = nil, nil
+	local secStart, secKey = nil, nil -- engine / sound sections (sections[partName][key] = object text)
 	local lastString, lastDepth, lastEnd = nil, -1, 0
 	while true do
 		local s = find(text, '[{}%[%]"/]', pos)
@@ -214,11 +215,18 @@ local function extractFlexbodies(text, out)
 			depth = depth + 1
 			local isKey = lastString and lastDepth == depth - 1 and match(sub(text, lastEnd + 1, s - 1), "^%s*:%s*$")
 			if depth == 2 and c == 123 then partName = isKey and lastString or nil
-			elseif depth == 3 and c == 91 and isKey and lastString == "flexbodies" and partName then flexStart = s end
+			elseif depth == 3 and c == 91 and isKey and lastString == "flexbodies" and partName then flexStart = s
+			elseif depth == 3 and c == 123 and isKey and partName and sections
+				and (lastString == "mainEngine" or sub(lastString, 1, 11) == "soundConfig") then secStart, secKey = s, lastString end
 			lastString = nil
 			pos = s + 1
 		else
 			if depth == 3 and flexStart and c == 93 then out[partName] = sub(text, flexStart, s) flexStart = nil end
+			if depth == 3 and secStart and c == 125 then
+				sections[partName] = sections[partName] or {}
+				sections[partName][secKey] = sub(text, secStart, s)
+				secStart = nil
+			end
 			if depth == 2 then partName = nil end
 			depth = depth - 1
 			if depth < 0 then return false end
@@ -231,22 +239,73 @@ local function extractFlexbodies(text, out)
 	return depth == 0
 end
 
+-- fields kept from the jbeam engine device and its sound sections (as read by combustionEngine.lua init)
+local ENGINE_FIELDS = { idleRPM = true, maxRPM = true, revLimiterRPM = true, soundConfig = true, soundConfigExhaust = true, requiredEnergyType = true }
+local SOUND_FIELDS = { sampleName = true, sampleFolder = true, mainGain = true, onLoadGain = true, offLoadGain = true,
+	intakeMuffling = true, exhaustAudioMufflingBaseCoef = true }
+local ENGINE_INDEX_VERSION = 1 -- part index files without this are rebuilt once
+
+local function keepFields(decoded, fields)
+	local out, any = {}, false
+	for k in pairs(fields) do
+		local v = decoded[k]
+		if type(v) == "number" or (type(v) == "string" and string.sub(v, 1, 1) ~= "$") then out[k] = v any = true end
+	end
+	return any and out or nil
+end
+
+-- engine[partName] = { mainEngine = {...}, [soundConfig section name] = {...} }
+local function addEngineSections(engine, sectionTexts, filename)
+	for partName, secs in pairs(sectionTexts) do
+		for key, txt in pairs(secs) do
+			local ok, d = pcall(jsonDecode, txt, filename)
+			local kept = ok and type(d) == "table" and keepFields(d, key == "mainEngine" and ENGINE_FIELDS or SOUND_FIELDS) or nil
+			if kept then
+				engine[partName] = engine[partName] or {}
+				engine[partName][key] = kept
+			end
+			checkBudget()
+		end
+	end
+end
+
+local engineIndex = {} -- [model] = engine sections by part (see addEngineSections)
+
 local function buildPartIndex(model)
 	local diskFile = CACHE_DIR .. model .. "_parts_" .. CACHE_VERSION .. ".json"
 	local files = FS:findFiles("/vehicles/" .. model .. "/", "*.jbeam", -1, false, false) or {}
 	local sig = modelSignature(model)
 	local cached = FS:fileExists(diskFile) and jsonReadFile(diskFile) or nil
-	if cached and cached.sig == sig and type(cached.parts) == "table" then return cached.parts end
+	if cached and cached.sig == sig and type(cached.parts) == "table" and cached.engineV == ENGINE_INDEX_VERSION then
+		engineIndex[model] = type(cached.engine) == "table" and cached.engine or {}
+		return cached.parts
+	end
 
 	local parts = {}
-	local flexTexts = {}
+	local engine = {}
+	local flexTexts, sectionTexts = {}, {}
+	-- engines and their sound sections often live in /vehicles/common/<model>/ (only those sections are read there)
+	local commonFiles = FS:findFiles("/vehicles/common/" .. model .. "/", "*.jbeam", -1, false, false) or {}
+	for _, filename in ipairs(commonFiles) do
+		local text = readFile(filename)
+		checkBudget()
+		if text and string.find(text, "soundConfig", 1, true) then
+			table.clear(flexTexts) table.clear(sectionTexts)
+			if extractFlexbodies(text, flexTexts, sectionTexts) then addEngineSections(engine, sectionTexts, filename) end
+		end
+		text = nil
+		checkBudget()
+	end
 	for _, filename in ipairs(files) do
 		table.clear(flexTexts)
+		table.clear(sectionTexts)
 		local data = nil
 		local text = readFile(filename)
 		checkBudget()
-		if text and string.find(text, "flexbodies", 1, true) then
-			if extractFlexbodies(text, flexTexts) then
+		local hasSound = text and string.find(text, "soundConfig", 1, true)
+		if text and (hasSound or string.find(text, "flexbodies", 1, true)) then
+			if extractFlexbodies(text, flexTexts, hasSound and sectionTexts or nil) then
+				addEngineSections(engine, sectionTexts, filename)
 				data = {}
 				for partName, arr in pairs(flexTexts) do
 					local ok, rows = pcall(jsonDecode, arr, filename)
@@ -280,8 +339,58 @@ local function buildPartIndex(model)
 		checkBudget()
 	end
 	FS:directoryCreate(CACHE_DIR, true)
-	jsonWriteFile(diskFile, { sig = sig, fileCount = #files, parts = parts }, false)
+	jsonWriteFile(diskFile, { sig = sig, fileCount = #files, parts = parts, engine = engine, engineV = ENGINE_INDEX_VERSION }, false)
+	engineIndex[model] = engine
 	return parts
+end
+
+-- ============= ENGINE SOUND OF A CONFIG =============
+-- Same lookup as combustionEngine.lua init: the mainEngine device names its sound sections (soundConfig = intake,
+-- soundConfigExhaust = exhaust), a section gives sampleFolder (default art/sound/blends/) .. sampleName ..
+-- ".sfxBlend2D.json", whose eventName is the FMOD event. The exhaust is used when it resolves, else the intake.
+local function blendEvent(folder, name)
+	if type(name) ~= "string" then return nil end
+	folder = folder or "art/sound/blends/"
+	if string.sub(folder, 1, 1) ~= "/" then folder = "/" .. folder end
+	local base = folder .. name .. ".sfxBlend"
+	local data = jsonReadFile(base .. "2D.json") or jsonReadFile(base .. "2d.json")
+	local ev = type(data) == "table" and data.eventName
+	return type(ev) == "string" and ev ~= "" and ev or nil
+end
+
+local function resolveSound(job, cachedNote)
+	if type(partIndex[job.model]) ~= "table" then
+		setPhase("part index")
+		partIndex[job.model] = buildPartIndex(job.model)
+	end
+	setPhase("engine sound")
+	local index = engineIndex[job.model] or {}
+	local me, sections = {}, {}
+	for _, partName in ipairs(job.parts) do
+		local e = index[partName]
+		if e then
+			for key, sec in pairs(e) do
+				if key == "mainEngine" then for k, v in pairs(sec) do me[k] = v end
+				else sections[key] = sections[key] or {} for k, v in pairs(sec) do sections[key][k] = v end end
+			end
+		end
+	end
+	local sound = { source = "fallback" }
+	for _, which in ipairs({ { "soundConfigExhaust", "exhaust" }, { "soundConfig", "intake" } }) do
+		local sec = sections[me[which[1]] or ""]
+		local ev = sec and blendEvent(sec.sampleFolder, sec.sampleName)
+		if ev then
+			sound = { source = "jbeam", event = ev, kind = which[2], sample = sec.sampleName,
+				mainGain = sec.mainGain, onLoadGain = sec.onLoadGain, offLoadGain = sec.offLoadGain,
+				muffling = which[2] == "exhaust" and sec.exhaustAudioMufflingBaseCoef or sec.intakeMuffling }
+			break
+		end
+	end
+	sound.idleRPM, sound.maxRPM = tonumber(me.idleRPM), tonumber(me.revLimiterRPM) or tonumber(me.maxRPM)
+	sound.diesel = me.requiredEnergyType == "diesel" or nil
+	log('I', 'MPProxyMeshGE', string.format("Proxy engine sound for %s/%s: %s (source: %s%s%s)", job.model, string.sub(job.key, -16),
+		sound.event or "type mapping", sound.source, sound.sample and (", " .. sound.kind .. " " .. sound.sample) or "", cachedNote or ""))
+	return sound
 end
 
 local function loadModelMaterials(model)
@@ -629,6 +738,13 @@ local function runJob(job)
 		local allExist = true
 		for _, p in ipairs(meta.paths) do if not FS:fileExists(p) then allExist = false end end
 		if allExist then
+			if type(meta.sound) ~= "table" then
+				meta.sound = resolveSound(job)
+				jsonWriteFile(metaFile, meta, false)
+			else
+				log('I', 'MPProxyMeshGE', string.format("Proxy engine sound for %s/%s: %s (source: %s, cached)", job.model, string.sub(job.key, -16), meta.sound.event or "type mapping", tostring(meta.sound.source)))
+			end
+			shape.sound = meta.sound
 			setPhase("materials")
 			loadModelMaterials(job.model)
 			ensureMaterials(meta.materials)
@@ -641,11 +757,8 @@ local function runJob(job)
 		end
 	end
 
-	if type(partIndex[job.model]) ~= "table" then
-		setPhase("part index")
-		partIndex[job.model] = buildPartIndex(job.model)
-		setPhase("cache check")
-	end
+	shape.sound = resolveSound(job)
+	setPhase("cache check")
 	local index = partIndex[job.model]
 	local wanted, count = {}, 0
 	for _, partName in ipairs(job.parts) do
@@ -671,7 +784,9 @@ local function runJob(job)
 			setPhase("materials")
 			loadModelMaterials(job.model)
 			ensureMaterials(mm.materials)
+			mm.sound = shape.sound -- per config, the mesh set is shared by configs with other engines
 			jsonWriteFile(metaFile, mm, false)
+			mm.sound = nil
 			shape.paths = mm.paths
 			shape.tiers = mm.tiers
 			shape.fromCache = true
@@ -753,8 +868,9 @@ local function runJob(job)
 	table.sort(matList)
 	ensureMaterials(matList)
 	local metaData = { sig = sig, paths = paths, tiers = tiers, bbox = validBBox(bbox) and bbox or nil, materials = matList }
-	jsonWriteFile(metaFile, metaData, false)
 	jsonWriteFile(meshMetaFile, metaData, false)
+	metaData.sound = shape.sound
+	jsonWriteFile(metaFile, metaData, false)
 	shape.paths = paths
 	shape.tiers = tiers
 	finishBBox(shape, bbox, job.model)
@@ -871,6 +987,14 @@ end
 
 local function getShape(key)
 	return key and shapes[key]
+end
+
+-- engine sound info of a config (or of the model's default config while the exact one builds), nil if unknown
+local function getSound(key)
+	local sh = key and shapes[key]
+	if sh and sh.sound then return sh.sound end
+	local fb = key and fallbackOf[key] and shapes[fallbackOf[key]]
+	return fb and fb.sound or nil
 end
 
 -- ============= ENGINE IMPORTS =============
@@ -1325,6 +1449,7 @@ detectGlobalWrites() -- reenable global write notifications
 
 M.request           = request
 M.getShape          = getShape
+M.getSound          = getSound
 M.getLodSettings    = function() return cfg.lodFull, cfg.lodParts, math.min(cfg.lodShell, cfg.distance) end
 M.decide            = decide
 M.drawProxy         = drawProxy
