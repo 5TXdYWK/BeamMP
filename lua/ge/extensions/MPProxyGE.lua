@@ -166,6 +166,9 @@ local function initProxy(vehicle, spawnData)
 	p.dimsFromMesh = nil
 	if spawnData and spawnData.vcf then
 		p.vcf = spawnData.vcf
+		if MPProxyMeshGE and not info.valid then
+			log('W', 'MPProxyGE', "No proxy mesh for "..tostring(vehicle.serverVehicleString)..": model '"..tostring(spawnData.jbm or vehicle.jbeam).."' is not installed, drawing a box")
+		end
 		if MPProxyMeshGE and info.valid then
 			local key = MPProxyMeshGE.request(spawnData.jbm or vehicle.jbeam, spawnData.vcf) -- async, box until ready
 			if key ~= p.meshKey then MPProxyMeshGE.release(p) end

@@ -158,11 +158,11 @@ local function updateBBox(bbox, geometryBlock)
 	end
 end
 
---- Streams one .dae and returns the filtered collada text (or nil if no wanted mesh is in it).
-local function filterDae(filename, wanted, bbox)
+--- Streams one .dae. keepGeom(id, name) picks geometry blocks (appended to geoms, ids to keptIds),
+-- onNode(block, name, url) sees every flat scene node. geomsOnly stops after the geometry library.
+local function scanDae(filename, keepGeom, onNode, geomsOnly, header, geoms, keptIds, bbox)
 	local f = io.open(filename, "r")
-	if not f then return nil end
-	local header, geoms, nodes, keptIds = {}, {}, {}, {}
+	if not f then return false end
 	local mode = "header"
 	local buf = ""
 	local eof = false
@@ -190,14 +190,14 @@ local function filterDae(filename, wanted, bbox)
 				local libEnd = string.find(buf, "</library_geometries>", 1, true)
 				if libEnd and (not s or libEnd < s) then
 					buf = string.sub(buf, libEnd + 21)
-					mode = "prescene"
+					mode = geomsOnly and "done" or "prescene"
 					progressed = true
 				elseif s then
 					local e = string.find(buf, "</geometry>", s, true)
 					if e then
 						local block = string.sub(buf, s, e + 10)
 						local id, name = string.match(block, '^<geometry id="([^"]*)" name="([^"]*)"')
-						if id and (wanted[name] or wanted[string.gsub(id, "%-mesh$", "")]) then
+						if id and keepGeom(id, name) then
 							geoms[#geoms + 1] = block
 							keptIds[id] = true
 							updateBBox(bbox, block)
@@ -231,7 +231,7 @@ local function filterDae(filename, wanted, bbox)
 						if not string.find(block, "<node ", 2, true) then -- flat nodes only, nested ones are skipped
 							local name = string.match(block, 'name="([^"]*)"')
 							local url = string.match(block, 'instance_geometry url="#([^"]*)"')
-							if name and url and wanted[name] and keptIds[url] then nodes[#nodes + 1] = block .. "\n" end
+							if name and url then onNode(block, name, url) end
 						end
 						buf = string.sub(buf, e + 7)
 						progressed = true
@@ -247,6 +247,28 @@ local function filterDae(filename, wanted, bbox)
 		coroutine.yield() -- one chunk per step
 	end
 	f:close()
+	return true
+end
+
+--- Streams one .dae and returns the filtered collada text (or nil if no wanted mesh is in it).
+-- Meshes are matched by scene node name (what jbeam flexbodies reference). Exporters like Blender name
+-- the geometry blocks differently ("Mesh.038"), those are fetched in a second pass by the node's url.
+local function filterDae(filename, wanted, bbox)
+	local header, geoms, nodes, keptIds, missing = {}, {}, {}, {}, {}
+	local missingCount = 0
+	local function keepByName(id, name) return wanted[name] or wanted[string.gsub(id, "%-mesh$", "")] end
+	local ok = scanDae(filename, keepByName, function(block, name, url)
+		if not wanted[name] then return end
+		if keptIds[url] then nodes[#nodes + 1] = block .. "\n"
+		elseif not missing[url] then missing[url] = block missingCount = missingCount + 1 end
+	end, false, header, geoms, keptIds, bbox)
+	if not ok then return nil end
+	if missingCount > 0 then
+		scanDae(filename, function(id) return missing[id] ~= nil and not keptIds[id] end, function() end, true, {}, geoms, keptIds, bbox)
+		for url, block in pairs(missing) do
+			if keptIds[url] then nodes[#nodes + 1] = block .. "\n" end
+		end
+	end
 	if #nodes == 0 then return nil end
 	return table.concat(header) .. "<library_geometries>\n" .. table.concat(geoms, "\n") ..
 		"\n</library_geometries>\n<library_visual_scenes>\n<visual_scene id=\"Scene\" name=\"Scene\">\n" ..
@@ -271,6 +293,7 @@ local function runJob(job)
 		if allExist then
 			loadModelMaterials(job.model)
 			shape.paths = meta.paths
+			shape.fromCache = true -- built in an earlier session
 			finishBBox(shape, meta.bbox or {1, 1, 1, -1, -1, -1})
 			shape.state = "ready"
 			return
@@ -290,7 +313,11 @@ local function runJob(job)
 			end
 		end
 	end
-	if count == 0 then shape.state = "failed" return end
+	if count == 0 then
+		log('W', 'MPProxyMeshGE', string.format("No proxy mesh for %s: none of its %d config parts has a usable flexbody mesh in /vehicles/%s/", job.model, #job.parts, job.model))
+		shape.state = "failed" shape.reason = "no flexbody meshes for the config parts"
+		return
+	end
 
 	local bbox = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
 	local daes = FS:findFiles("/vehicles/" .. job.model .. "/", "*.dae", -1, false, false) or {}
@@ -304,7 +331,12 @@ local function runJob(job)
 		end
 		coroutine.yield()
 	end
-	if #paths == 0 then shape.state = "failed" return end
+	if #paths == 0 then
+		log('W', 'MPProxyMeshGE', string.format("No proxy mesh for %s: %d wanted meshes not found in %d .dae files of /vehicles/%s/", job.model, count, #daes, job.model))
+		shape.state = "failed" shape.reason = "meshes not found in the .dae files"
+		return
+	end
+	log('I', 'MPProxyMeshGE', string.format("Proxy mesh for %s ready (%d meshes, %d files)", job.model, count, #paths))
 	loadModelMaterials(job.model)
 	jsonWriteFile(metaFile, { paths = paths, bbox = bbox[1] <= bbox[4] and bbox or nil }, false)
 	shape.paths = paths
@@ -443,7 +475,7 @@ local function decide(vehicles, refPos)
 		elseif not p.meshObjects then
 			local shape = shapes[p.meshKey]
 			if shape and shape.state == "ready" and created < MAX_NEW_OBJECTS_PER_PASS then
-				if not shape.loaded and not c.v.isFakeTest then
+				if not shape.loaded and not c.v.isFakeTest and not shape.fromCache then
 					-- first use of this shape: the engine imports it synchronously, so only one per interval
 					if clock >= nextNewShapeAllowed then
 						nextNewShapeAllowed = clock + NEW_SHAPE_INTERVAL
