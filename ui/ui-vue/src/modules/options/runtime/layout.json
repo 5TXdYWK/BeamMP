@@ -5188,6 +5188,31 @@
                 "tooltip",
                 "setting"
               ]
+            },
+            {
+              "version": "0.38",
+              "label": "ui.options.beammp.proxyCleanupOnReload",
+              "tooltip": "ui.options.beammp.proxyCleanupOnReload.tooltip",
+              "setting": "proxyCleanupOnReload",
+              "interactive": true,
+              "condition_always_off": false,
+              "condition_not_shipping": false,
+              "condition_simplemenu": "",
+              "condition_visible": "beammpEnableProxyVehicles",
+              "condition_enabled": "beammpEnableProxyVehicles",
+              "itemType": "checkbox",
+              "component": "OptionsCheckbox",
+              "separateLabel": true,
+              "lua": "",
+              "luaOff": "",
+              "valueOn": true,
+              "valueOff": false,
+              "search": [
+                "label",
+                "caption",
+                "tooltip",
+                "setting"
+              ]
             }
           ]
         },

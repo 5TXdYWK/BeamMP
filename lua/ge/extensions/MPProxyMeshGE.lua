@@ -2300,8 +2300,24 @@ local function forget(p)
 end
 
 local function onSettingsChanged() readSettings() if not preload then frameBudget = cfg.frameBudget end end
+-- TSStatics (body and wheel meshes) of an earlier load of this extension (Lua reload), by their name prefix
+local function removeLeftovers()
+	local n = 0
+	for _, name in ipairs(scenetree.findClassObjects("TSStatic") or {}) do
+		if string.find(name, "^beammpProxyMesh") then
+			local obj = scenetree.findObject(name)
+			if obj and not allObjects[obj:getId()] then obj:delete() n = n + 1 end
+		end
+	end
+	if n > 0 then log('I', 'MPProxyMeshGE', string.format("Removed %d proxy mesh objects of an earlier load", n)) end
+end
+
 local function onExtensionLoaded()
 	readSettings()
+	if settings.getValue("proxyCleanupOnReload", true) ~= false then
+		local ok, err = pcall(removeLeftovers)
+		if not ok then log('W', 'MPProxyMeshGE', "Leftover cleanup failed: " .. tostring(err)) end
+	end
 	frameBudget = cfg.frameBudget
 	local ok, err = pcall(cleanOldCache)
 	if not ok then log('W', 'MPProxyMeshGE', "Cache cleanup failed: " .. tostring(err)) end

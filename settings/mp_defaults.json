@@ -79,6 +79,7 @@
   "proxySuspension"             : [ "local", false ],
   "proxySuspensionDistance"     : [ "local", 40 ],
   "proxyMetallicPaint"          : [ "local", true ],
+  "proxyCleanupOnReload"        : [ "local", true ],
   "proxyMeshRealWheelsMax"      : [ "local", 12 ],
   "showPlayerIDs"               : [ "cloud", true  ],
   "licensePlateUsesPlayerName"  : [ "cloud", true ],

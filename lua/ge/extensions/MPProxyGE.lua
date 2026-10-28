@@ -1085,6 +1085,7 @@ local function estimateRpm(p, diesel, speed, snd)
 	return math.min(math.max(rpm, idle), redline), thr
 end
 
+local soundCounter = 0
 local function soundSource(entry)
 	return entry.id and scenetree.findObjectById(entry.id) or nil
 end
@@ -1141,6 +1142,9 @@ local function assignSounds(vehicles)
 						releaseSound(entry)
 						local ok, id = pcall(Engine.Audio.createSource, "AudioDefaultLoop3D", event)
 						entry.id = ok and id or nil
+						local src = entry.id and scenetree.findObjectById(entry.id)
+						soundCounter = soundCounter + 1
+						if src then pcall(src.setName, src, "beammpProxySound_" .. soundCounter) end -- found again after a Lua reload
 						entry.event = event
 					end
 					entry.owner, entry.diesel, entry.leaving, entry.vol, entry.snd = v, diesel, false, 0, snd
@@ -1443,8 +1447,31 @@ local function onSettingsChanged()
 	end
 end
 
+-- objects of an earlier load of these extensions (Lua reload): engine sound sources keep playing and collider
+-- vehicles stay in the level when the tables that knew them are gone. Found by their name prefix.
+local function removeLeftovers()
+	local sounds, cars = 0, 0
+	for _, name in ipairs(scenetree.findClassObjects("SFXFMODEventSource") or {}) do
+		if string.find(name, "^beammpProxySound_") then
+			local src = scenetree.findObject(name)
+			if src then pcall(src.stop, src, -1) src:delete() sounds = sounds + 1 end
+		end
+	end
+	for _, name in ipairs(scenetree.findClassObjects("BeamNGVehicle") or {}) do
+		if string.find(name, "^beammpProxyCollider") then
+			local veh = scenetree.findObject(name)
+			if veh then veh:delete() cars = cars + 1 end
+		end
+	end
+	if sounds + cars > 0 then log('I', 'MPProxyGE', string.format("Removed leftovers of an earlier load: %d sound sources, %d collider vehicles", sounds, cars)) end
+end
+
 local function onExtensionLoaded()
 	readSettings()
+	if settings.getValue("proxyCleanupOnReload", true) ~= false then
+		local ok, err = pcall(removeLeftovers)
+		if not ok then log('W', 'MPProxyGE', "Leftover cleanup failed: " .. tostring(err)) end
+	end
 end
 
 detectGlobalWrites() -- reenable global write notifications
