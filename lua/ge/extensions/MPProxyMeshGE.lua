@@ -23,9 +23,11 @@ setmetatable(_G,{}) -- temporarily disable global notifications
 
 local TIMER = (HighPerfTimer or hptimer)
 local CACHE_DIR = "/temp/beammp/proxymeshes/"
-local CACHE_VERSION = "v2" -- v2: transform aware bounding boxes, glow map materials
+local CACHE_VERSION = "v3" -- v3: one merged .dae per mesh set, source signature validation
 local READ_CHUNK = 256 * 1024     -- bytes per read step (smaller steps keep each resume near the frame budget)
-local FRAME_BUDGET_MS = 2         -- coroutine work per frame
+local FRAME_BUDGET_MS = 2         -- coroutine work per frame in game
+local PRELOAD_BUDGET_MS = 40      -- while the join loading screen hides the stutter
+local frameBudget = FRAME_BUDGET_MS
 local MAX_MESHES = 60             -- per config
 local MAX_NEW_OBJECTS_PER_PASS = 4
 local NEW_SHAPE_INTERVAL = 2      -- seconds between first uses of not yet loaded shapes (engine import hitch)
@@ -84,7 +86,7 @@ end
 
 local budgetTimer = nil
 local function checkBudget()
-	if budgetTimer and budgetTimer:stop() > FRAME_BUDGET_MS then coroutine.yield() end
+	if budgetTimer and budgetTimer:stop() > frameBudget then coroutine.yield() end
 end
 
 -- ============= BUILD STEPS (inside the coroutine) =============
@@ -97,8 +99,9 @@ end
 local function buildPartIndex(model)
 	local diskFile = CACHE_DIR .. model .. "_parts_" .. CACHE_VERSION .. ".json"
 	local files = FS:findFiles("/vehicles/" .. model .. "/", "*.jbeam", -1, false, false) or {}
+	local sig = modelSignature(model)
 	local cached = FS:fileExists(diskFile) and jsonReadFile(diskFile) or nil
-	if cached and cached.fileCount == #files and type(cached.parts) == "table" then return cached.parts end
+	if cached and cached.sig == sig and type(cached.parts) == "table" then return cached.parts end
 
 	local parts = {}
 	for _, filename in ipairs(files) do
@@ -124,7 +127,7 @@ local function buildPartIndex(model)
 		coroutine.yield() -- one jbeam file per step
 	end
 	FS:directoryCreate(CACHE_DIR, true)
-	jsonWriteFile(diskFile, { fileCount = #files, parts = parts }, false)
+	jsonWriteFile(diskFile, { sig = sig, fileCount = #files, parts = parts }, false)
 	return parts
 end
 
@@ -324,9 +327,77 @@ local function filterDae(filename, wanted, bbox, mats)
 		end
 	end
 	if #nodes == 0 then return nil end
-	return table.concat(header) .. "<library_geometries>\n" .. table.concat(geoms, "\n") ..
-		"\n</library_geometries>\n<library_visual_scenes>\n<visual_scene id=\"Scene\" name=\"Scene\">\n" ..
-		table.concat(nodes) .. "</visual_scene>\n</library_visual_scenes>\n<scene>\n<instance_visual_scene url=\"#Scene\"/>\n</scene>\n</COLLADA>\n"
+	return { header = table.concat(header), geoms = geoms, nodes = nodes }
+end
+
+-- ============= MERGING =============
+-- All filtered parts of one config go into a single .dae, so the engine imports one shape per mesh set.
+-- ids are prefixed per source file (Blender names like "Mesh_038-mesh" repeat across files), materials,
+-- effects and images are deduplicated by id. Files with a different <unit>/<up_axis> get their own output.
+local function prefixIds(block, pre, refsToo)
+	block = string.gsub(block, ' id="', ' id="' .. pre)
+	if refsToo then
+		block = string.gsub(block, '="#', '="#' .. pre) -- geometry internal references (sources, vertices)
+	else
+		block = string.gsub(block, 'url="#', 'url="#' .. pre) -- node -> geometry, material targets stay
+	end
+	return block
+end
+
+local function collectLib(header, lib, tag, seen, out)
+	local inner = string.match(header, "<" .. lib .. ">(.-)</" .. lib .. ">")
+	if not inner then return end
+	for block, id in string.gmatch(inner, '(<' .. tag .. ' id="([^"]*)".-</' .. tag .. '>)') do
+		if not seen[id] then seen[id] = true out[#out + 1] = block end
+	end
+end
+
+local function daeSignature(header)
+	return (string.match(header, "<unit[^>]*>") or "") .. (string.match(header, "<up_axis>(.-)</up_axis>") or "Z_UP")
+end
+
+local function mergeDae(list)
+	local first = list[1].header
+	local preamble = string.match(first, "^(.-)<asset>") or '<?xml version="1.0" encoding="utf-8"?>\n<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">\n'
+	local out = { preamble, string.match(first, "<asset>.-</asset>") or "", "\n" }
+	for _, lib in ipairs({ { "library_images", "image" }, { "library_effects", "effect" }, { "library_materials", "material" } }) do
+		local seen, blocks = {}, {}
+		for _, part in ipairs(list) do collectLib(part.header, lib[1], lib[2], seen, blocks) end
+		if #blocks > 0 then out[#out + 1] = "<" .. lib[1] .. ">\n" .. table.concat(blocks, "\n") .. "\n</" .. lib[1] .. ">\n" end
+	end
+	out[#out + 1] = "<library_geometries>\n"
+	for i, part in ipairs(list) do
+		local pre = "f" .. i .. "_"
+		for _, g in ipairs(part.geoms) do out[#out + 1] = prefixIds(g, pre, true) out[#out + 1] = "\n" end
+		checkBudget()
+	end
+	out[#out + 1] = '</library_geometries>\n<library_visual_scenes>\n<visual_scene id="Scene" name="Scene">\n'
+	for i, part in ipairs(list) do
+		local pre = "f" .. i .. "_"
+		for _, n in ipairs(part.nodes) do out[#out + 1] = prefixIds(n, pre, false) end
+	end
+	out[#out + 1] = '</visual_scene>\n</library_visual_scenes>\n<scene>\n<instance_visual_scene url="#Scene"/>\n</scene>\n</COLLADA>\n'
+	return table.concat(out)
+end
+
+-- ============= CACHE VALIDATION =============
+-- game version + count and total size of the model's jbeam/dae/json files (works for zips and mods alike)
+local modelSigs = {}
+local function modelSignature(model)
+	if modelSigs[model] then return modelSigs[model] end
+	local files = FS:findFiles("/vehicles/" .. model .. "/", "*", -1, false, false) or {}
+	local n, total = 0, 0
+	for i, f in ipairs(files) do
+		local ext = string.match(f, "%.(%w+)$")
+		if ext == "jbeam" or ext == "dae" or ext == "json" then
+			local st = FS:stat(f)
+			n, total = n + 1, total + (st and tonumber(st.filesize) or 0)
+		end
+		if i % 64 == 0 then coroutine.yield() end
+	end
+	local sig = tostring(beamng_version or "?") .. "|" .. n .. "|" .. total
+	modelSigs[model] = sig
+	return sig
 end
 
 local MAX_LEN, MAX_WIDTH, MAX_HEIGHT = 25, 6, 6
@@ -370,8 +441,9 @@ local function runJob(job)
 	local shape = shapes[job.key]
 	shape.state = "building"
 	local metaFile = CACHE_DIR .. job.key .. ".json"
+	local sig = modelSignature(job.model)
 	local meta = FS:fileExists(metaFile) and jsonReadFile(metaFile) or nil
-	if meta and type(meta.paths) == "table" and #meta.paths > 0 then
+	if meta and meta.sig == sig and type(meta.paths) == "table" and #meta.paths > 0 then
 		local allExist = true
 		for _, p in ipairs(meta.paths) do if not FS:fileExists(p) then allExist = false end end
 		if allExist then
@@ -407,7 +479,7 @@ local function runJob(job)
 	local meshMetaFile = CACHE_DIR .. meshKey .. ".json"
 	if count > 0 and FS:fileExists(meshMetaFile) then
 		local mm = jsonReadFile(meshMetaFile)
-		local ok = mm and type(mm.paths) == "table" and #mm.paths > 0
+		local ok = mm and mm.sig == sig and type(mm.paths) == "table" and #mm.paths > 0
 		if ok then for _, p in ipairs(mm.paths) do if not FS:fileExists(p) then ok = false end end end
 		if ok then
 			loadModelMaterials(job.model)
@@ -430,12 +502,21 @@ local function runJob(job)
 	local daes = FS:findFiles("/vehicles/" .. job.model .. "/", "*.dae", -1, false, false) or {}
 	local paths, mats = {}, {}
 	FS:directoryCreate(CACHE_DIR, true)
-	for i, dae in ipairs(daes) do
-		local text = filterDae(dae, wanted, bbox, mats)
-		if text then
-			local out = CACHE_DIR .. meshKey .. "_" .. i .. ".dae"
-			if writeFile(out, text) then paths[#paths + 1] = out end
+	local groups, groupOrder = {}, {}
+	for _, dae in ipairs(daes) do
+		local part = filterDae(dae, wanted, bbox, mats)
+		if part then
+			local gsig = daeSignature(part.header)
+			if not groups[gsig] then groups[gsig] = {} groupOrder[#groupOrder + 1] = gsig end
+			table.insert(groups[gsig], part)
 		end
+		coroutine.yield()
+	end
+	for g, gsig in ipairs(groupOrder) do
+		local out = CACHE_DIR .. meshKey .. "_" .. g .. ".dae"
+		local text = mergeDae(groups[gsig])
+		coroutine.yield()
+		if writeFile(out, text) then paths[#paths + 1] = out end
 		coroutine.yield()
 	end
 	if #paths == 0 then
@@ -449,7 +530,7 @@ local function runJob(job)
 	for name in pairs(mats) do matList[#matList + 1] = name end
 	table.sort(matList)
 	ensureMaterials(matList)
-	local metaData = { paths = paths, bbox = validBBox(bbox) and bbox or nil, materials = matList }
+	local metaData = { sig = sig, paths = paths, bbox = validBBox(bbox) and bbox or nil, materials = matList }
 	jsonWriteFile(metaFile, metaData, false)
 	jsonWriteFile(meshMetaFile, metaData, false)
 	shape.paths = paths
@@ -465,7 +546,7 @@ local function stepJobs()
 	end
 	budgetTimer = TIMER()
 	currentJob.frames = currentJob.frames + 1
-	while currentJob and budgetTimer:stop() < FRAME_BUDGET_MS do
+	while currentJob and budgetTimer:stop() < frameBudget do
 		local before = budgetTimer:stop()
 		local ok, err = coroutine.resume(currentJob.co, currentJob.job)
 		local stepMs = budgetTimer:stop() - before
@@ -498,6 +579,7 @@ local function request(model, vcf)
 	if vcf.mainPartName then parts[#parts + 1] = vcf.mainPartName end
 	table.sort(parts)
 	local key = model .. "_" .. CACHE_VERSION .. "_" .. hashString(model .. "|" .. table.concat(parts, ","))
+	if M._onRequest then M._onRequest() end
 	if not shapes[key] then
 		shapes[key] = { state = "queued" }
 		jobs[#jobs + 1] = { key = key, model = model, parts = parts }
@@ -721,6 +803,91 @@ local function drawOverlay()
 	imgui.End()
 end
 
+-- ============= JOIN PRELOAD =============
+-- While joining, BeamMP's map loading screen is kept up (core_gamestate loading screen request, same as
+-- career does) until the vehicles received on join have their meshes built and imported once, capped by
+-- PRELOAD_TIMEOUT. Whatever is left continues in the background with the normal budget.
+local PRELOAD_TAG = "beammpProxyPreload"
+local PRELOAD_TIMEOUT = 25  -- seconds
+local PRELOAD_FIRST_WAIT = 6 -- seconds to wait for the first spawn packets
+local PRELOAD_QUIET = 2      -- seconds without new requests before finishing
+local preload = nil
+
+local function finishPreload(reason)
+	if not preload then return end
+	log('I', 'MPProxyMeshGE', string.format("Join preload finished after %.1f s (%s)", clock - preload.started, reason))
+	preload = nil
+	frameBudget = FRAME_BUDGET_MS
+	guihooks.trigger('LoadingInfo', { message = "" })
+	if core_gamestate and core_gamestate.requestExitLoadingScreen then core_gamestate.requestExitLoadingScreen(PRELOAD_TAG) end
+end
+
+local function startPreload()
+	if preload or not cfg.enabled then return end
+	if not (MPCoreNetwork and MPCoreNetwork.isMPSession and MPCoreNetwork.isMPSession()) then return end
+	if not (core_gamestate and core_gamestate.requestEnterLoadingScreen) then return end
+	preload = { started = clock, quietUntil = clock + PRELOAD_FIRST_WAIT }
+	frameBudget = PRELOAD_BUDGET_MS
+	core_gamestate.requestEnterLoadingScreen(PRELOAD_TAG)
+	log('I', 'MPProxyMeshGE', "Join preload started")
+end
+
+M._onRequest = function()
+	if preload then preload.quietUntil = math.max(preload.quietUntil, clock + PRELOAD_QUIET) end
+end
+
+-- imports every ready shape once (hidden pooled TSStatic), so the first real use does not hitch
+local function preImport()
+	local done = 0
+	for _, shape in pairs(shapes) do
+		if shape.state == "ready" and shape.paths and not shape.loaded then
+			for _, path in ipairs(shape.paths) do
+				if not importedPaths[path] then
+					local t = TIMER()
+					importedPaths[path] = true
+					local id = takeStatic(path)
+					if id then returnStatic(path, id) end
+					log('I', 'MPProxyMeshGE', string.format("First use of %s mesh took %.1f ms (preload)", path, t:stop()))
+					done = done + 1
+				end
+			end
+			shape.loaded = true
+			if done >= 1 then return true end -- one import per frame keeps the loading screen animating
+		end
+	end
+	return done > 0
+end
+
+local function updatePreload()
+	if not preload then return end
+	local busy = currentJob ~= nil or #jobs > 0
+	local imported = preImport()
+	local current = currentJob and currentJob.job.model or jobs[1] and jobs[1].model
+	if current then
+		guihooks.trigger('LoadingInfo', { message = string.format("Preparing vehicles: %s (%d left)", tostring(current), #jobs + 1) })
+	end
+	if clock - preload.started > PRELOAD_TIMEOUT then finishPreload("timeout, continuing in background")
+	elseif not busy and not imported and clock > preload.quietUntil then finishPreload("all vehicles ready") end
+end
+
+-- removes cache files of older CACHE_VERSIONs (and their engine .cdae copies)
+local function cleanOldCache()
+	local removed, bytes = 0, 0
+	for _, dir in ipairs({ CACHE_DIR, "/temp" .. CACHE_DIR }) do
+		for _, f in ipairs(FS:findFiles(dir, "*", 0, false, false) or {}) do
+			local name = string.match(f, "([^/]+)$") or f
+			local current = string.find(name, "_" .. CACHE_VERSION .. "_", 1, true) or string.find(name, "_parts_" .. CACHE_VERSION .. ".json", 1, true)
+			if not current and name ~= "main.materials.json" then
+				local st = FS:stat(f)
+				bytes = bytes + (st and tonumber(st.filesize) or 0)
+				FS:removeFile(f)
+				removed = removed + 1
+			end
+		end
+	end
+	if removed > 0 then log('I', 'MPProxyMeshGE', string.format("Removed %d old proxy mesh cache files (%.0f MB)", removed, bytes / 1048576)) end
+end
+
 local function onUpdate(dtReal)
 	clock = clock + (dtReal or 0)
 	if not cfg.enabled then return end
@@ -737,7 +904,8 @@ local function onUpdate(dtReal)
 			if ms > buildStats.maxMs then buildStats.maxMs = ms end
 		end
 	end
-	drawOverlay()
+	updatePreload()
+	if not preload then drawOverlay() end -- the loading screen shows progress during preload
 end
 
 --- Cache / pool statistics for MPProxyTest.
@@ -779,7 +947,11 @@ local function forget(p)
 end
 
 local function onSettingsChanged() readSettings() end
-local function onExtensionLoaded() readSettings() end
+local function onExtensionLoaded()
+	readSettings()
+	local ok, err = pcall(cleanOldCache)
+	if not ok then log('W', 'MPProxyMeshGE', "Cache cleanup failed: " .. tostring(err)) end
+end
 
 detectGlobalWrites() -- reenable global write notifications
 
@@ -795,7 +967,8 @@ M.getStats          = getStats
 M.isEnabled         = function() return cfg.enabled end
 M.onSettingsChanged = onSettingsChanged
 M.onExtensionLoaded = onExtensionLoaded
-M.onClientEndMission = reset
+M.onClientEndMission = function() finishPreload("mission ended") reset() end
+M.onClientStartMission = startPreload
 M.onInit = function() setExtensionUnloadMode(M, "manual") end
 
 return M
