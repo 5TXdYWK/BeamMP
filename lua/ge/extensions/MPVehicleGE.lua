@@ -38,6 +38,19 @@ local oneSecCounter = 0
 local nicknamesAllowed = true
 local onVehicleDestroyedAllowed = true
 local nextSpawnIsRemote = false
+local proxyTestActive = false -- set by MPProxyTest: lets the remote-vehicle pipeline run without a launcher connection
+local PROXY_TEST_MIN_PLAYER_ID = 900000 -- fake test players use IDs >= this, never sent to the server
+
+-- true for server vehicle IDs that belong to MPProxyTest fake players
+local function isFakeServerVehicleID(serverVehicleID)
+	local pid = tonumber(tostring(serverVehicleID or ""):match("^(%d+)%-"))
+	return pid ~= nil and pid >= PROXY_TEST_MIN_PLAYER_ID
+end
+
+-- the remote vehicle pipeline (prediction, nametags, proxies) runs when connected, or in proxy test mode
+local function pipelineActive()
+	return proxyTestActive or (MPGameNetwork and MPGameNetwork.launcherConnected())
+end
 local editSyncTimer = 0
 local localCounter = 0
 local vehiclesToSync = {}
@@ -1651,7 +1664,11 @@ end
 --============================ ON VEHICLE SPAWNED (CLIENT) ============================
 local function onVehicleSpawned(gameVehicleID)
 
-	if not MPCoreNetwork.isMPSession() then return end -- do nothing if singleplayer
+	if not MPCoreNetwork.isMPSession() then -- do nothing if singleplayer
+		-- proxy test mode: only remote (fake) vehicles and proxy colliders get the VE extensions, own spawns stay untouched
+		if not proxyTestActive then return end
+		if not (nextSpawnIsRemote or (MPProxyGE and MPProxyGE.isCollider(gameVehicleID))) then return end
+	end
 
 	local veh = getObjectByID(gameVehicleID)
 	if MPProxyGE and MPProxyGE.isCollider(gameVehicleID) then -- pooled proxy collider, never sent to the server
@@ -1903,7 +1920,7 @@ end
 
 local function onVehicleDestroyed(gameVehicleID)
 	missingServerIDLogged[gameVehicleID] = nil
-	if MPGameNetwork.launcherConnected() then
+	if pipelineActive() then
 		local vehicle = getVehicleByGameID(gameVehicleID)
 
 		log('W', 'onVehicleDestroyed', gameVehicleID .. ' ' )
@@ -1984,7 +2001,10 @@ local function sendActiveVehicleID(newVehObj)
 	if not newServerVehicleID then
 		newServerVehicleID = tostring(MPConfig.getPlayerServerID()) .. '-' .. -1 -- if the vehicle doesn't exist we still want to send that it changed to remove the spectator nametag
 	end
-	if newServerVehicleID then
+	if isFakeServerVehicleID(newServerVehicleID) or newVehObj.isFakeTest then -- MPProxyTest vehicle, the server must never hear about it
+		newServerVehicleID = tostring(MPConfig.getPlayerServerID()) .. '-' .. -1
+	end
+	if newServerVehicleID and MPGameNetwork.launcherConnected() then
 		local playerID = MPConfig.getPlayerServerID()
 		MPGameNetwork.send(MPNetworkHelpers.generatePacketBuffer('Om',tostring(playerID),newServerVehicleID))
 	end
@@ -2754,7 +2774,7 @@ local function applyPlayerQueues(playerID)
 end
 
 local function onUpdate(dt)
-	if MPGameNetwork and MPGameNetwork.launcherConnected() then
+	if pipelineActive() then
 		localCounter = localCounter + dt
 	end
 
@@ -2785,7 +2805,7 @@ end
 
 
 local function onPreRender(dt)
-	if MPGameNetwork and MPGameNetwork.launcherConnected() then
+	if pipelineActive() then
 		if not hasInitColors then
 			initColors()
 		end
@@ -3211,6 +3231,15 @@ M.isProxy                  = isProxy                  -- takes: string serverVeh
 M.getVehiclePosRot         = getVehiclePosRot         -- takes: string serverVehicleID  returns: vec3, quat (works for proxies)
 M.getProxyVehicles         = getProxyVehicles         -- takes: -      returns: { serverVehicleID : Vehicle }
 M.requestRealVehicle       = requestRealVehicle       -- takes: string serverVehicleID  returns: bool
+M.setProxyTestActive       = function(active) proxyTestActive = active and true or false end
+M.isProxyTestActive        = function() return proxyTestActive end
+M.isFakeServerVehicleID    = isFakeServerVehicleID    -- takes: string serverVehicleID  returns: bool
+M.PROXY_TEST_MIN_PLAYER_ID = PROXY_TEST_MIN_PLAYER_ID
+-- MPProxyTest entry point: same path as a received 'Os' packet, minus the past-vehicles resend the 's' handler does
+M.injectTestSpawn          = function(playerRole, playerNickname, serverVehicleID, data)
+	if not isFakeServerVehicleID(serverVehicleID) then log('E', 'injectTestSpawn', 'refusing non-test id '..tostring(serverVehicleID)) return end
+	onServerVehicleSpawned(playerRole, playerNickname, serverVehicleID, data)
+end
 M.hasSpawnData             = hasSpawnData             -- internal, used by MPProxyGE
 M.promoteToReal            = promoteToReal            -- internal, used by MPProxyGE
 M.demoteToProxy            = demoteToProxy            -- internal, used by MPProxyGE

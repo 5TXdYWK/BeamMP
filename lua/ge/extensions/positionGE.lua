@@ -276,7 +276,7 @@ local function onPreRender(dt)
 end
 
 local function onUpdate(dtReal, dtSim, dtRaw)
-	if MPGameNetwork and MPGameNetwork.launcherConnected() then
+	if (MPGameNetwork and MPGameNetwork.launcherConnected()) or (MPVehicleGE and MPVehicleGE.isProxyTestActive and MPVehicleGE.isProxyTestActive()) then
 		setActualSimSpeed(dtSim/dtRaw)
 		local simSpeed = simTimeAuthority.getReal() * (simTimeAuthority.getPause() and 0 or 1)
 		if targetGameSpeed ~= simSpeed then
