@@ -165,6 +165,22 @@ local function isOffsetModifier(row)
 	return nz(row.pos) or nz(row.rot) or (type(s) == "table" and ((s.x or 1) ~= 1 or (s.y or 1) ~= 1 or (s.z or 1) ~= 1))
 end
 
+-- flexbody rows that are never part of the body mesh sets: wheels, tires, hubcaps and brakes (bound to wheel /
+-- tire / hubcap / wheelhub groups, they come from the wheel system), and rows placed by their own pos / rot /
+-- scale (the body sets use the raw mesh position, those would end up at the vehicle origin)
+local BODY_SKIP_GROUPS = { wheel = true, tire = true, tyre = true, hubcap = true, rim = true, wheelhub = true }
+local function isWheelFlexRow(row)
+	local last = row[#row]
+	if #row > 1 and type(last) == "table" and last[1] == nil and isOffsetModifier(last) then return true end
+	if type(row[2]) == "table" then
+		for _, g in ipairs(row[2]) do
+			local pre = type(g) == "string" and string.match(g, "^(%a+)_")
+			if pre and BODY_SKIP_GROUPS[string.lower(pre)] then return true end
+		end
+	end
+	return false
+end
+
 -- ============= CACHE VALIDATION =============
 -- game version + count and total size of the model's jbeam/dae/json files (works for zips and mods alike)
 local modelSigs = {}
@@ -263,7 +279,8 @@ end
 local ENGINE_FIELDS = { idleRPM = true, maxRPM = true, revLimiterRPM = true, soundConfig = true, soundConfigExhaust = true, requiredEnergyType = true }
 local SOUND_FIELDS = { sampleName = true, sampleFolder = true, mainGain = true, onLoadGain = true, offLoadGain = true,
 	intakeMuffling = true, exhaustAudioMufflingBaseCoef = true }
-local ENGINE_INDEX_VERSION = 3 -- part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies)
+local ENGINE_INDEX_VERSION = 4 -- part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists)
+local BODY_VERSION = 2 -- per config meta written before this is not reused as is (2: wheel / tire / brake meshes left out of the body)
 
 local function keepFields(decoded, fields)
 	local out, any = {}, false
@@ -512,7 +529,7 @@ local function buildPartIndex(model)
 						if type(row) == "table" then
 							if row[1] ~= nil then
 								local mesh = row[1]
-								if type(mesh) == "string" and mesh ~= "mesh" and not offset then list[#list + 1] = mesh end
+								if type(mesh) == "string" and mesh ~= "mesh" and not offset and not isWheelFlexRow(row) then list[#list + 1] = mesh end
 							else
 								offset = isOffsetModifier(row) -- positioned meshes (mirrored/moved) would be misplaced
 							end
@@ -1327,7 +1344,7 @@ local function runJob(job)
 	local metaFile = CACHE_DIR .. job.key .. ".json"
 	local sig = modelSignature(job.model)
 	local meta = FS:fileExists(metaFile) and jsonReadFile(metaFile) or nil
-	if meta and meta.sig == sig and type(meta.paths) == "table" and #meta.paths > 0 and type(meta.tiers) == "table" then
+	if meta and meta.sig == sig and meta.bodyV == BODY_VERSION and type(meta.paths) == "table" and #meta.paths > 0 and type(meta.tiers) == "table" then
 		local allExist = true
 		for _, p in ipairs(meta.paths) do if not FS:fileExists(p) then allExist = false end end
 		if allExist then
@@ -1393,9 +1410,9 @@ local function runJob(job)
 			local w, why = resolveWheels(job)
 			shape.wheels = checkWheels(w, shape)
 			logWheels(job, shape.wheels, why)
-			mm.wheels, mm.wheelV = shape.wheels or false, WHEEL_VERSION
+			mm.wheels, mm.wheelV, mm.bodyV = shape.wheels or false, WHEEL_VERSION, BODY_VERSION
 			jsonWriteFile(metaFile, mm, false)
-			mm.sound, mm.wheels, mm.wheelV = nil, nil, nil
+			mm.sound, mm.wheels, mm.wheelV, mm.bodyV = nil, nil, nil, nil
 			shape.paths = mm.paths
 			shape.tiers = mm.tiers
 			shape.fromCache = true
@@ -1482,7 +1499,7 @@ local function runJob(job)
 	local wl, why = resolveWheels(job)
 	shape.wheels = checkWheels(wl, shape)
 	logWheels(job, shape.wheels, why)
-	metaData.sound, metaData.wheels, metaData.wheelV = shape.sound, shape.wheels or false, WHEEL_VERSION
+	metaData.sound, metaData.wheels, metaData.wheelV, metaData.bodyV = shape.sound, shape.wheels or false, WHEEL_VERSION, BODY_VERSION
 	jsonWriteFile(metaFile, metaData, false)
 	shape.paths = paths
 	shape.tiers = tiers
