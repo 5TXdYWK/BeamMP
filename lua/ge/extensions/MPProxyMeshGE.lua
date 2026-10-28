@@ -559,7 +559,7 @@ end
 -- (x away from the center line: posX + sign(posX) * x, lua/common/jbeam/utils.lua), pressureWheels options apply
 -- to the wheel rows after them, and each wheel is placed like lua/common/jbeam/sections/wheelTypes/pressureWheels.lua:
 -- midpoint of node1/node2 (or offsetFromNode), moved by wheelOffset along the axis, tireWidth wide, radius.
-local WHEEL_VERSION = 2 -- 2: named fields (mixed tables did not survive the json round trip), rim / tire meshes
+local WHEEL_VERSION = 3 -- 3: tire flag per mesh; 2: named fields (mixed tables did not survive the json round trip), rim / tire meshes
 local MAX_WHEEL_MESHES = 6 -- per wheel
 
 -- jbeam values: numbers, "$var", or "$=expression" (arithmetic, comparisons, and/or/not, case(c1, v1, ..., default),
@@ -713,9 +713,8 @@ local function resolveWheels(job)
 				local dup = false
 				for _, e in ipairs(w.m) do if e[1] == fb.m then dup = true end end
 				if not dup and #w.m < MAX_WHEEL_MESHES then
-					if fb.t then w.mt = true end -- has a tire mesh (else the drawn cylinder stays as the tire)
 					w.m[#w.m + 1] = { fb.m, x - w.x, y - w.y, z - w.z, evalVal(r[1], vars) or 0, evalVal(r[2], vars) or 0, evalVal(r[3], vars) or 0,
-						evalVal(sc[1], vars) or 1, evalVal(sc[2], vars) or 1, evalVal(sc[3], vars) or 1 }
+						evalVal(sc[1], vars) or 1, evalVal(sc[2], vars) or 1, evalVal(sc[3], vars) or 1, fb.t and 1 or 0 }
 				end
 			end
 		end
@@ -1145,11 +1144,10 @@ end
 -- They are built after the body meshes, when no body job waits.
 local wheelFiles = {}     -- [wheel .dae path] = "queued" | "ready" | "failed"
 local wheelJobs = {}      -- FIFO of wheel mesh builds
-local wheelMeshFile = nil -- [mesh name] = source .dae where it was found (disk cached)
-local wheelDaeList = {}   -- [model] = candidate source .dae files
-local wheelMissing = {}   -- [mesh name] = true: searched this session without finding it
-local WHEEL_FILES_CACHE = CACHE_DIR .. "wheelmeshes_" .. CACHE_VERSION .. "_files.json"
-local MAX_WHEEL_FILE_TRIES = 12 -- source files scanned per mesh name that is not in the cache yet
+local wheelInfo = {}      -- [wheel .dae path] = { tire = bool, rim = bool } (what the file has, sidecar .json)
+local meshIndexes = {}    -- ["common"] / [model] = { [scene node name] = source .dae } (disk cached)
+-- wheel files are named with this: v2 = found through the scene node index (v1 guessed files by name and missed many)
+local WHEEL_FILE_TAG = "wheel2_"
 
 local function wheelPath(w)
 	if w.path ~= nil then return w.path end
@@ -1159,7 +1157,7 @@ local function wheelPath(w)
 		list[#list + 1] = string.format("%s|%.3f|%.3f|%.3f|%.1f|%.1f|%.1f|%.3f|%.3f|%.3f", tostring(e[1]), e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9], e[10])
 	end
 	table.sort(list)
-	w.path = CACHE_DIR .. "wheel_" .. CACHE_VERSION .. "_" .. hashString(table.concat(list, ";")) .. ".dae"
+	w.path = CACHE_DIR .. WHEEL_FILE_TAG .. CACHE_VERSION .. "_" .. hashString(table.concat(list, ";")) .. ".dae"
 	return w.path
 end
 
@@ -1168,7 +1166,8 @@ local function queueWheelMeshes(shape, model)
 	for _, w in ipairs(shape.wheels) do
 		local path = wheelPath(w)
 		if path and wheelFiles[path] == nil then
-			if FS:fileExists(path) then wheelFiles[path] = "ready"
+			local info = FS:fileExists(path) and jsonReadFile((string.gsub(path, "%.dae$", ".json"))) or nil
+			if type(info) == "table" then wheelFiles[path] = "ready" wheelInfo[path] = info
 			else
 				wheelFiles[path] = "queued"
 				wheelJobs[#wheelJobs + 1] = { wheelJob = true, key = path, model = model, m = w.m }
@@ -1177,32 +1176,77 @@ local function queueWheelMeshes(shape, model)
 	end
 end
 
-local function wheelCandidates(model)
-	local list = wheelDaeList[model]
-	if list then return list end
-	list = {}
-	for _, d in ipairs({ "/vehicles/common/wheels/", "/vehicles/common/tires/", "/vehicles/common/hubcaps/", "/vehicles/common/wheels_square/",
-		"/vehicles/common/" .. model .. "/", "/vehicles/" .. model .. "/" }) do
-		for _, f in ipairs(FS:findFiles(d, "*.dae", -1, false, false) or {}) do list[#list + 1] = f end
-		checkBudget()
+-- scene node names of one .dae. The visual scene sits at the end of the file (after the geometries), so the file
+-- is read backwards from its end until the scene starts; files that cannot seek are read forward.
+local function sceneNodeNames(file, out)
+	local f = io.open(file, "rb")
+	if not f then return end
+	local okSeek, size = pcall(f.seek, f, "end")
+	local text = nil
+	if okSeek and type(size) == "number" and size > 0 then
+		local parts, pos = {}, size
+		while pos > 0 do
+			local from = math.max(0, pos - READ_CHUNK * 2)
+			f:seek("set", from)
+			local chunk = f:read(pos - from)
+			if not chunk then break end
+			table.insert(parts, 1, chunk)
+			pos = from
+			local joined = table.concat(parts)
+			parts = { joined }
+			if string.find(joined, "<visual_scene", 1, true) then break end
+			coroutine.yield()
+		end
+		text = parts[1]
+	else
+		local list = {}
+		while true do
+			local chunk = f:read(READ_CHUNK)
+			if not chunk then break end
+			list[#list + 1] = chunk
+			coroutine.yield()
+		end
+		text = table.concat(list)
 	end
-	wheelDaeList[model] = list
-	return list
+	f:close()
+	if not text then return end
+	local sceneAt = string.find(text, "<visual_scene", 1, true) or 1
+	for name in string.gmatch(string.sub(text, sceneAt), '<node [^>]-name="([^"]+)"') do
+		if out[name] == nil then out[name] = file end
+	end
+	checkBudget()
 end
 
--- how well a file path matches a mesh name: longest common prefix with one of its folder / file names
--- ("steelwheel_02a_16x8" -> .../steelwheel_02a/steelwheel_02a.dae, "tire_01a_18x9_26" -> tires/tires.dae)
-local function nameScore(mesh, path)
-	local m, best = string.lower(mesh), 0
-	for comp in string.gmatch(string.lower(path), "[^/]+") do
-		comp = string.gsub(comp, "%.dae$", "")
-		local n = 0
-		for i = 1, math.min(#m, #comp) do
-			if string.byte(m, i) == string.byte(comp, i) then n = i else break end
-		end
-		if n > best then best = n end
+-- [scene node name] = .dae for the shared wheel / tire / hubcap folders ("common") or one model's folders
+local function meshIndex(which)
+	local idx = meshIndexes[which]
+	if idx then return idx end
+	local dirs = which == "common" and { "/vehicles/common/wheels/", "/vehicles/common/tires/", "/vehicles/common/hubcaps/", "/vehicles/common/wheels_square/" }
+		or { "/vehicles/common/" .. which .. "/", "/vehicles/" .. which .. "/" }
+	local files = {}
+	for _, d in ipairs(dirs) do
+		for _, fl in ipairs(FS:findFiles(d, "*.dae", -1, false, false) or {}) do files[#files + 1] = fl end
+		checkBudget()
 	end
-	return best
+	table.sort(files)
+	local sig = tostring(beamng_version or "?") .. "|" .. #files .. "|" .. (which ~= "common" and modelSignature(which) or "")
+	local diskFile = CACHE_DIR .. "meshindex_" .. CACHE_VERSION .. "_" .. which .. ".json"
+	local cached = FS:fileExists(diskFile) and jsonReadFile(diskFile) or nil
+	if type(cached) == "table" and cached.sig == sig and type(cached.names) == "table" then
+		meshIndexes[which] = cached.names
+		return cached.names
+	end
+	setPhase("mesh index")
+	local t0 = os.clock()
+	idx = {}
+	for _, fl in ipairs(files) do sceneNodeNames(fl, idx) end
+	local count = 0
+	for _ in pairs(idx) do count = count + 1 end
+	FS:directoryCreate(CACHE_DIR, true)
+	jsonWriteFile(diskFile, { sig = sig, names = idx }, false)
+	log('I', 'MPProxyMeshGE', string.format("Indexed %d scene nodes in %d .dae files (%s)", count, #files, which))
+	meshIndexes[which] = idx
+	return idx
 end
 
 -- the node block with the flexbody transform (scale, rotation: euler +Z +X +Y intrinsic, then position relative to
@@ -1253,54 +1297,31 @@ end
 
 local function runWheelJob(job)
 	setPhase("wheel meshes")
-	if wheelMeshFile == nil then
-		local c = FS:fileExists(WHEEL_FILES_CACHE) and jsonReadFile(WHEEL_FILES_CACHE) or nil
-		wheelMeshFile = (type(c) == "table" and c.sig == tostring(beamng_version or "?") and type(c.files) == "table") and c.files or {}
-	end
 	local need = {}
 	for _, e in ipairs(job.m) do need[e[1]] = true end
-	local found, scanned, learned = {}, {}, false
-	local function scan(file, names)
-		if scanned[file] then return end
-		scanned[file] = true
-		local part = filterDae(file, names, {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}, nil)
+	-- the model's own folders first (model specific hubs / wheels), then the shared ones
+	local own, common = meshIndex(job.model), meshIndex("common")
+	setPhase("wheel meshes")
+	local byFile, missing = {}, {}
+	for name in pairs(need) do
+		local fl = own[name] or common[name]
+		if fl then byFile[fl] = byFile[fl] or {} byFile[fl][name] = true else missing[#missing + 1] = name end
+	end
+	local found = {}
+	for fl, names in pairs(byFile) do
+		local part = filterDae(fl, names, {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}, nil)
 		coroutine.yield()
-		if not part then return end
-		for _, n in ipairs(part.nodes) do
-			if need[n.name] and not found[n.name] then
-				found[n.name] = { part = part, node = n, file = file }
-				if wheelMeshFile[n.name] ~= file then wheelMeshFile[n.name] = file learned = true end
+		if part then
+			for _, n in ipairs(part.nodes) do
+				if need[n.name] and not found[n.name] then found[n.name] = { part = part, node = n, file = fl } end
 			end
 		end
-	end
-	local byFile = {}
-	for name in pairs(need) do
-		local f = wheelMeshFile[name]
-		if f then byFile[f] = byFile[f] or {} byFile[f][name] = true end
-	end
-	for f, names in pairs(byFile) do if FS:fileExists(f) then scan(f, names) end end
-	for name in pairs(need) do
-		if not found[name] and not wheelMissing[name] then
-			local rest = {}
-			for n2 in pairs(need) do if not found[n2] then rest[n2] = true end end
-			local scored = {}
-			for _, f in ipairs(wheelCandidates(job.model)) do
-				if not scanned[f] then scored[#scored + 1] = { f = f, s = nameScore(name, f) } end
-			end
-			table.sort(scored, function(a, b) return a.s > b.s end)
-			checkBudget()
-			for i = 1, math.min(#scored, MAX_WHEEL_FILE_TRIES) do
-				if found[name] then break end
-				scan(scored[i].f, rest)
-			end
-			if not found[name] then wheelMissing[name] = true end
+		for name in pairs(names) do
+			if not found[name] then missing[#missing + 1] = name .. " (nested or unusable in " .. (string.match(fl, "([^/]+)$") or fl) .. ")" end
 		end
-	end
-	if learned then
-		FS:directoryCreate(CACHE_DIR, true)
-		jsonWriteFile(WHEEL_FILES_CACHE, { sig = tostring(beamng_version or "?"), files = wheelMeshFile }, false)
 	end
 	local groups, order, sig0, mats, used, names = {}, {}, nil, {}, 0, {}
+	local hasTire, hasRim = false, false
 	for _, e in ipairs(job.m) do
 		local fnd = found[e[1]]
 		local part = fnd and fnd.part
@@ -1319,11 +1340,12 @@ local function runWheelJob(job)
 			if not g.used[url] and part.geomById[url] then g.used[url] = true g.geoms[#g.geoms + 1] = part.geomById[url] end
 			used = used + 1
 			names[#names + 1] = e[1]
+			if e[11] == 1 then hasTire = true else hasRim = true end
 		end
 	end
 	if used == 0 then
 		wheelFiles[job.key] = "failed"
-		log('W', 'MPProxyMeshGE', string.format("Proxy wheel mesh for %s: none of %d meshes found or usable (%s), drawn wheels stay", job.model, #job.m, job.m[1] and job.m[1][1] or "?"))
+		log('W', 'MPProxyMeshGE', string.format("Proxy wheel mesh for %s: none of %d meshes found or usable (missing: %s), drawn wheels stay", job.model, #job.m, table.concat(missing, ", ")))
 		return
 	end
 	setPhase("wheel merge")
@@ -1337,9 +1359,12 @@ local function runWheelJob(job)
 	local matList = {}
 	for name in pairs(mats) do matList[#matList + 1] = name end
 	ensureMaterials(matList)
+	wheelInfo[job.key] = { tire = hasTire, rim = hasRim }
+	jsonWriteFile((string.gsub(job.key, "%.dae$", ".json")), wheelInfo[job.key], false)
 	wheelFiles[job.key] = "ready"
-	log('I', 'MPProxyMeshGE', string.format("Proxy wheel mesh %s for %s: %d of %d meshes (%s) from %d files",
-		string.match(job.key, "([^/]+)$"), job.model, used, #job.m, table.concat(names, ", "), #order))
+	log(#missing > 0 and 'W' or 'I', 'MPProxyMeshGE', string.format("Proxy wheel mesh %s for %s: %d of %d meshes (%s) from %d files, tire %s, rim %s%s",
+		string.match(job.key, "([^/]+)$"), job.model, used, #job.m, table.concat(names, ", "), #order, hasTire and "yes" or "drawn",
+		hasRim and "yes" or "drawn", #missing > 0 and (", missing: " .. table.concat(missing, ", ")) or ""))
 end
 
 local function runJob(job)
@@ -1782,7 +1807,7 @@ local function attachWheels(p, shape)
 		local obj = id and scenetree.findObjectById(id)
 		if obj then
 			obj.hidden = false
-			p.wheelObjects[i] = { path = path, id = id, obj = obj, roll = 0 }
+			p.wheelObjects[i] = { path = path, id = id, obj = obj, roll = 0, info = wheelInfo[path] }
 		end
 	end
 	return true
@@ -1895,6 +1920,7 @@ local unitX, unitY, unitZ = vec3(1,0,0), vec3(0,1,0), vec3(0,0,1)
 local ffiFound = ffi and ffi.C and true or false
 local drawCylinder = ffiFound and ffi.C.BNG_DBG_DRAW_Cylinder or nop
 local wheelColor = color(25, 25, 25, 255)
+local rimColor = color(150, 150, 155, 255)
 local MAX_STEER = math.rad(30) -- drawn front wheel angle at full steering
 local wheelDir, wheelUp, wheelQuat = vec3(), vec3(), quat()
 local TWO_PI = 2 * math.pi
@@ -2074,7 +2100,17 @@ local function drawProxy(p, dist)
 					o.obj:setPosRot(px, py, pz, q.x, q.y, q.z, q.w)
 				end
 			end
-			if cfg.wheels and not (o and o.obj and w.mt) then -- drawn tire when there is no tire mesh
+			local real = o and o.obj and o.info
+			if real and not real.rim then -- a tire mesh without its rim: a plain disc inside it
+				local ax, ay, az = w.ax, w.ay, w.az
+				if w.s and steer ~= 0 then ax, ay = ax * sc - ay * ss, ax * ss + ay * sc end
+				local h = w.wd * 0.42
+				local wz = w.z + (susp and susp.off[i] or 0)
+				local x1, y1, z1 = toWorld(w.x - ax * h, w.y - ay * h, wz - az * h)
+				local x2, y2, z2 = toWorld(w.x + ax * h, w.y + ay * h, wz + az * h)
+				drawCylinder(x1, y1, z1, x2, y2, z2, w.r * 0.62, rimColor, true)
+			end
+			if (cfg.wheels or real) and not (real and real.tire) then -- drawn tire when there is no tire mesh
 				local ax, ay, az = w.ax, w.ay, w.az
 				if w.s and steer ~= 0 then ax, ay = ax * sc - ay * ss, ax * ss + ay * sc end
 				local h = w.wd * 0.5
@@ -2227,6 +2263,8 @@ local function cleanOldCache()
 		for _, f in ipairs(FS:findFiles(dir, "*", 0, false, false) or {}) do
 			local name = string.match(f, "([^/]+)$") or f
 			local current = string.find(name, "_" .. CACHE_VERSION .. "_", 1, true) or string.find(name, "_parts_" .. CACHE_VERSION .. ".json", 1, true)
+			-- wheel_v5_* / wheelmeshes_v5_*: wheel files of the first real wheel version (found by guessed file names)
+			if string.find(name, "^wheel_") or string.find(name, "^wheelmeshes_") then current = nil end
 			if not current and name ~= "main.materials.json" then
 				local st = FS:stat(f)
 				bytes = bytes + (st and tonumber(st.filesize) or 0)
