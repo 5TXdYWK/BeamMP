@@ -125,6 +125,8 @@
     "ui.options.beammp.proxyCleanupOnReload.tooltip": "When the Lua extensions are reloaded, remove proxy meshes, engine sound sources and collider vehicles left over from before.",
     "ui.options.beammp.proxySkipStaticUpdates": "Skip updates of parked proxies",
     "ui.options.beammp.proxySkipStaticUpdates.tooltip": "Proxy body and wheel objects that did not move since the last frame are not moved again (saves engine calls for parked cars).",
+    "ui.options.beammp.proxyEngineAutoShift": "Automatic gear shifts",
+    "ui.options.beammp.proxyEngineAutoShift.tooltip": "For proxies driving in an automatic gear (D), the engine sound shifts through the gears with a short shift time and kickdown, instead of jumping to the gear that fits the speed.",
     "ui.options.beammp.proxyGroup.general": "General",
     "ui.options.beammp.proxyGroup.realVehicles": "Real vehicles & spawning",
     "ui.options.beammp.proxyGroup.meshes": "Meshes & detail",

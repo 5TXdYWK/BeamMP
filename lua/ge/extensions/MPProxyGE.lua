@@ -76,6 +76,7 @@ local function readSettings()
 	cfg.queueByDistance = settings.getValue("proxyQueueByDistance", true) ~= false
 	cfg.lodShape = math.max(0, tonumber(settings.getValue("proxyLodShapeDistance", 600)) or 600)
 	cfg.engineSound = settings.getValue("proxyEngineSound", false) == true
+	cfg.autoShift = settings.getValue("proxyEngineAutoShift", true) ~= false
 	cfg.engineSoundDist = math.max(5, tonumber(settings.getValue("proxyEngineSoundDistance", 60)) or 60)
 	cfg.engineSoundMax = math.min(16, math.max(0, math.floor(tonumber(settings.getValue("proxyEngineSoundMax", 6)) or 6)))
 	cfg.maxPredict = math.min(math.max(tonumber(settings.getValue("proxyMaxPrediction", 0.3)) or 0.3, 0.05), 2)
@@ -1064,6 +1065,7 @@ local function soundFor(v)
 	return ev, (snd and snd.diesel) or diesel, snd
 end
 
+local SHIFT_TIME = 0.5 -- s, fake automatic gearbox (proxyEngineAutoShift)
 local function estimateRpm(p, diesel, speed, snd)
 	local idle, redline = diesel and 650 or 850, diesel and 2400 or 6200
 	if snd and snd.idleRPM and snd.maxRPM and snd.maxRPM > snd.idleRPM + 500 then idle, redline = snd.idleRPM, snd.maxRPM end
@@ -1076,12 +1078,40 @@ local function estimateRpm(p, diesel, speed, snd)
 	local n = tonumber(g and string.match(g, "%d+"))
 	local perGear = diesel and 4 or 9 -- m/s per gear at redline in first, grows with the gear
 	if g == "R" then n = 1 end
+	local function rpmIn(gear) return idle + speed / (perGear * math.max(gear, 1)) * (redline - idle) end
+	if not n and cfg.autoShift then
+		-- automatic (D): a remembered gear that shifts up past a throttle dependent rpm, down below a lower one
+		-- (hysteresis), kicks down on full throttle, and blends the rpm over SHIFT_TIME while shifting
+		local cur = p.sndAutoGear or 1
+		local up = idle + (redline - idle) * (0.55 + 0.4 * thr)
+		local down = idle + (redline - idle) * (0.18 + 0.35 * thr)
+		local want = cur
+		if clock >= (p.sndShiftEnd or 0) then
+			if want < 8 and rpmIn(want) > up then want = want + 1
+			elseif want > 1 and rpmIn(want) < down then want = want - 1
+			elseif thr > 0.85 and want > 1 and rpmIn(want - 1) < redline * 0.92 and rpmIn(want) < idle + (redline - idle) * 0.6 then
+				want = want - 1 -- kickdown
+			end
+		end
+		if want ~= cur then
+			p.sndShiftFrom, p.sndShiftStart, p.sndShiftEnd = rpmIn(cur), clock, clock + SHIFT_TIME
+			p.sndAutoGear = want
+		end
+		local rpm = rpmIn(p.sndAutoGear or 1)
+		if p.sndShiftEnd and clock < p.sndShiftEnd then
+			local f = (clock - p.sndShiftStart) / SHIFT_TIME
+			rpm = p.sndShiftFrom + (rpm - p.sndShiftFrom) * f
+			thr = thr * 0.3 -- the engine is off load while the gearbox shifts
+		end
+		return math.min(math.max(rpm, idle), redline), thr
+	end
 	if not n then -- automatic: shift up once past a throttle dependent point
 		local shiftAt = redline * (0.45 + 0.4 * thr)
 		n = 1
 		while n < 8 and idle + speed / (perGear * n) * (redline - idle) > shiftAt do n = n + 1 end
 	end
-	local rpm = idle + speed / (perGear * math.max(n, 1)) * (redline - idle)
+	p.sndAutoGear = math.max(n, 1)
+	local rpm = rpmIn(n)
 	return math.min(math.max(rpm, idle), redline), thr
 end
 
