@@ -5238,6 +5238,60 @@
                 "tooltip",
                 "setting"
               ]
+            },
+            {
+              "version": "0.38",
+              "label": "ui.options.beammp.proxySmoke",
+              "tooltip": "ui.options.beammp.proxySmoke.tooltip",
+              "setting": "proxySmoke",
+              "interactive": true,
+              "condition_always_off": false,
+              "condition_not_shipping": false,
+              "condition_simplemenu": "",
+              "condition_visible": "beammpEnableProxyVehicles",
+              "condition_enabled": "beammpEnableProxyVehicles",
+              "itemType": "checkbox",
+              "component": "OptionsCheckbox",
+              "separateLabel": true,
+              "lua": "",
+              "luaOff": "",
+              "valueOn": true,
+              "valueOff": false,
+              "search": [
+                "label",
+                "caption",
+                "tooltip",
+                "setting"
+              ]
+            },
+            {
+              "version": "0.38",
+              "label": "ui.options.beammp.proxySmokeDistance",
+              "tooltip": "ui.options.beammp.proxySmokeDistance.tooltip",
+              "setting": "proxySmokeDistance",
+              "interactive": true,
+              "condition_always_off": false,
+              "condition_not_shipping": false,
+              "condition_simplemenu": "",
+              "condition_visible": "beammpProxySmoke",
+              "condition_enabled": "beammpProxySmoke",
+              "itemType": "slider",
+              "component": "BngSlider",
+              "separateLabel": true,
+              "min": 20,
+              "max": 200,
+              "step": 10,
+              "compact": false,
+              "valueMultiplier": 1,
+              "unit": "m",
+              "lua": "",
+              "basic_interaction": false,
+              "search": [
+                "label",
+                "caption",
+                "tooltip",
+                "setting"
+              ]
             }
           ]
         },

@@ -81,6 +81,8 @@ local function readSettings()
 	cfg.engineSoundMax = math.min(16, math.max(0, math.floor(tonumber(settings.getValue("proxyEngineSoundMax", 6)) or 6)))
 	cfg.tireScreech = settings.getValue("proxyTireScreech", false) == true
 	cfg.screechDist = math.max(5, tonumber(settings.getValue("proxyTireScreechDistance", 50)) or 50)
+	cfg.smoke = settings.getValue("proxySmoke", false) == true
+	cfg.smokeDist = math.max(5, tonumber(settings.getValue("proxySmokeDistance", 80)) or 80)
 	cfg.tabCycle = settings.getValue("proxyTabCycle", true) ~= false
 	cfg.maxPredict = math.min(math.max(tonumber(settings.getValue("proxyMaxPrediction", 0.3)) or 0.3, 0.05), 2)
 end
@@ -1320,6 +1322,116 @@ function skid.update(dt)
 	end
 end
 
+
+-- ============= TIRE / EXHAUST SMOKE =============
+-- a small pool of ParticleEmitterNode objects (created like editor/createObjectTool.lua buildParticleEmitter does)
+-- moved to the nearest sliding proxies (tire smoke, BNGP_6 = rubber on asphalt in lua/common/particles.json) or
+-- hard accelerating ones (exhaust puff)
+local smoke = { pool = {}, MAX = 4, TIRE = "BNGP_6", EXHAUST = "BNGP_44", counter = 0, pos = vec3(), fwd = vec3(), up = vec3(), warned = {} }
+
+function smoke.kindFor(p)
+	if not p or not p.hasData then return nil end
+	if skid.slip(p) > 0.4 then return "tire" end
+	smoke.fwd:setRotate(p.rrot, vec3(0, -1, 0))
+	local speed = p.svel:length()
+	if speed < 15 and p.acc:dot(smoke.fwd) > 2.5 and proxyEngineRunning(p) then return "exhaust" end
+	return nil
+end
+
+function smoke.emitterFor(kind)
+	local name = kind == "tire" and smoke.TIRE or smoke.EXHAUST
+	local db = scenetree.findObject(name)
+	if not db and not smoke.warned[name] then
+		smoke.warned[name] = true
+		log('W', 'MPProxyGE', "Proxy smoke: particle emitter " .. name .. " not found, " .. kind .. " smoke off")
+	end
+	return db, name
+end
+
+function smoke.release(e)
+	local o = e.id and scenetree.findObjectById(e.id)
+	if o then o:delete() end
+	e.id, e.owner, e.kind = nil, nil, nil
+end
+
+function smoke.stopAll()
+	for _, e in ipairs(smoke.pool) do smoke.release(e) end
+	table.clear(smoke.pool)
+end
+
+function smoke.assign(vehicles)
+	if not cfg.smoke then
+		if #smoke.pool > 0 then smoke.stopAll() end
+		return
+	end
+	local maxD2 = cfg.smokeDist * cfg.smokeDist
+	local wanted = {}
+	for _, v in pairs(vehicles) do
+		if soundEligible(v) then
+			local d2 = refPos:squaredDistance(v.proxy.rpos)
+			local kind = d2 < maxD2 and smoke.kindFor(v.proxy)
+			if kind then wanted[#wanted + 1] = { v = v, d2 = d2, kind = kind } end
+		end
+	end
+	table.sort(wanted, function(a, b) return a.d2 < b.d2 end)
+	for _, e in ipairs(smoke.pool) do e.keep = false end
+	for i = 1, math.min(#wanted, smoke.MAX) do
+		local w = wanted[i]
+		local entry
+		for _, e in ipairs(smoke.pool) do if e.owner == w.v and e.kind == w.kind then entry = e end end
+		if not entry then
+			for _, e in ipairs(smoke.pool) do if not e.keep and (not e.owner or e.owner ~= w.v) then entry = e break end end
+			if not entry and #smoke.pool < smoke.MAX then entry = {} smoke.pool[#smoke.pool + 1] = entry end
+			if entry and entry.kind ~= w.kind then
+				smoke.release(entry)
+				local db, name = smoke.emitterFor(w.kind)
+				if db then
+					local o = createObject("ParticleEmitterNode")
+					if o then
+						o:setField("dataBlock", 0, "lightExampleEmitterNodeData1")
+						o:setField("emitter", 0, name)
+						o.canSave = false
+						smoke.counter = smoke.counter + 1
+						o:registerObject("beammpProxySmoke_" .. smoke.counter)
+						if o.setEmitterDataBlock then o:setEmitterDataBlock(db) end
+						entry.id, entry.kind = o:getId(), w.kind
+					end
+				end
+			end
+			if entry then entry.owner = w.v end
+		end
+		if entry then entry.keep = true end
+	end
+	for _, e in ipairs(smoke.pool) do
+		if not e.keep and e.owner then
+			e.owner = nil
+			local o = e.id and scenetree.findObjectById(e.id)
+			if o then o:setField("active", 0, "0") end
+		end
+	end
+end
+
+function smoke.update()
+	for _, e in ipairs(smoke.pool) do
+		local v = e.owner
+		local o = v and e.id and scenetree.findObjectById(e.id)
+		if o then
+			local p = v.proxy
+			local on = soundEligible(v) and smoke.kindFor(p) == e.kind
+			o:setField("active", 0, on and "1" or "0")
+			if on then
+				smoke.fwd:setRotate(p.rrot, vec3(0, -1, 0))
+				smoke.up:setRotate(p.rrot, vec3(0, 0, 1))
+				local back = (p.L or 4) * (e.kind == "tire" and 0.3 or 0.5)
+				local down = e.kind == "tire" and (p.cogH or 0.5) or math.max(0, (p.cogH or 0.5) - 0.3)
+				smoke.pos:set(p.rpos.x - smoke.fwd.x * back - smoke.up.x * down, p.rpos.y - smoke.fwd.y * back - smoke.up.y * down,
+					p.rpos.z - smoke.fwd.z * back - smoke.up.z * down)
+				o:setPosition(smoke.pos)
+			end
+		end
+	end
+end
+
 -- ============= SWAP MANAGER =============
 local function isEligibleForReal(v)
 	return v.isProxy and not v.isSpawned and not v.isDeleted and not v.isIllegal and not v.spawnQueue
@@ -1470,6 +1582,7 @@ local function update(dt, cameraPos, activeVehID)
 	stats.mesh, stats.box, stats.prism, stats.hidden = nMesh, nBox, nPrism, nHidden
 	updateSounds(dt)
 	skid.update(dt)
+	if #smoke.pool > 0 then smoke.update() end
 
 	updateHandovers(vehicles)
 	hybridContacts(vehicles)
@@ -1485,6 +1598,7 @@ local function update(dt, cameraPos, activeVehID)
 		updateColliders(vehicles)
 		assignSounds(vehicles)
 		skid.assign(vehicles)
+		smoke.assign(vehicles)
 		if MPProxyMeshGE then
 			MPProxyMeshGE.decide(vehicles, refPos)
 			for _, v in pairs(vehicles) do -- use the real mesh bounds for the box fallback once known
@@ -1713,6 +1827,7 @@ local function reset()
 	removeAllColliders()
 	stopAllSounds()
 	skid.stopAll()
+	smoke.stopAll()
 	if MPProxyMeshGE then MPProxyMeshGE.reset() end
 	nextSpawnAllowed, nextDespawnAllowed, nextColliderSpawnAllowed = 0, 0, 0
 end
@@ -1734,13 +1849,19 @@ local function removeLeftovers()
 			if src then pcall(src.stop, src, -1) src:delete() sounds = sounds + 1 end
 		end
 	end
+	for _, name in ipairs(scenetree.findClassObjects("ParticleEmitterNode") or {}) do
+		if string.find(name, "^beammpProxySmoke_") then
+			local o = scenetree.findObject(name)
+			if o then o:delete() sounds = sounds + 1 end
+		end
+	end
 	for _, name in ipairs(scenetree.findClassObjects("BeamNGVehicle") or {}) do
 		if string.find(name, "^beammpProxyCollider") then
 			local veh = scenetree.findObject(name)
 			if veh then veh:delete() cars = cars + 1 end
 		end
 	end
-	if sounds + cars > 0 then log('I', 'MPProxyGE', string.format("Removed leftovers of an earlier load: %d sound sources, %d collider vehicles", sounds, cars)) end
+	if sounds + cars > 0 then log('I', 'MPProxyGE', string.format("Removed leftovers of an earlier load: %d sound sources / smoke emitters, %d collider vehicles", sounds, cars)) end
 end
 
 local function onExtensionLoaded()
@@ -1780,7 +1901,7 @@ M.flushReplay         = flushReplay
 M.onVehicleResetWhileHeld = onVehicleResetWhileHeld
 M.finishHandover      = finishHandover
 M.onExtensionLoaded   = onExtensionLoaded
-M.onExtensionUnloaded = function() stopAllSounds() skid.stopAll() pcall(removeTabHook) end
+M.onExtensionUnloaded = function() stopAllSounds() skid.stopAll() smoke.stopAll() pcall(removeTabHook) end
 M.isTabFocused        = function() return tab.v ~= nil end
 M.getSoundPool        = function() return soundPool end
 M.onInit = function() setExtensionUnloadMode(M, "manual") end

@@ -298,6 +298,9 @@ export default function (deps) {
     beammpProxyTireScreech(values) {
         return values.enableProxyVehicles!==false && values.proxyTireScreech===true
     },
+    beammpProxySmoke(values) {
+        return values.enableProxyVehicles!==false && values.proxySmoke===true
+    },
     beammpProxyAutoReal(values) {
         return values.enableProxyVehicles!==false && values.proxyAutoReal===true
     },
