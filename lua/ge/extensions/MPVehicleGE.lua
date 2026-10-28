@@ -2249,6 +2249,9 @@ local function onServerVehicleEdited(serverID, data)
 	local saveVehicleRot = players_vehicle_configs[serverID].rot
 	local saveVehiclePos = players_vehicle_configs[serverID].pos
 
+	-- a paused (hybrid mode) vehicle has to run to be respawned with the new config
+	if MPProxyGE and MPProxyGE.isHybridPaused(vehicles[serverID]) then MPProxyGE.hybridWake(vehicles[serverID], "edit") end
+
 	players_vehicle_configs[serverID] = decodedData
 	players_vehicle_configs[serverID].pos = saveVehiclePos
 	players_vehicle_configs[serverID].rot = saveVehicleRot
@@ -2335,6 +2338,11 @@ local function onServerVehicleResetted(serverVehicleID, data)
 		if MPProxyGE then MPProxyGE.onVehicleResetWhileHeld(resetVehicle) end
 		lastResetTime[serverVehicleID] = localCounter
 		return
+	end
+	if resetVehicle and MPProxyGE and MPProxyGE.isHybridPaused(resetVehicle) then -- paused: the proxy shows the reset pose
+		local pr = jsonDecode(data)
+		if pr then MPProxyGE.snapProxy(resetVehicle, pr.pos, pr.rot) end
+		MPProxyGE.onVehicleResetWhileHeld(resetVehicle)
 	end
 	if localCounter - (lastResetTime[serverVehicleID] or 0) > 0.2 then
 		if gameVehicleID then
@@ -2898,7 +2906,7 @@ local function onPreRender(dt)
 				dir:set(veh:getDirectionVectorXYZ())
 				dirUp:set(veh:getDirectionVectorUpXYZ())
 				v.rotation:setFromDir(dir,dirUp)
-			elseif v.isProxy and v.proxy then -- proxy (mesh, box, prism or person), use the drawn position and height
+			elseif (v.isProxy or v.hybridPaused) and v.proxy then -- proxy (mesh, box, prism or person), use the drawn position and height
 				local p = v.proxy
 				if not p.hasData then goto skip_vehicle end -- nothing drawn yet, the position would be the map origin
 				v.position:set(p.rpos)

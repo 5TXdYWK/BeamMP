@@ -108,7 +108,7 @@ local function applyPos(data, serverVehicleID)
 
 	vehicle.posPackets = (vehicle.posPackets or 0) + 1 -- counted for the fps, as not every packet is decoded
 	vehicle.proxyPktCount = (vehicle.proxyPktCount or 0) + 1 -- MPProxyGE handover waits for a fresh packet
-	local inHandover = vehicle.proxyHandover ~= nil
+	local inHandover = vehicle.proxyHandover ~= nil or vehicle.hybridPaused == true -- the proxy is what is drawn
 
 	local owner = vehicle:getOwner()
 	if owner and not owner.hasUpdatedPing or not veh or inHandover then -- only update twice a second per player unless the vehicle is not spawned, spawned vehicles already gets their position and rotation in MPvehicleGE

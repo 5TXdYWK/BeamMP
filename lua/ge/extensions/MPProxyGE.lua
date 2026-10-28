@@ -30,6 +30,10 @@ local cfg = {
 	colliderModel = "simple_traffic",
 	smoothHandover = true,
 	replayState = true,
+	hybrid = false,
+	hybridMaxPlayers = 16,
+	hybridWakeDist = 80,
+	hybridMaxAwake = 6,
 	maxPredict = 0.3,
 	farShape = true,
 }
@@ -60,6 +64,10 @@ local function readSettings()
 	cfg.colliderModel = settings.getValue("proxyColliderModel", "simple_traffic") or "simple_traffic"
 	cfg.smoothHandover = settings.getValue("proxySmoothHandover", true) ~= false
 	cfg.replayState = settings.getValue("proxyReplayState", true) ~= false
+	cfg.hybrid = settings.getValue("proxyHybridMode", false) == true
+	cfg.hybridMaxPlayers = math.max(1, math.floor(tonumber(settings.getValue("proxyHybridMaxPlayers", 16)) or 16))
+	cfg.hybridWakeDist = math.max(10, tonumber(settings.getValue("proxyHybridWakeDistance", 80)) or 80)
+	cfg.hybridMaxAwake = math.max(0, math.floor(tonumber(settings.getValue("proxyHybridMaxAwake", 6)) or 6))
 	cfg.farShape = settings.getValue("proxyFarShape", true) ~= false
 	cfg.maxPredict = math.min(math.max(tonumber(settings.getValue("proxyMaxPrediction", 0.3)) or 0.3, 0.05), 2)
 end
@@ -139,6 +147,7 @@ local refPos = vec3()       -- distance reference (camera or local vehicle)
 local localVehPos = vec3()
 local hasLocalVeh = false
 
+local hybridActive = false  -- proxyHybridMode in effect (set by updateHybrid)
 local colliders = {}        -- [gameVehicleID] = { serverVehicleID = string|nil, ready = bool }
 local colliderCount = 0
 local nextColliderSpawnAllowed = 0
@@ -777,6 +786,158 @@ local function flushReplay(vehicle)
 end
 flushReplayLater = flushReplay
 
+-- ============= HYBRID MODE (proxyHybridMode) =============
+-- On servers with few players, remote vehicles are spawned for real (rate limited) but the ones that are not
+-- near get paused with setActive(0) and drawn as their proxy, following the position packets. The game object
+-- stays, so be:getObjectByID keeps working for mods (CaRP and others) and switching to a vehicle is instant.
+-- A paused vehicle wakes when it comes near (nearest first, up to proxyHybridMaxAwake) or when a simulated
+-- vehicle of ours runs into its box, and goes back to sleep after the contact settled.
+-- Packets for its VE side are kept while paused (STATE REPLAY) and replayed on wake. Commands other mods queue
+-- to a paused vehicle are dropped by the game, there is no way to buffer those from here.
+local HYBRID_CONTACT_RANGE = 40   -- m, paused vehicles closer than this to one of ours are contact checked per frame
+local HYBRID_WAKE_MARGIN = 0.25   -- m, the box is grown by this, so it wakes just before touching
+local HYBRID_MIN_WAKE_SPEED = 0.2 -- m/s relative speed for a contact to count
+local HYBRID_SETTLE_TIME = 1.0    -- s without contact before a contact-woken vehicle may sleep again
+local HYBRID_MAX_HOLD = 20        -- s a contact keeps a vehicle awake at most
+local HYBRID_DIST_MARGIN = 20     -- m of hysteresis on the wake distance
+
+local hybC, hybX, hybY, hybZ = vec3(), vec3(), vec3(), vec3()
+local othC, othX, othY, othZ, othVel = vec3(), vec3(), vec3(), vec3(), vec3()
+local ownIDs = {}
+
+local function countPlayers()
+	local n = 0
+	for _ in pairs(MPVehicleGE.getPlayers and MPVehicleGE.getPlayers() or {}) do n = n + 1 end
+	return n
+end
+
+local function hybridPause(v, veh)
+	seedFromVehicle(v, veh)
+	v.hybridPaused = true
+	v.hybridHoldUntil = nil
+	veh:setActive(0)
+	log('D', 'MPProxyGE', "Hybrid: paused "..tostring(v.serverVehicleString))
+end
+
+local function hybridWake(v, reason)
+	if not v.hybridPaused then return end
+	local veh = v.gameVehicleID and v.gameVehicleID > 0 and getObjectByID(v.gameVehicleID) or nil
+	v.hybridPaused = nil
+	if not veh then return end
+	veh:setActive(1)
+	local p = v.proxy
+	if p and p.hasData then pcall(placeOnProxy, veh, p) end
+	veh:queueLuaCommand("if positionVE then positionVE.onReset() end")
+	veh:setMeshAlpha(0, "", false)
+	-- shown once a fresh packet came in, the proxy is drawn until then (handover machinery)
+	v.proxyHandover = { state = "syncing", started = clock, readyAt = clock, packets = v.proxyPktCount or 0 }
+	flushReplay(v)
+	log('D', 'MPProxyGE', "Hybrid: woke "..tostring(v.serverVehicleString).." ("..tostring(reason)..")")
+end
+
+-- per frame: paused vehicles near one of ours, woken when one of our simulated vehicles runs into their box
+local function hybridContacts(vehicles)
+	if not hybridActive then return end
+	table.clear(ownIDs)
+	for id in pairs(MPVehicleGE.getOwnMap and MPVehicleGE.getOwnMap() or {}) do ownIDs[#ownIDs + 1] = tonumber(id) or id end
+	if #ownIDs == 0 then return end
+	local range2 = HYBRID_CONTACT_RANGE * HYBRID_CONTACT_RANGE
+	for _, v in pairs(vehicles) do
+		local p = v.proxy
+		if v.hybridPaused and p and p.hasData then
+			for _, id in ipairs(ownIDs) do
+				local own = getObjectByID(id)
+				if own and be:getObjectActive(id) then
+					othC:set(be:getObjectOOBBCenterXYZ(id))
+					if othC:squaredDistance(p.rpos) < range2 then
+						axX:setRotate(p.rrot, unitX) axY:setRotate(p.rrot, unitY) axZ:setRotate(p.rrot, unitZ)
+						hybC:set(axZ) hybC:setScaled(p.H * 0.5 - p.cogH) hybC:setAdd(p.rpos)
+						hybX:set(axX) hybX:setScaled(p.W * 0.5 + HYBRID_WAKE_MARGIN)
+						hybY:set(axY) hybY:setScaled(p.L * 0.5 + HYBRID_WAKE_MARGIN)
+						hybZ:set(axZ) hybZ:setScaled(p.H * 0.5 + HYBRID_WAKE_MARGIN)
+						othX:set(be:getObjectOOBBHalfAxisXYZ(id, 0))
+						othY:set(be:getObjectOOBBHalfAxisXYZ(id, 1))
+						othZ:set(be:getObjectOOBBHalfAxisXYZ(id, 2))
+						othVel:set(own:getVelocityXYZ())
+						othVel:setSub(p.svel)
+						if othVel:length() > HYBRID_MIN_WAKE_SPEED and overlapsOBB_OBB(hybC, hybX, hybY, hybZ, othC, othX, othY, othZ) then
+							hybridWake(v, "contact")
+							v.hybridContactAt = clock
+							v.hybridHoldUntil = clock + HYBRID_MAX_HOLD
+							break
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+-- true while one of our vehicles is still touching (and moving against) this awake vehicle
+local function hybridStillInContact(v, veh)
+	local gid = v.gameVehicleID
+	othC:set(be:getObjectOOBBCenterXYZ(gid))
+	hybX:set(be:getObjectOOBBHalfAxisXYZ(gid, 0)) hybY:set(be:getObjectOOBBHalfAxisXYZ(gid, 1)) hybZ:set(be:getObjectOOBBHalfAxisXYZ(gid, 2))
+	for _, id in ipairs(ownIDs) do
+		if be:getObjectActive(id) then
+			hybC:set(be:getObjectOOBBCenterXYZ(id))
+			othX:set(be:getObjectOOBBHalfAxisXYZ(id, 0)) othY:set(be:getObjectOOBBHalfAxisXYZ(id, 1)) othZ:set(be:getObjectOOBBHalfAxisXYZ(id, 2))
+			local own = getObjectByID(id)
+			othVel:set(own:getVelocityXYZ())
+			tmpV:set(veh:getVelocityXYZ())
+			othVel:setSub(tmpV)
+			if othVel:length() > 1 and overlapsOBB_OBB(othC, hybX, hybY, hybZ, hybC, othX, othY, othZ) then return true end
+		end
+	end
+	return false
+end
+
+-- decision pass: which real remote vehicles are awake, at most one pause and one wake per pass
+local hybridList = {}
+local function updateHybrid(vehicles, activeVehID)
+	local wasActive = hybridActive
+	hybridActive = cfg.enabled and cfg.hybrid and countPlayers() <= cfg.hybridMaxPlayers
+	if wasActive ~= hybridActive then log('I', 'MPProxyGE', "Hybrid mode "..(hybridActive and "on" or "off")) end
+	table.clear(hybridList)
+	for _, v in pairs(vehicles) do
+		if not v.isLocal and v.isSpawned and v.gameVehicleID and v.gameVehicleID > 0 and not v.proxyHandover then
+			hybridList[#hybridList + 1] = v
+			v.hybridDist = refPos:distance(v.hybridPaused and v.proxy and v.proxy.rpos or v.position)
+		end
+	end
+	if not hybridActive then -- wake whatever is still paused, one per pass
+		for _, v in ipairs(hybridList) do if v.hybridPaused then hybridWake(v, "hybrid mode off") return end end
+		return
+	end
+	table.sort(hybridList, function(a, b) return a.hybridDist < b.hybridDist end)
+	local woke, paused, rank = false, false, 0
+	for _, v in ipairs(hybridList) do
+		local veh = getObjectByID(v.gameVehicleID)
+		if veh then
+			local inContact = v.hybridHoldUntil and clock < v.hybridHoldUntil
+			if inContact and not v.hybridPaused then
+				if hybridStillInContact(v, veh) then v.hybridContactAt = clock
+				elseif clock - (v.hybridContactAt or 0) > HYBRID_SETTLE_TIME then inContact = false v.hybridHoldUntil = nil end
+			end
+			local near = v.hybridDist < cfg.hybridWakeDist + (v.hybridPaused and 0 or HYBRID_DIST_MARGIN)
+			if near then rank = rank + 1 end
+			local wantAwake = v.gameVehicleID == activeVehID or inContact or v.proxyForceReal
+				or (near and rank <= cfg.hybridMaxAwake)
+			if wantAwake and v.hybridPaused and not woke then
+				hybridWake(v, v.gameVehicleID == activeVehID and "camera" or "near")
+				woke = true
+			elseif not wantAwake and not v.hybridPaused and not paused and v.proxy then
+				hybridPause(v, veh)
+				paused = true
+			end
+		end
+	end
+end
+
+local function isHybridPaused(vehicle)
+	return vehicle ~= nil and vehicle.hybridPaused == true
+end
+
 -- ============= SWAP MANAGER =============
 local function isEligibleForReal(v)
 	return v.isProxy and not v.isSpawned and not v.isDeleted and not v.isIllegal and not v.spawnQueue
@@ -802,8 +963,8 @@ local function decide(vehicles, activeVehID)
 				realCount = realCount + 1
 				local isActive = isReal and v.gameVehicleID == activeVehID
 				if cooled and not isActive and not v.proxyForceReal then
-					if not cfg.enabled then
-						-- proxy mode off: nothing gets demoted
+					if not cfg.enabled or hybridActive or v.hybridPaused then
+						-- proxy mode off / hybrid mode (far vehicles are paused instead): nothing gets demoted
 					elseif d > despawn2 and d > despawnCandD then -- demotion stays on, it never spawns anything
 						despawnCand, despawnCandD = v, d
 					end
@@ -811,7 +972,7 @@ local function decide(vehicles, activeVehID)
 				end
 			elseif isEligibleForReal(v) and cooled then
 				-- only explicit requests (spectate / requestRealVehicle) unless distance based real spawns are enabled
-				local wanted = (not cfg.enabled) or v.proxyForceReal or (cfg.autoReal and d < cfg.spawnDist)
+				local wanted = (not cfg.enabled) or hybridActive or v.proxyForceReal or (cfg.autoReal and d < cfg.spawnDist)
 				local dd = v.proxyForceReal and -1 or d
 				if wanted and dd < nearestCandD then nearestCand, nearestCandD = v, dd end
 			end
@@ -828,7 +989,7 @@ local function decide(vehicles, activeVehID)
 	end
 
 	if not nearestCand then return end
-	local limit = cfg.enabled and cfg.maxReal or math.huge
+	local limit = (cfg.enabled and not hybridActive) and cfg.maxReal or math.huge -- paused vehicles cost no physics
 
 	-- real -> proxy: make room for a much closer proxy (cap reached)
 	if realCount >= limit and cfg.enabled and cfg.autoReal and farthestReal and farthestReal ~= despawnCand
@@ -891,7 +1052,7 @@ local function update(dt, cameraPos, activeVehID)
 
 	for _, v in pairs(vehicles) do
 		local p = v.proxy
-		if ((v.isProxy and not v.isSpawned) or v.proxyHandover) and not v.isLocal and p and p.hasData then
+		if ((v.isProxy and not v.isSpawned) or v.proxyHandover or v.hybridPaused) and not v.isLocal and p and p.hasData then
 			if v.proxyHandover then
 				-- the vehicle table position belongs to the real vehicle now, only move the proxy itself
 				tmpPosSave:set(v.position) tmpRotSave:set(v.rotation)
@@ -923,12 +1084,14 @@ local function update(dt, cameraPos, activeVehID)
 	stats.mesh, stats.box, stats.prism, stats.hidden = nMesh, nBox, nPrism, nHidden
 
 	updateHandovers(vehicles)
+	hybridContacts(vehicles)
 
 	decisionTimer = decisionTimer - dt
 	local decideStart = perfTimer and perfTimer:stop() or 0
 	local didDecide = decisionTimer <= 0
 	if didDecide then
 		decisionTimer = DECISION_INTERVAL
+		updateHybrid(vehicles, activeVehID)
 		decide(vehicles, activeVehID)
 		updateColliders(vehicles)
 		if MPProxyMeshGE then
@@ -965,7 +1128,9 @@ local function getStats(resetWindow)
 		avgDecideMs = stats.decides > 0 and stats.decideMs / stats.decides or 0 }
 	for _, v in pairs(MPVehicleGE.getVehicles()) do
 		if not v.isLocal then
-			if v.isSpawned then out.real = out.real + 1
+			if v.isSpawned then
+				out.real = out.real + 1
+				if v.hybridPaused then out.paused = (out.paused or 0) + 1 end
 			elseif v.isProxy then
 				out.proxies = out.proxies + 1
 				if v.proxyForceReal then out.realQueued = out.realQueued + 1 end
@@ -983,6 +1148,10 @@ M.getStats = getStats
 
 --- Asks the manager to swap a proxy for a real vehicle as soon as possible (ignores distance, cap and interval).
 local function requestReal(vehicle)
+	if vehicle and vehicle.hybridPaused then
+		hybridWake(vehicle, "requested")
+		return true
+	end
 	if vehicle and vehicle.isProxy and not vehicle.isSpawned then
 		vehicle.proxyForceReal = true
 		decisionTimer = 0
@@ -1042,6 +1211,9 @@ M.onRealVehicleReady  = onRealVehicleReady
 M.isInHandover        = isInHandover
 M.setOwnPing          = setOwnPing
 M.captureState        = captureState
+M.isHybridPaused      = isHybridPaused
+M.hybridWake          = function(vehicle, reason) if vehicle then hybridWake(vehicle, reason or "request") end end
+M.isHybridActive      = function() return hybridActive end
 M.flushReplay         = flushReplay
 M.onVehicleResetWhileHeld = onVehicleResetWhileHeld
 M.finishHandover      = finishHandover

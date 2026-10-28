@@ -283,6 +283,9 @@ export default function (deps) {
     beammpProxyCollision(values) {
         return values.enableProxyVehicles!==false && values.proxyCollision===true
     },
+    beammpProxyHybrid(values) {
+        return values.enableProxyVehicles!==false && values.proxyHybridMode===true
+    },
     beammpEnableBlobs(values) {
         return values.enableBlobs===true
     },

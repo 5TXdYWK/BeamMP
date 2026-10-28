@@ -707,7 +707,7 @@ local function decide(vehicles, refPos)
 	for _, v in pairs(vehicles) do
 		local p = v.proxy
 		if p then
-			local usable = cfg.enabled and ((v.isProxy and not v.isSpawned) or v.proxyHandover ~= nil) and not v.isDeleted and not v.proxyColliderID and p.hasData
+			local usable = cfg.enabled and ((v.isProxy and not v.isSpawned) or v.proxyHandover ~= nil or v.hybridPaused) and not v.isDeleted and not v.proxyColliderID and p.hasData
 			local d = usable and refPos:distance(p.rpos) or math.huge
 			if p.meshObjects and not usable then detach(p) -- gone, real or collider: right away
 			elseif p.meshObjects and d > release and not v.isFakeTest then leaving[#leaving + 1] = { p = p, d = d } end
