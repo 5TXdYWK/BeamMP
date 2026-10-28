@@ -53,6 +53,7 @@ local function readSettings()
 	cfg.maxProxies = math.max(0, math.floor(tonumber(settings.getValue("proxyMaxMeshProxies", 48)) or 48))
 	cfg.wheels = settings.getValue("proxyMeshWheels", true) ~= false
 	cfg.realWheels = settings.getValue("proxyMeshRealWheels", true) ~= false
+	cfg.metallicPaint = settings.getValue("proxyMetallicPaint", true) ~= false
 	cfg.suspension = settings.getValue("proxySuspension", false) == true
 	cfg.suspDist = math.max(0, tonumber(settings.getValue("proxySuspensionDistance", 40)) or 40)
 	cfg.realWheelsMax = math.max(0, math.floor(tonumber(settings.getValue("proxyMeshRealWheelsMax", 12)) or 12))
@@ -1696,6 +1697,13 @@ local function paintString(paint)
 	return string.format("%.3f %.3f %.3f %.3f", c[1] or 0.6, c[2] or 0.6, c[3] or 0.6, c[4] or 1)
 end
 
+-- "metallic roughness clearcoat clearcoatRoughness" of one vcf paint
+local function metallicString(paint)
+	if type(paint) ~= "table" then return "0 0.5 0 0" end
+	return string.format("%.3f %.3f %.3f %.3f", tonumber(paint.metallic) or 0, tonumber(paint.roughness) or 0.5,
+		tonumber(paint.clearcoat) or 0, tonumber(paint.clearcoatRoughness) or 0)
+end
+
 local function attach(p, shape, tier)
 	p.meshObjects = {}
 	p.meshTier = tier
@@ -1718,6 +1726,9 @@ local function attach(p, shape, tier)
 				obj:setField('instanceColor', 0, paintString(paints[1]))
 				obj:setField('instanceColor1', 0, paintString(paints[2] or paints[1]))
 				obj:setField('instanceColor2', 0, paintString(paints[3] or paints[1]))
+				if cfg.metallicPaint then -- same field and format the game sets on vehicles (core/vehicle/partmgmt.lua)
+					for i = 1, 3 do obj:setField('metallicPaintData', i - 1, metallicString(paints[i] or paints[1])) end
+				end
 				obj.hidden = false
 				p.meshObjects[#p.meshObjects + 1] = { path = path, id = id, obj = obj }
 			end
