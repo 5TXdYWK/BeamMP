@@ -30,6 +30,7 @@ local cfg = {
 	colliderModel = "simple_traffic",
 	smoothHandover = true,
 	maxPredict = 0.3,
+	farShape = true,
 }
 
 local DESPAWN_INTERVAL = 0.5   -- seconds between two real -> proxy swaps (despawns are cheap, but not free)
@@ -57,6 +58,7 @@ local function readSettings()
 	cfg.poolSize = math.max(0, math.floor(tonumber(settings.getValue("proxyColliderPoolSize", 4)) or 4))
 	cfg.colliderModel = settings.getValue("proxyColliderModel", "simple_traffic") or "simple_traffic"
 	cfg.smoothHandover = settings.getValue("proxySmoothHandover", true) ~= false
+	cfg.farShape = settings.getValue("proxyFarShape", true) ~= false
 	cfg.maxPredict = math.min(math.max(tonumber(settings.getValue("proxyMaxPrediction", 0.3)) or 0.3, 0.05), 2)
 end
 
@@ -350,6 +352,69 @@ end
 local drawSphere = ffiFound and ffi.C.BNG_DBG_DRAW_Sphere or nop
 local drawCylinder = ffiFound and ffi.C.BNG_DBG_DRAW_Cylinder or nop
 
+-- ============= LOW POLY CAR SHAPE =============
+-- Instead of a plain box, proxies without a mesh get a lofted outline of a vehicle: a few cross sections along
+-- the length (front to back), each with a bottom, top and half width as fractions of the proxy size. Only the
+-- faces looking at the camera are drawn. {t along the length from the front, bottom, top, width}
+local LOFT_CAR = {
+	{0.00, 0.20, 0.45, 0.88}, {0.10, 0.14, 0.58, 0.97}, {0.32, 0.14, 0.64, 1.00}, {0.46, 0.14, 0.98, 0.86},
+	{0.76, 0.14, 0.96, 0.86}, {0.90, 0.14, 0.68, 0.98}, {1.00, 0.20, 0.58, 0.90},
+}
+local LOFT_TALL = { -- trucks, vans, buses: cab almost at the front, boxy body
+	{0.00, 0.18, 0.55, 0.95}, {0.06, 0.14, 0.92, 1.00}, {0.14, 0.14, 1.00, 1.00}, {1.00, 0.14, 1.00, 1.00},
+}
+local loftL, loftR = {}, {} -- per section: bottom and top points, left and right
+for i = 1, 8 do loftL[i] = { vec3(), vec3() } loftR[i] = { vec3(), vec3() } end
+local loftN = vec3()
+
+-- draws triangle a b c if its front side (counter clockwise) looks at the camera, shaded by its normal
+local function loftTri(p, a, b, c, camPos, alpha)
+	tmpV:set(b) tmpV:setSub(a)
+	loftN:set(c) loftN:setSub(a)
+	loftN:set(tmpV.y*loftN.z - tmpV.z*loftN.y, tmpV.z*loftN.x - tmpV.x*loftN.z, tmpV.x*loftN.y - tmpV.y*loftN.x)
+	-- orient the normal away from the proxy center, skip faces turned away from the camera
+	if loftN.x*(a.x - center.x) + loftN.y*(a.y - center.y) + loftN.z*(a.z - center.z) < 0 then loftN:setScaled(-1) end
+	local dx, dy, dz = camPos.x - a.x, camPos.y - a.y, camPos.z - a.z
+	local facing = loftN.x*dx + loftN.y*dy + loftN.z*dz
+	if facing <= 0 then return end
+	local len = loftN:length()
+	if len < 1e-6 then return end
+	local up = loftN.z / len -- -1 .. 1
+	local f = 0.55 + 0.45 * math.max(up, 0) + 0.15 * math.min(up, 0)
+	local col = shade(p, f, alpha)
+	-- the debug drawer triangles are single sided and the winding of our list is not consistent: draw both
+	drawTriSolid(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z, col, true)
+	drawTriSolid(a.x, a.y, a.z, c.x, c.y, c.z, b.x, b.y, b.z, col, true)
+end
+
+local function drawLoft(p, camPos)
+	local profile = (p.H > 2.1 or p.L > 6.5) and LOFT_TALL or LOFT_CAR
+	local hl, hw = p.L * 0.5, p.W * 0.5
+	local bottomZ = -p.cogH -- packet position is the cog, the ground is cogH below
+	local n = #profile
+	for i = 1, n do
+		local s = profile[i]
+		local ly = -hl + s[1] * p.L -- -Y of the packet rotation is the driving direction
+		local zb, zt, w = bottomZ + s[2] * p.H, bottomZ + s[3] * p.H, s[4] * hw
+		local l, r = loftL[i], loftR[i]
+		for k = 1, 2 do
+			local z = k == 1 and zb or zt
+			l[k]:set(p.rpos.x + axX.x*(-w) + axY.x*ly + axZ.x*z, p.rpos.y + axX.y*(-w) + axY.y*ly + axZ.y*z, p.rpos.z + axX.z*(-w) + axY.z*ly + axZ.z*z)
+			r[k]:set(p.rpos.x + axX.x*w + axY.x*ly + axZ.x*z, p.rpos.y + axX.y*w + axY.y*ly + axZ.y*z, p.rpos.z + axX.z*w + axY.z*ly + axZ.z*z)
+		end
+	end
+	for i = 1, n - 1 do
+		local l1, r1, l2, r2 = loftL[i], loftR[i], loftL[i + 1], loftR[i + 1]
+		loftTri(p, l1[2], r1[2], r2[2], camPos, 235) loftTri(p, l1[2], r2[2], l2[2], camPos, 235) -- top
+		loftTri(p, l1[1], l1[2], l2[2], camPos, 235) loftTri(p, l1[1], l2[2], l2[1], camPos, 235) -- left side
+		loftTri(p, r1[1], r2[2], r1[2], camPos, 235) loftTri(p, r1[1], r2[1], r2[2], camPos, 235) -- right side
+	end
+	local f, b = loftL[1], loftR[1]
+	loftTri(p, f[1], b[2], f[2], camPos, 235) loftTri(p, f[1], b[1], b[2], camPos, 235) -- front cap
+	f, b = loftL[n], loftR[n]
+	loftTri(p, f[1], f[2], b[2], camPos, 235) loftTri(p, f[1], b[2], b[1], camPos, 235) -- rear cap
+end
+
 local function drawProxy(p, camPos, dist)
 	if p.isPerson then -- walking player: body cylinder + head, about 1.8 m tall
 		local x, y, z = p.rpos.x, p.rpos.y, p.rpos.z - p.cogH
@@ -376,6 +441,8 @@ local function drawProxy(p, camPos, dist)
 		drawSquarePrism(x1, y1, z1, x2, y2, z2, p.W, p.H, p.W, p.H, shade(p, 1, 230), true)
 		return
 	end
+
+	if cfg.farShape then drawLoft(p, camPos) return end
 
 	-- corners: index bits (x, y, z) -> sign
 	for i = 1, 8 do

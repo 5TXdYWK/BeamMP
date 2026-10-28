@@ -30,16 +30,51 @@ local PRELOAD_BUDGET_MS = 40      -- while the join loading screen hides the stu
 local frameBudget = FRAME_BUDGET_MS
 local MAX_MESHES = 60             -- per config
 local MAX_NEW_OBJECTS_PER_PASS = 4
+local MAX_DETACHES_PER_PASS = 6   -- mesh -> box changes per pass, farthest first, so a group leaving range spreads out
 local NEW_SHAPE_INTERVAL = 2      -- seconds between first uses of not yet loaded shapes (engine import hitch)
 local RELEASE_MARGIN = 50
 
-local cfg = { enabled = true, distance = 500, maxProxies = 48, wheels = true }
+local cfg = { enabled = true, distance = 500, maxProxies = 48, wheels = true, targetFps = 0 }
 
 local function readSettings()
 	cfg.enabled = settings.getValue("proxyMeshEnabled", true) ~= false
 	cfg.distance = tonumber(settings.getValue("proxyMeshDistance", 500)) or 500
 	cfg.maxProxies = math.max(0, math.floor(tonumber(settings.getValue("proxyMaxMeshProxies", 48)) or 48))
 	cfg.wheels = settings.getValue("proxyMeshWheels", true) ~= false
+	cfg.targetFps = math.max(0, tonumber(settings.getValue("proxyTargetFps", 0)) or 0)
+end
+
+-- ============= FRAME RATE TARGET =============
+-- With proxyTargetFps set, the number of proxies drawn with meshes is lowered while the frame rate is under the
+-- target and raised again when there is headroom. If several reductions in a row did not make frames faster,
+-- the meshes are not what limits the frame rate: the old count comes back and we wait before trying again.
+local FPS_WINDOW = 0.5
+local fps = { sum = 0, frames = 0, cap = math.huge, reductions = 0, baseMs = 0, restore = math.huge, holdUntil = 0, inRange = 0 }
+
+local function updateFpsCap(dtReal, now)
+	if cfg.targetFps <= 0 then fps.cap = math.huge return end
+	fps.sum, fps.frames = fps.sum + dtReal, fps.frames + 1
+	if fps.sum < FPS_WINDOW then return end
+	local ms = fps.sum / fps.frames * 1000
+	fps.sum, fps.frames = 0, 0
+	local target = 1000 / cfg.targetFps
+	local current = math.min(fps.cap, fps.inRange)
+	if ms > target * 1.05 then
+		if now < fps.holdUntil or current <= 4 then fps.reductions = 0 return end
+		if fps.reductions == 0 then fps.restore, fps.baseMs = fps.cap, ms end
+		fps.reductions = fps.reductions + 1
+		if fps.reductions > 3 and ms > fps.baseMs * 0.97 then -- did not help
+			fps.cap, fps.holdUntil, fps.reductions = fps.restore, now + 15, 0
+			return
+		end
+		fps.cap = math.max(4, math.floor(current * 0.85))
+	else
+		fps.reductions = 0
+		if ms < target * 0.9 and fps.cap ~= math.huge then
+			fps.cap = math.ceil(fps.cap * 1.1) + 1
+			if fps.cap >= fps.inRange then fps.cap = math.huge end
+		end
+	end
 end
 
 -- mesh names containing any of these are skipped (interior, mechanical, small or hidden parts)
@@ -668,24 +703,36 @@ local function decide(vehicles, refPos)
 	table.clear(waitingLoad)
 	table.clear(importedPaths)
 	local release = cfg.distance + RELEASE_MARGIN
+	local leaving = {}
 	for _, v in pairs(vehicles) do
 		local p = v.proxy
 		if p then
 			local usable = cfg.enabled and ((v.isProxy and not v.isSpawned) or v.proxyHandover ~= nil) and not v.isDeleted and not v.proxyColliderID and p.hasData
 			local d = usable and refPos:distance(p.rpos) or math.huge
-			if p.meshObjects and (not usable or (d > release and not v.isFakeTest)) then detach(p) end
+			if p.meshObjects and not usable then detach(p) -- gone, real or collider: right away
+			elseif p.meshObjects and d > release and not v.isFakeTest then leaving[#leaving + 1] = { p = p, d = d } end
 			-- MPProxyTest vehicles ignore the mesh distance (they are never drawn as boxes)
 			if usable and (d < cfg.distance or v.isFakeTest) and p.meshKey then
 				candidates[#candidates + 1] = { v = v, d = d }
 			end
 		end
 	end
+	-- out of range: farthest first, a few per pass
+	table.sort(leaving, function(a, b) return a.d > b.d end)
+	local detached = 0
+	for _, l in ipairs(leaving) do
+		if detached >= MAX_DETACHES_PER_PASS then break end
+		detach(l.p)
+		detached = detached + 1
+	end
 	table.sort(candidates, function(a, b) return a.d < b.d end)
+	fps.inRange = #candidates
+	local limit = math.min(cfg.maxProxies, fps.cap)
 	local created = 0
 	for i, c in ipairs(candidates) do
 		local p = c.v.proxy
-		if i > cfg.maxProxies and not c.v.isFakeTest then
-			if p.meshObjects then detach(p) end
+		if i > limit and not c.v.isFakeTest then
+			if p.meshObjects and detached < MAX_DETACHES_PER_PASS then detach(p) detached = detached + 1 end
 		elseif not p.meshObjects then
 			local shape = shapes[p.meshKey]
 			if shape and shape.state == "ready" and created < MAX_NEW_OBJECTS_PER_PASS then
@@ -892,6 +939,7 @@ end
 local function onUpdate(dtReal)
 	clock = clock + (dtReal or 0)
 	if not cfg.enabled then return end
+	updateFpsCap(dtReal or 0, clock)
 	if currentJob or #jobs > 0 then
 		if buildTimer == nil then
 			local ok, t = pcall(function() return (hptimer and hptimer()) or (HighPerfTimer and HighPerfTimer()) end)
@@ -912,7 +960,7 @@ end
 --- Cache / pool statistics for MPProxyTest.
 local function getStats(resetWindow)
 	local out = { queued = #jobs + (currentJob and 1 or 0), building = currentJob and currentJob.job and currentJob.job.key or nil,
-		ready = 0, failed = 0, liveObjects = liveCount,
+		ready = 0, failed = 0, liveObjects = liveCount, fpsCap = fps.cap ~= math.huge and fps.cap or nil,
 		buildFrames = buildStats.frames, avgBuildMs = buildStats.frames > 0 and buildStats.ms / buildStats.frames or 0, maxBuildMs = buildStats.maxMs }
 	for _, sh in pairs(shapes) do
 		if sh.state == "ready" then out.ready = out.ready + 1 elseif sh.state == "failed" then out.failed = out.failed + 1 end
