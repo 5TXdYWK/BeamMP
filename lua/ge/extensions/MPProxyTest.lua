@@ -40,6 +40,10 @@
 --   /proxytest 40 sweep radius=500 model=current speed=25 rate=20 jitter=100 loss=0.05
 --   /proxytest status | perf | clear | help
 --
+-- Every fake vehicle is drawn as its BeamNG body mesh, never as a box: spawn() first builds the
+-- mesh cache for the chosen configs and only spawns once they are ready (a failed build falls back
+-- to FALLBACK_MODEL), fake vehicles ignore the mesh distance/cap and are not drawn while no mesh is attached.
+--   variety = number of distinct random models (each is one cache build)  default 4
 -- Requires "Proxy vehicles" enabled in the BeamMP settings (else every fake vehicle would be a real spawn).
 --====================================================================================
 
@@ -47,6 +51,11 @@ local M = {}
 
 local FIRST_ID = 900000 -- keep in sync with MPVehicleGE.PROXY_TEST_MIN_PLAYER_ID
 local HEIGHT_REFRESH = 0.5
+local FALLBACK_MODEL = "covet"
+local PREFERRED_RANDOM = { covet = true, sunburst2 = true, vivace = true, etk800 = true, bastion = true, legran = true,
+	fullsize = true, midsize = true, bx = true, pessima = true, moonhawk = true, barstow = true, burnside = true, miramar = true,
+	etki = true, sbr = true, pickup = true, bluebuck = true, autobello = true, wendover = true, lansdale = true, scintilla = true }
+local pending = {}      -- spawn batches waiting for their mesh cache builds
 
 local fakes = {}        -- [serverVehicleID] = state
 local fakeOrder = {}    -- serverVehicleIDs in spawn order
@@ -60,7 +69,7 @@ local function msg(text)
 	print("[MPProxyTest] "..text)
 end
 
-local function isActive() return next(fakes) ~= nil end
+local function isActive() return next(fakes) ~= nil or #pending > 0 end
 
 local function getRefPos()
 	local veh = getPlayerVehicle(0)
@@ -81,7 +90,13 @@ local function getRandomModels()
 	randomModels = {}
 	for key, model in pairs(core_vehicles.getModelList().models or {}) do
 		local official = model.aggregates and model.aggregates.Source and model.aggregates.Source['BeamNG - Official']
-		if official and (model.Type == "Car" or model.Type == "Truck") then table.insert(randomModels, key) end
+		if official and model.Type == "Car" and PREFERRED_RANDOM[key] then table.insert(randomModels, key) end
+	end
+	if #randomModels == 0 then -- unknown game version: any official car
+		for key, model in pairs(core_vehicles.getModelList().models or {}) do
+			local official = model.aggregates and model.aggregates.Source and model.aggregates.Source['BeamNG - Official']
+			if official and model.Type == "Car" then table.insert(randomModels, key) end
+		end
 	end
 	table.sort(randomModels)
 	return randomModels
@@ -95,11 +110,23 @@ local function defaultConfig(modelKey)
 	local vcf = { parts = {}, vars = {} }
 	if type(pc) == "table" then
 		vcf.parts = type(pc.parts) == "table" and pc.parts or {}
+		if next(vcf.parts) == nil and type(pc.partsTree) == "table" then -- newer tree format: flatten slot -> part
+			local function walk(node)
+				for slot, child in pairs(node.children or {}) do
+					if type(child) == "table" then
+						if child.chosenPartName then vcf.parts[slot] = child.chosenPartName end
+						walk(child)
+					end
+				end
+			end
+			walk(pc.partsTree)
+		end
 		vcf.vars = type(pc.vars) == "table" and pc.vars or {}
 		vcf.paints = pc.paints
 	end
+	vcf.mainPartName = (type(pc) == "table" and pc.mainPartName) or modelKey -- the root part is named after the model
 	vcf.partConfigFilename = pcName and ("vehicles/"..modelKey.."/"..pcName..".pc") or nil
-	if not vcf.paints then
+	if type(vcf.paints) ~= "table" or not vcf.paints[1] then
 		local c = { math.random(), math.random(), math.random(), 1.2 }
 		vcf.paints = { { baseColor = c, metallic = 0.5, roughness = 0.5, clearcoat = 0.8, clearcoatRoughness = 0.1 } }
 		vcf.paints[2], vcf.paints[3] = vcf.paints[1], vcf.paints[1]
@@ -179,12 +206,18 @@ end
 
 -- api ------------------------------------------------------------------------------------
 
+local spawnPlanned
+
 local function spawn(n, opts)
 	if type(n) == "table" then opts, n = n, nil end
 	n = math.max(1, math.floor(tonumber(n) or 20))
 	opts = opts or {}
 	if not (MPProxyGE and MPProxyGE.isEnabled()) then
 		msg("Proxy vehicles are disabled in the BeamMP settings, enable them first (every fake vehicle would be a real spawn)")
+		return false
+	end
+	if not (MPProxyMeshGE and MPProxyMeshGE.isEnabled and MPProxyMeshGE.isEnabled()) then
+		msg("Proxy meshes are disabled in the BeamMP settings, enable them first (test vehicles are only drawn as meshes)")
 		return false
 	end
 	local o = {
@@ -212,7 +245,32 @@ local function spawn(n, opts)
 	local models = o.model == "random" and getRandomModels() or nil
 	if models and #models == 0 then msg("no stock models found") return false end
 
+	if models then -- a few distinct models, each one is a cache build
+		local variety = math.max(1, math.floor(tonumber(opts.variety) or 4))
+		local pool, copy = {}, deepcopy(models)
+		while #pool < variety and #copy > 0 do table.insert(pool, table.remove(copy, math.random(#copy))) end
+		models = pool
+	end
+
+	local plan = {}
+	for i = 1, n do
+		local modelKey, vcf
+		if curModel then modelKey, vcf = curModel, deepcopy(curVcf)
+		elseif models then modelKey = models[(i - 1) % #models + 1]; vcf = defaultConfig(modelKey)
+		else modelKey = o.model; vcf = defaultConfig(modelKey) end
+		if not vcf or not next(vcf.parts or {}) then modelKey, vcf = FALLBACK_MODEL, defaultConfig(FALLBACK_MODEL) end
+		plan[i] = { model = modelKey, vcf = vcf }
+	end
 	MPVehicleGE.setProxyTestActive(true)
+	for _, e in ipairs(plan) do e.key = MPProxyMeshGE.request(e.model, e.vcf) end
+	table.insert(pending, { plan = plan, o = o, started = clock })
+	msg("building mesh cache for "..n.." fake vehicles, they spawn once ready (MPProxyTest.status() shows progress)")
+	return true
+end
+
+-- second half of spawn(): all mesh shapes are ready (or the mesh tier is off)
+spawnPlanned = function(plan, o)
+	local n = #plan
 	local ref = getRefPos()
 	local lineAngle = math.random() * 2 * math.pi
 	local circleCenter = vec3(ref.x + o.offset, ref.y, ref.z)
@@ -221,10 +279,7 @@ local function spawn(n, opts)
 		local playerID = nextPlayerID
 		nextPlayerID = nextPlayerID + 1
 		local sid = playerID.."-0"
-		local modelKey, vcf
-		if curModel then modelKey, vcf = curModel, deepcopy(curVcf)
-		elseif models then modelKey = models[math.random(#models)]; vcf = defaultConfig(modelKey)
-		else modelKey = o.model; vcf = defaultConfig(modelKey) end
+		local modelKey, vcf = plan[i].model, plan[i].vcf
 
 		local f = { sid = sid, playerID = playerID, opts = o, pattern = o.pattern, pos = vec3(), fwd = vec3(0, 1, 0),
 			yawRate = 0, t = 0, sendAcc = math.random() / o.rate, heightAcc = 0, refZ = ref.z, model = modelKey }
@@ -279,6 +334,7 @@ local function clear()
 	table.clear(fakeOrder)
 	table.clear(fakes)
 	table.clear(inFlight)
+	table.clear(pending)
 	MPVehicleGE.setProxyTestActive(false)
 	msg("cleared "..count.." fake vehicles")
 end
@@ -292,7 +348,10 @@ local function status()
 	msg(string.format("colliders %d/%d used (collision %s) | mesh cache: %d ready, %d failed, %d pending%s, %d live TSStatics",
 		s.collidersUsed, s.collidersPool, tostring(cfg.collision), m.ready or 0, m.failed or 0, m.queued or 0,
 		m.building and (" (building "..m.building..")") or "", m.liveObjects or 0))
-	return { proxy = s, mesh = m, fakes = #fakeOrder }
+	local waiting = 0
+	for _, b in ipairs(pending) do waiting = waiting + #b.plan end
+	if waiting > 0 then msg(waiting.." fake vehicles waiting for their mesh build") end
+	return { proxy = s, mesh = m, fakes = #fakeOrder, waiting = waiting }
 end
 
 local function perf()
@@ -329,10 +388,46 @@ local function chatCommand(text)
 	return true
 end
 
+-- spawns pending batches whose mesh builds are done, swaps failed builds for the fallback model
+local function updatePending()
+	local i = 1
+	while i <= #pending do
+		local b = pending[i]
+		local done = true
+		for _, e in ipairs(b.plan) do
+			local shape = e.key and MPProxyMeshGE.getShape(e.key)
+			local state = shape and shape.state or "failed"
+			if state == "failed" then
+				if e.model ~= FALLBACK_MODEL then
+					log('W', 'MPProxyTest', "mesh build failed for "..tostring(e.model)..", using "..FALLBACK_MODEL)
+					e.model, e.vcf = FALLBACK_MODEL, defaultConfig(FALLBACK_MODEL)
+					e.key = MPProxyMeshGE.request(e.model, e.vcf)
+					done = false
+				else
+					e.skip = true
+				end
+			elseif state ~= "ready" then
+				done = false
+			end
+		end
+		if done then
+			table.remove(pending, i)
+			local plan = {}
+			for _, e in ipairs(b.plan) do if not e.skip then plan[#plan + 1] = e end end
+			if #plan < #b.plan then msg((#b.plan - #plan).." fake vehicles skipped, even the fallback mesh failed to build") end
+			if #plan > 0 then spawnPlanned(plan, b.o) end
+			msg(string.format("mesh cache ready after %.1f s", clock - b.started))
+		else
+			i = i + 1
+		end
+	end
+end
+
 local function onUpdate(dtReal)
-	if not next(fakes) then return end
 	local dt = math.min(dtReal or 0, 0.1)
 	clock = clock + dt
+	if #pending > 0 then updatePending() end
+	if not next(fakes) then return end
 	for _, f in pairs(fakes) do
 		f.t = f.t + dt
 		move(f, dt)

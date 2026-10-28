@@ -517,14 +517,21 @@ end
 -- @tparam vec3 cameraPos distance reference (active vehicle, or camera in free cam)
 -- @tparam number activeVehID game id of the vehicle the local player is in, or nil
 -- perf / tier statistics for MPProxyTest (cheap counters, no allocations)
-local hasHptimer = type(hptimer) == "function"
-local perfTimer = hasHptimer and hptimer() or nil
+local perfTimer = nil -- created lazily, hptimer is not defined yet when extensions load
+local function getPerfTimer()
+	if perfTimer == nil then
+		local ok, t = pcall(function() return (hptimer and hptimer()) or (HighPerfTimer and HighPerfTimer()) end)
+		perfTimer = ok and t or false
+	end
+	return perfTimer or nil
+end
 local stats = { frames = 0, totalMs = 0, maxMs = 0, decideMs = 0, decides = 0, mesh = 0, box = 0, prism = 0, hidden = 0 }
 local function resetPerf()
 	stats.frames, stats.totalMs, stats.maxMs, stats.decideMs, stats.decides = 0, 0, 0, 0, 0
 end
 
 local function update(dt, cameraPos, activeVehID)
+	local perfTimer = getPerfTimer()
 	if perfTimer then perfTimer:stopAndReset() end
 	clock = clock + dt
 	refPos:set(cameraPos)
@@ -550,6 +557,8 @@ local function update(dt, cameraPos, activeVehID)
 					-- tier 1: real body meshes (MPProxyMeshGE), tier 2: box, tier 3 (beyond drawDist): nametag only
 					if p.meshObjects and MPProxyMeshGE and MPProxyMeshGE.drawProxy(p, dist) then
 						nMesh = nMesh + 1
+					elseif v.isFakeTest then
+						nHidden = nHidden + 1 -- MPProxyTest vehicles are only ever shown as meshes
 					else
 						drawProxy(p, camPos, dist)
 						if dist > DETAIL_DISTANCE then nPrism = nPrism + 1 else nBox = nBox + 1 end
@@ -599,7 +608,7 @@ end
 --- Returns tier counts, collider usage and per frame cost of update(). Resets the perf window if resetWindow is set.
 local function getStats(resetWindow)
 	local out = { mesh = stats.mesh, box = stats.box, prism = stats.prism, hidden = stats.hidden,
-		real = 0, realQueued = 0, proxies = 0, collidersUsed = 0, collidersPool = 0, timerAvailable = perfTimer ~= nil,
+		real = 0, realQueued = 0, proxies = 0, collidersUsed = 0, collidersPool = 0, timerAvailable = getPerfTimer() ~= nil,
 		frames = stats.frames, avgMs = stats.frames > 0 and stats.totalMs / stats.frames or 0, maxMs = stats.maxMs,
 		avgDecideMs = stats.decides > 0 and stats.decideMs / stats.decides or 0 }
 	for _, v in pairs(MPVehicleGE.getVehicles()) do

@@ -427,8 +427,9 @@ local function decide(vehicles, refPos)
 		if p then
 			local usable = cfg.enabled and v.isProxy and not v.isSpawned and not v.isDeleted and not v.proxyColliderID and p.hasData
 			local d = usable and refPos:distance(p.rpos) or math.huge
-			if p.meshObjects and (not usable or d > release) then detach(p) end
-			if usable and d < cfg.distance and p.meshKey then
+			if p.meshObjects and (not usable or (d > release and not v.isFakeTest)) then detach(p) end
+			-- MPProxyTest vehicles ignore the mesh distance (they are never drawn as boxes)
+			if usable and (d < cfg.distance or v.isFakeTest) and p.meshKey then
 				candidates[#candidates + 1] = { v = v, d = d }
 			end
 		end
@@ -437,12 +438,12 @@ local function decide(vehicles, refPos)
 	local created = 0
 	for i, c in ipairs(candidates) do
 		local p = c.v.proxy
-		if i > cfg.maxProxies then
+		if i > cfg.maxProxies and not c.v.isFakeTest then
 			if p.meshObjects then detach(p) end
 		elseif not p.meshObjects then
 			local shape = shapes[p.meshKey]
 			if shape and shape.state == "ready" and created < MAX_NEW_OBJECTS_PER_PASS then
-				if not shape.loaded then
+				if not shape.loaded and not c.v.isFakeTest then
 					-- first use of this shape: the engine imports it synchronously, so only one per interval
 					if clock >= nextNewShapeAllowed then
 						nextNewShapeAllowed = clock + NEW_SHAPE_INTERVAL
@@ -451,6 +452,7 @@ local function decide(vehicles, refPos)
 						created = created + 1
 					end
 				else
+					shape.loaded = true
 					attach(p, shape)
 					created = created + 1
 				end
@@ -508,13 +510,17 @@ local function drawProxy(p, dist)
 	return true
 end
 
-local buildTimer = type(hptimer) == "function" and hptimer() or nil
+local buildTimer = nil -- lazy, see MPProxyGE.getPerfTimer
 local buildStats = { ms = 0, frames = 0, maxMs = 0 }
 
 local function onUpdate(dtReal)
 	clock = clock + (dtReal or 0)
 	if not cfg.enabled then return end
 	if currentJob or #jobs > 0 then
+		if buildTimer == nil then
+			local ok, t = pcall(function() return (hptimer and hptimer()) or (HighPerfTimer and HighPerfTimer()) end)
+			buildTimer = ok and t or false
+		end
 		if buildTimer then buildTimer:stopAndReset() end
 		stepJobs()
 		if buildTimer then
@@ -575,6 +581,7 @@ M.forget            = forget
 M.reset             = reset
 M.onUpdate          = onUpdate
 M.getStats          = getStats
+M.isEnabled         = function() return cfg.enabled end
 M.onSettingsChanged = onSettingsChanged
 M.onExtensionLoaded = onExtensionLoaded
 M.onClientEndMission = reset
