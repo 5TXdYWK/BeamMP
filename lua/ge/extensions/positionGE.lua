@@ -77,6 +77,8 @@ local function applyPos(data, serverVehicleID)
 			veh.mpVehicleType = 'R'
 		end
 		be:sendToMailbox("vehPosPckt" .. serverVehicleID ,data)
+	elseif vehicle.proxyColliderID then -- proxy with a pooled collision vehicle, it follows the proxy through positionVE
+		be:sendToMailbox("vehPosPckt" .. serverVehicleID ,data)
 	end
 
 	vehicle.posPackets = (vehicle.posPackets or 0) + 1 -- counted for the fps, as not every packet is decoded
@@ -87,8 +89,12 @@ local function applyPos(data, serverVehicleID)
 		local deltaDt = math.max((decoded.tim or 0) - (vehicle.lastDt or 0), 0.001)
 		vehicle.lastDt = decoded.tim
 
-		vehicle.position:set(decoded.pos[1],decoded.pos[2],decoded.pos[3])
-		vehicle.rotation:set(decoded.rot[1],decoded.rot[2],decoded.rot[3],decoded.rot[4])
+		if not veh and vehicle.isProxy and MPProxyGE then
+			MPProxyGE.onPositionPacket(vehicle, decoded) -- proxies predict and smooth their own position
+		else
+			vehicle.position:set(decoded.pos[1],decoded.pos[2],decoded.pos[3])
+			vehicle.rotation:set(decoded.rot[1],decoded.rot[2],decoded.rot[3],decoded.rot[4])
+		end
 
 		if owner and not owner.hasUpdatedPing then -- was owner.updatedPing, which is never set, so unspawned vehicles pushed the ping to the UI on every packet
 			local ping = math.floor(decoded.ping*1000) -- (d.ping-deltaDt)
