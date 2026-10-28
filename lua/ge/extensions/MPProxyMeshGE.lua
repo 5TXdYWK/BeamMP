@@ -54,6 +54,7 @@ local function readSettings()
 	cfg.wheels = settings.getValue("proxyMeshWheels", true) ~= false
 	cfg.realWheels = settings.getValue("proxyMeshRealWheels", true) ~= false
 	cfg.metallicPaint = settings.getValue("proxyMetallicPaint", true) ~= false
+	cfg.skipStatic = settings.getValue("proxySkipStaticUpdates", true) ~= false
 	cfg.suspension = settings.getValue("proxySuspension", false) == true
 	cfg.suspDist = math.max(0, tonumber(settings.getValue("proxySuspensionDistance", 40)) or 40)
 	cfg.realWheelsMax = math.max(0, math.floor(tonumber(settings.getValue("proxyMeshRealWheelsMax", 12)) or 12))
@@ -1706,6 +1707,7 @@ end
 
 local function attach(p, shape, tier)
 	p.meshObjects = {}
+	p.meshLast = nil -- new objects: place them on the next draw
 	p.meshTier = tier
 	local list = tierPaths(shape, tier)
 	for _, path in ipairs(list) do
@@ -2022,11 +2024,20 @@ local function drawProxy(p, dist)
 	else
 		p.susp, p.suspT = nil, nil
 	end
-	for _, o in ipairs(p.meshObjects) do
-		local obj = o.obj
-		if obj then
-			obj:setPosRot(bx, by, bz, qx, qy, qz, qw)
-			obj:updateInstanceRenderData()
+	-- parked / unchanged: the objects keep their transform, skip the engine calls
+	local lb = p.meshLast
+	local moved = not (cfg.skipStatic and lb and math.abs(lb[1] - bx) < 1e-4 and math.abs(lb[2] - by) < 1e-4 and math.abs(lb[3] - bz) < 1e-4
+		and math.abs(lb[4] - qx) < 1e-6 and math.abs(lb[5] - qy) < 1e-6 and math.abs(lb[6] - qz) < 1e-6 and math.abs(lb[7] - qw) < 1e-6)
+	if moved then
+		lb = lb or {}
+		lb[1], lb[2], lb[3], lb[4], lb[5], lb[6], lb[7] = bx, by, bz, qx, qy, qz, qw
+		p.meshLast = lb
+		for _, o in ipairs(p.meshObjects) do
+			local obj = o.obj
+			if obj then
+				obj:setPosRot(bx, by, bz, qx, qy, qz, qw)
+				obj:updateInstanceRenderData()
+			end
 		end
 	end
 	if (cfg.wheels or p.wheelObjects) and shape.wheels then -- real wheel objects are moved even with drawn wheels off
@@ -2053,7 +2064,15 @@ local function drawProxy(p, dist)
 				wheelUp:set(axX.x*zx + axY.x*zy + axZ.x*zz, axX.y*zx + axY.y*zy + axZ.y*zz, axX.z*zx + axY.z*zy + axZ.z*zz)
 				wheelQuat:setFromDir(wheelDir, wheelUp)
 				local px, py, pz = toWorld(w.x, w.y, w.z + (susp and susp.off[i] or 0))
-				o.obj:setPosRot(px, py, pz, wheelQuat.x, wheelQuat.y, wheelQuat.z, wheelQuat.w)
+				local q = wheelQuat
+				local l = o.last
+				if not (cfg.skipStatic and l and math.abs(l[1] - px) < 1e-4 and math.abs(l[2] - py) < 1e-4 and math.abs(l[3] - pz) < 1e-4
+					and math.abs(l[4] - q.x) < 1e-6 and math.abs(l[5] - q.y) < 1e-6 and math.abs(l[6] - q.z) < 1e-6 and math.abs(l[7] - q.w) < 1e-6) then
+					l = l or {}
+					l[1], l[2], l[3], l[4], l[5], l[6], l[7] = px, py, pz, q.x, q.y, q.z, q.w
+					o.last = l
+					o.obj:setPosRot(px, py, pz, q.x, q.y, q.z, q.w)
+				end
 			end
 			if cfg.wheels and not (o and o.obj and w.mt) then -- drawn tire when there is no tire mesh
 				local ax, ay, az = w.ax, w.ay, w.az

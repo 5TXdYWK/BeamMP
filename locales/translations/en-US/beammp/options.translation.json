@@ -123,6 +123,8 @@
     "ui.options.beammp.proxyMetallicPaint.tooltip": "Proxy body meshes use the metallic, roughness and clearcoat values of the vehicle's paints, not only the colour.",
     "ui.options.beammp.proxyCleanupOnReload": "Clean up after Lua reloads",
     "ui.options.beammp.proxyCleanupOnReload.tooltip": "When the Lua extensions are reloaded, remove proxy meshes, engine sound sources and collider vehicles left over from before.",
+    "ui.options.beammp.proxySkipStaticUpdates": "Skip updates of parked proxies",
+    "ui.options.beammp.proxySkipStaticUpdates.tooltip": "Proxy body and wheel objects that did not move since the last frame are not moved again (saves engine calls for parked cars).",
     "ui.options.beammp.proxyGroup.general": "General",
     "ui.options.beammp.proxyGroup.realVehicles": "Real vehicles & spawning",
     "ui.options.beammp.proxyGroup.meshes": "Meshes & detail",
