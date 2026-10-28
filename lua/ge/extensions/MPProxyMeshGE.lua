@@ -23,7 +23,7 @@ setmetatable(_G,{}) -- temporarily disable global notifications
 
 local TIMER = (HighPerfTimer or hptimer)
 local CACHE_DIR = "/temp/beammp/proxymeshes/"
-local CACHE_VERSION = "v1"
+local CACHE_VERSION = "v2" -- v2: transform aware bounding boxes, glow map materials
 local READ_CHUNK = 1024 * 1024    -- bytes per read step
 local FRAME_BUDGET_MS = 2         -- coroutine work per frame
 local MAX_MESHES = 60             -- per config
@@ -200,7 +200,11 @@ local function scanDae(filename, keepGeom, onNode, geomsOnly, header, geoms, kep
 						if id and keepGeom(id, name) then
 							geoms[#geoms + 1] = block
 							keptIds[id] = true
-							updateBBox(bbox, block)
+							if bbox then -- per geometry local bounds, placed by the node transform later
+								local gb = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
+								updateBBox(gb, block)
+								bbox[id] = gb
+							end
 						end
 						buf = string.sub(buf, e + 11)
 						progressed = true
@@ -253,20 +257,60 @@ end
 --- Streams one .dae and returns the filtered collada text (or nil if no wanted mesh is in it).
 -- Meshes are matched by scene node name (what jbeam flexbodies reference). Exporters like Blender name
 -- the geometry blocks differently ("Mesh.038"), those are fetched in a second pass by the node's url.
-local function filterDae(filename, wanted, bbox)
+-- adds a node's geometry bounds to bbox, transformed by the node matrix (collada: row major, column vectors).
+-- Some vehicle .dae files keep meshes in centimeters or offset with a scaled/translated node, raw vertex
+-- bounds of those were hundreds of meters (the "bigger than the map" boxes).
+local function mergeNodeBBox(bbox, block, gb)
+	if not gb or gb[1] > gb[4] then return end
+	local m = {}
+	local mtx = string.match(block, "<matrix[^>]*>([^<]*)</matrix>")
+	if mtx then for num in string.gmatch(mtx, "%S+") do m[#m + 1] = tonumber(num) or 0 end end
+	if #m ~= 16 then m = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1} end
+	for i = 0, 7 do
+		local x = (i % 2 == 0) and gb[1] or gb[4]
+		local y = (math.floor(i / 2) % 2 == 0) and gb[2] or gb[5]
+		local z = (i < 4) and gb[3] or gb[6]
+		local wx = m[1]*x + m[2]*y + m[3]*z + m[4]
+		local wy = m[5]*x + m[6]*y + m[7]*z + m[8]
+		local wz = m[9]*x + m[10]*y + m[11]*z + m[12]
+		if wx < bbox[1] then bbox[1] = wx end
+		if wx > bbox[4] then bbox[4] = wx end
+		if wy < bbox[2] then bbox[2] = wy end
+		if wy > bbox[5] then bbox[5] = wy end
+		if wz < bbox[3] then bbox[3] = wz end
+		if wz > bbox[6] then bbox[6] = wz end
+	end
+end
+
+local function collectMaterials(block, mats)
+	if not mats then return end
+	for sym in string.gmatch(block, '<instance_material symbol="([^"]+)"') do
+		mats[(string.gsub(sym, "%-material$", ""))] = true
+	end
+end
+
+local function filterDae(filename, wanted, bbox, mats)
 	local header, geoms, nodes, keptIds, missing = {}, {}, {}, {}, {}
 	local missingCount = 0
+	local geomBoxes = {}
 	local function keepByName(id, name) return wanted[name] or wanted[string.gsub(id, "%-mesh$", "")] end
 	local ok = scanDae(filename, keepByName, function(block, name, url)
 		if not wanted[name] then return end
-		if keptIds[url] then nodes[#nodes + 1] = block .. "\n"
+		if keptIds[url] then
+			nodes[#nodes + 1] = block .. "\n"
+			mergeNodeBBox(bbox, block, geomBoxes[url])
+			collectMaterials(block, mats)
 		elseif not missing[url] then missing[url] = block missingCount = missingCount + 1 end
-	end, false, header, geoms, keptIds, bbox)
+	end, false, header, geoms, keptIds, geomBoxes)
 	if not ok then return nil end
 	if missingCount > 0 then
-		scanDae(filename, function(id) return missing[id] ~= nil and not keptIds[id] end, function() end, true, {}, geoms, keptIds, bbox)
+		scanDae(filename, function(id) return missing[id] ~= nil and not keptIds[id] end, function() end, true, {}, geoms, keptIds, geomBoxes)
 		for url, block in pairs(missing) do
-			if keptIds[url] then nodes[#nodes + 1] = block .. "\n" end
+			if keptIds[url] then
+				nodes[#nodes + 1] = block .. "\n"
+				mergeNodeBBox(bbox, block, geomBoxes[url])
+				collectMaterials(block, mats)
+			end
 		end
 	end
 	if #nodes == 0 then return nil end
@@ -275,11 +319,41 @@ local function filterDae(filename, wanted, bbox)
 		table.concat(nodes) .. "</visual_scene>\n</library_visual_scenes>\n<scene>\n<instance_visual_scene url=\"#Scene\"/>\n</scene>\n</COLLADA>\n"
 end
 
-local function finishBBox(shape, bbox)
-	if bbox[1] > bbox[4] then return end
+local MAX_LEN, MAX_WIDTH, MAX_HEIGHT = 25, 6, 6
+local function validBBox(b)
+	if type(b) ~= "table" or #b ~= 6 then return false end
+	for i = 1, 6 do if type(b[i]) ~= "number" or b[i] ~= b[i] or b[i] == math.huge or b[i] == -math.huge then return false end end
+	local w, l, h = b[4] - b[1], b[5] - b[2], b[6] - b[3]
+	return w > 0.1 and l > 0.1 and h > 0.1 and w <= MAX_WIDTH and l <= MAX_LEN and h <= MAX_HEIGHT
+		and math.abs(b[1] + b[4]) < 20 and math.abs(b[2] + b[5]) < 30 -- roughly centered on the jbeam origin
+end
+
+local function finishBBox(shape, bbox, model)
+	shape.minX = nil
+	if not validBBox(bbox) then
+		if bbox and bbox[1] and bbox[1] <= (bbox[4] or -math.huge) then
+			log('W', 'MPProxyMeshGE', string.format("Ignoring implausible mesh bounds for %s: %s", tostring(model), table.concat(bbox, ", ")))
+		end
+		return
+	end
 	shape.minX, shape.minY, shape.minZ, shape.maxX, shape.maxY, shape.maxZ = bbox[1], bbox[2], bbox[3], bbox[4], bbox[5], bbox[6]
 	-- jbeam vehicles stand on z = 0, use the mesh bottom only if that does not look like it
 	shape.groundZ = (bbox[3] > -0.3 and bbox[3] < 0.7) and 0 or bbox[3]
+end
+
+-- BeamNG creates glow map materials (signals, lights) at spawn when no material file defines them
+-- (lua/common/jbeam/materials.lua), a TSStatic does not, so do the same to avoid [NO-MATERIAL]
+local function ensureMaterials(list)
+	for _, name in ipairs(list or {}) do
+		if not scenetree.findObject(name) then
+			local mat = createObject("Material")
+			if mat then
+				mat.mapTo = name
+				mat.canSave = false
+				mat:registerObject(name)
+			end
+		end
+	end
 end
 
 local function runJob(job)
@@ -292,9 +366,10 @@ local function runJob(job)
 		for _, p in ipairs(meta.paths) do if not FS:fileExists(p) then allExist = false end end
 		if allExist then
 			loadModelMaterials(job.model)
+			ensureMaterials(meta.materials)
 			shape.paths = meta.paths
 			shape.fromCache = true -- built in an earlier session
-			finishBBox(shape, meta.bbox or {1, 1, 1, -1, -1, -1})
+			finishBBox(shape, meta.bbox, job.model)
 			shape.state = "ready"
 			return
 		end
@@ -321,10 +396,10 @@ local function runJob(job)
 
 	local bbox = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
 	local daes = FS:findFiles("/vehicles/" .. job.model .. "/", "*.dae", -1, false, false) or {}
-	local paths = {}
+	local paths, mats = {}, {}
 	FS:directoryCreate(CACHE_DIR, true)
 	for i, dae in ipairs(daes) do
-		local text = filterDae(dae, wanted, bbox)
+		local text = filterDae(dae, wanted, bbox, mats)
 		if text then
 			local out = CACHE_DIR .. job.key .. "_" .. i .. ".dae"
 			if writeFile(out, text) then paths[#paths + 1] = out end
@@ -338,9 +413,13 @@ local function runJob(job)
 	end
 	log('I', 'MPProxyMeshGE', string.format("Proxy mesh for %s ready (%d meshes, %d files)", job.model, count, #paths))
 	loadModelMaterials(job.model)
-	jsonWriteFile(metaFile, { paths = paths, bbox = bbox[1] <= bbox[4] and bbox or nil }, false)
+	local matList = {}
+	for name in pairs(mats) do matList[#matList + 1] = name end
+	table.sort(matList)
+	ensureMaterials(matList)
+	jsonWriteFile(metaFile, { paths = paths, bbox = validBBox(bbox) and bbox or nil, materials = matList }, false)
 	shape.paths = paths
-	finishBBox(shape, bbox)
+	finishBBox(shape, bbox, job.model)
 	shape.state = "ready"
 end
 

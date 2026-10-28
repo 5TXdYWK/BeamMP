@@ -79,6 +79,17 @@ local MODEL_DIMS = {
 }
 local TYPE_TO_CLASS = { Car = "car", Truck = "truck", Trailer = "trailer", Prop = "prop", Automation = "car" }
 
+-- hard limits for every proxy size (box, prism, mesh fallback), whatever the source
+local MIN_DIM, MAX_LEN, MAX_WIDTH, MAX_HEIGHT = 0.3, 25, 6, 6
+local function clampDim(v, maxV, default)
+	v = tonumber(v)
+	if not v or v ~= v then return default end
+	return math.max(MIN_DIM, math.min(maxV, v))
+end
+local function setDims(p, L, W, H)
+	p.L, p.W, p.H = clampDim(L, MAX_LEN, 4.5), clampDim(W, MAX_WIDTH, 1.9), clampDim(H, MAX_HEIGHT, 1.5)
+end
+
 local modelInfoCache = {} -- [jbeam] = { valid = bool, dims = {} }
 
 local function getModelInfo(jbeam)
@@ -157,7 +168,8 @@ local function initProxy(vehicle, spawnData)
 		end
 	end
 	local info = getModelInfo(spawnData and spawnData.jbm or vehicle.jbeam)
-	p.L, p.W, p.H = info.dims[1], info.dims[2], info.dims[3]
+	setDims(p, info.dims[1], info.dims[2], info.dims[3])
+	p.isPerson = (spawnData and spawnData.jbm or vehicle.jbeam) == "unicycle" -- walking player
 	p.cogH = math.min(0.55, p.H * 0.4) -- position packets are at the center of gravity, not the ground
 	local c = paintToColor(spawnData and spawnData.vcf)
 	p.r, p.g, p.b = c.r, c.g, c.b
@@ -166,10 +178,10 @@ local function initProxy(vehicle, spawnData)
 	p.dimsFromMesh = nil
 	if spawnData and spawnData.vcf then
 		p.vcf = spawnData.vcf
-		if MPProxyMeshGE and not info.valid then
+		if MPProxyMeshGE and not info.valid and not p.isPerson then
 			log('W', 'MPProxyGE', "No proxy mesh for "..tostring(vehicle.serverVehicleString)..": model '"..tostring(spawnData.jbm or vehicle.jbeam).."' is not installed, drawing a box")
 		end
-		if MPProxyMeshGE and info.valid then
+		if MPProxyMeshGE and info.valid and not p.isPerson then
 			local key = MPProxyMeshGE.request(spawnData.jbm or vehicle.jbeam, spawnData.vcf) -- async, box until ready
 			if key ~= p.meshKey then MPProxyMeshGE.release(p) end
 			p.meshKey = key
@@ -276,7 +288,17 @@ local function shade(p, f, alpha)
 end
 
 --- Draws an oriented box for the proxy. Only the up to 3 faces facing the camera are drawn.
+local drawSphere = ffiFound and ffi.C.BNG_DBG_DRAW_Sphere or nop
+local drawCylinder = ffiFound and ffi.C.BNG_DBG_DRAW_Cylinder or nop
+
 local function drawProxy(p, camPos, dist)
+	if p.isPerson then -- walking player: body cylinder + head, about 1.8 m tall
+		local x, y, z = p.rpos.x, p.rpos.y, p.rpos.z - p.cogH
+		local col = shade(p, 1, 230)
+		drawCylinder(x, y, z, x, y, z + 1.45, 0.22, col, true)
+		drawSphere(x, y, z + 1.65, 0.15, col, true)
+		return
+	end
 	axX:setRotate(p.rrot, unitX)
 	axY:setRotate(p.rrot, unitY)
 	axZ:setRotate(p.rrot, unitZ)
@@ -589,7 +611,7 @@ local function update(dt, cameraPos, activeVehID)
 				if p and p.meshKey and not p.dimsFromMesh then
 					local shape = MPProxyMeshGE.getShape(p.meshKey)
 					if shape and shape.state == "ready" and shape.minX then
-						p.L, p.W, p.H = shape.maxY - shape.minY, shape.maxX - shape.minX, shape.maxZ - (shape.groundZ or shape.minZ)
+						setDims(p, shape.maxY - shape.minY, shape.maxX - shape.minX, shape.maxZ - (shape.groundZ or shape.minZ))
 						p.dimsFromMesh = true
 					end
 				end
