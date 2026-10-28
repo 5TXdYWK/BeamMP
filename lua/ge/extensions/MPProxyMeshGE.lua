@@ -51,6 +51,8 @@ local function readSettings()
 	cfg.distance = tonumber(settings.getValue("proxyMeshDistance", 500)) or 500
 	cfg.maxProxies = math.max(0, math.floor(tonumber(settings.getValue("proxyMaxMeshProxies", 48)) or 48))
 	cfg.wheels = settings.getValue("proxyMeshWheels", true) ~= false
+	cfg.realWheels = settings.getValue("proxyMeshRealWheels", true) ~= false
+	cfg.realWheelsMax = math.max(0, math.floor(tonumber(settings.getValue("proxyMeshRealWheelsMax", 12)) or 12))
 	cfg.targetFps = math.max(0, tonumber(settings.getValue("proxyTargetFps", 0)) or 0)
 	cfg.triBudget = math.max(0, math.floor(tonumber(settings.getValue("proxyMeshTriangleBudget", 60000)) or 60000))
 	cfg.prebuild = settings.getValue("proxyPrebuildModels", false) == true
@@ -261,7 +263,7 @@ end
 local ENGINE_FIELDS = { idleRPM = true, maxRPM = true, revLimiterRPM = true, soundConfig = true, soundConfigExhaust = true, requiredEnergyType = true }
 local SOUND_FIELDS = { sampleName = true, sampleFolder = true, mainGain = true, onLoadGain = true, offLoadGain = true,
 	intakeMuffling = true, exhaustAudioMufflingBaseCoef = true }
-local ENGINE_INDEX_VERSION = 2 -- part index files without this are rebuilt once (2: wheel sections)
+local ENGINE_INDEX_VERSION = 3 -- part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies)
 
 local function keepFields(decoded, fields)
 	local out, any = {}, false
@@ -368,7 +370,7 @@ local function compactWheelPart(secs, filename)
 			if type(row) == "table" then
 				if row[1] == nil then
 					if row.nodeOffset ~= nil then list[#list + 1] = { off = vec3Raw(row.nodeOffset) } end
-				elseif type(row[1]) == "string" and row[1] ~= "id" and scalar(row[2]) then
+				elseif type(row[1]) == "string" and row[1] ~= "id" and scalar(row[2]) and scalar(row[3]) and scalar(row[4]) then
 					list[#list + 1] = { row[1], scalar(row[2]), scalar(row[3]), scalar(row[4]) }
 				end
 			end
@@ -378,10 +380,45 @@ local function compactWheelPart(secs, filename)
 	return any and out or nil
 end
 
-local function addWheelParts(into, wheelSecs, filename)
+-- positioned flexbodies of the wheels (rim, tire, hubcap): mesh, the wheel names from its groups ("tire_FR" -> FR),
+-- pos / rot / scale as written (values may be "$var" / "$=" expressions, evaluated per config)
+local WHEEL_GROUPS = { wheel = true, tire = true, tyre = true, hubcap = true, rim = true }
+local function compactWheelFlex(text, filename)
+	if not (string.find(text, "tire_", 1, true) or string.find(text, "wheel_", 1, true) or string.find(text, "hubcap_", 1, true)) then return nil end
+	local ok, rows = pcall(jsonDecode, text, filename)
+	checkBudget()
+	if not ok or type(rows) ~= "table" then return nil end
+	local list = {}
+	for _, row in ipairs(rows) do
+		if type(row) == "table" and type(row[1]) == "string" and row[1] ~= "mesh" and type(row[2]) == "table" then
+			local opt = row[#row]
+			opt = (type(opt) == "table" and opt[1] == nil and type(opt.pos) == "table") and opt or nil
+			local sides, seen, tire = {}, {}, nil
+			for _, g in ipairs(row[2]) do
+				local pre, side = string.match(type(g) == "string" and g or "", "^(%a+)_(.+)$")
+				pre = pre and string.lower(pre)
+				if pre and WHEEL_GROUPS[pre] and not seen[side] then seen[side] = true sides[#sides + 1] = side end
+				if pre == "tire" or pre == "tyre" then tire = true end
+			end
+			if opt and #sides > 0 then
+				list[#list + 1] = { m = row[1], w = sides, p = vec3Raw(opt.pos), r = vec3Raw(opt.rot) or nil, s = vec3Raw(opt.scale) or nil, t = tire }
+			end
+		end
+	end
+	return #list > 0 and list or nil
+end
+
+local function addWheelParts(into, wheelSecs, filename, flexTexts)
 	for partName, secs in pairs(wheelSecs) do
 		local c = compactWheelPart(secs, filename)
 		if c then into[partName] = c end
+	end
+	for partName, text in pairs(flexTexts or {}) do
+		local fb = compactWheelFlex(text, filename)
+		if fb then
+			into[partName] = into[partName] or {}
+			into[partName].fb = fb
+		end
 	end
 end
 
@@ -402,7 +439,7 @@ local function buildCommonWheelIndex()
 		checkBudget()
 		if text then
 			table.clear(flexTexts) table.clear(wheelSecs)
-			if extractFlexbodies(text, flexTexts, nil, wheelSecs) then addWheelParts(parts, wheelSecs, filename) end
+			if extractFlexbodies(text, flexTexts, nil, wheelSecs) then addWheelParts(parts, wheelSecs, filename, flexTexts) end
 		end
 		text = nil
 		checkBudget()
@@ -437,7 +474,7 @@ local function buildPartIndex(model)
 			table.clear(flexTexts) table.clear(sectionTexts) table.clear(wheelSecs)
 			if extractFlexbodies(text, flexTexts, sectionTexts, wheelSecs) then
 				addEngineSections(engine, sectionTexts, filename)
-				addWheelParts(wheels, wheelSecs, filename)
+				addWheelParts(wheels, wheelSecs, filename, flexTexts)
 			end
 		end
 		text = nil
@@ -454,7 +491,7 @@ local function buildPartIndex(model)
 		if text then
 			if extractFlexbodies(text, flexTexts, hasSound and sectionTexts or nil, wheelSecs) then
 				addEngineSections(engine, sectionTexts, filename)
-				addWheelParts(wheels, wheelSecs, filename)
+				addWheelParts(wheels, wheelSecs, filename, flexTexts)
 				data = {}
 				for partName, arr in pairs(flexTexts) do
 					local ok, rows = pcall(jsonDecode, arr, filename)
@@ -500,7 +537,8 @@ end
 -- (x away from the center line: posX + sign(posX) * x, lua/common/jbeam/utils.lua), pressureWheels options apply
 -- to the wheel rows after them, and each wheel is placed like lua/common/jbeam/sections/wheelTypes/pressureWheels.lua:
 -- midpoint of node1/node2 (or offsetFromNode), moved by wheelOffset along the axis, tireWidth wide, radius.
-local WHEEL_VERSION = 1
+local WHEEL_VERSION = 2 -- 2: named fields (mixed tables did not survive the json round trip), rim / tire meshes
+local MAX_WHEEL_MESHES = 6 -- per wheel
 
 -- jbeam values: numbers, "$var", or "$=expression" (arithmetic, comparisons, and/or/not, case(c1, v1, ..., default),
 -- min/max/abs...). Unknown variables (also "$components.x") become nil like in the game's evaluator.
@@ -564,7 +602,7 @@ local function resolveWheels(job)
 		if d and d.vars then for k, v in pairs(d.vars) do vars[k] = v end end
 	end
 	if type(vcf.vars) == "table" then for k, v in pairs(vcf.vars) do vars[k] = v end end
-	local nodes, items, visited = {}, {}, {}
+	local nodes, items, visited, flex = {}, {}, {}, {}
 	local function visit(name, off, path, depth)
 		if depth > 30 or visited[name] then return end
 		visited[name] = true
@@ -578,6 +616,7 @@ local function resolveWheels(job)
 			end
 		end
 		if d.pw then for _, it in ipairs(d.pw) do items[#items + 1] = it end end
+		if d.fb then for _, fb in ipairs(d.fb) do flex[#flex + 1] = { fb, off } end end
 		if d.slots then
 			for _, sl in ipairs(d.slots) do
 				local p = path .. sl.n .. "/"
@@ -588,12 +627,7 @@ local function resolveWheels(job)
 		checkBudget()
 	end
 	visit(vcf.mainPartName or job.model, nil, "/", 0)
-	local function nodePos(name)
-		local n = nodes[name]
-		if not n then return nil end
-		local x, y, z = evalVal(n[1], vars), evalVal(n[2], vars), evalVal(n[3], vars)
-		if not (x and y and z) then return nil end
-		local o = n[4]
+	local function moved(x, y, z, o)
 		if o then
 			local ox, oy, oz = evalVal(o[1], vars) or 0, evalVal(o[2], vars) or 0, evalVal(o[3], vars) or 0
 			x = x + (x > 0 and 1 or (x < 0 and -1 or 0)) * ox
@@ -601,7 +635,14 @@ local function resolveWheels(job)
 		end
 		return x, y, z
 	end
-	local opts, wheels = {}, {}
+	local function nodePos(name)
+		local n = nodes[name]
+		if not n then return nil end
+		local x, y, z = evalVal(n[1], vars), evalVal(n[2], vars), evalVal(n[3], vars)
+		if not (x and y and z) then return nil end
+		return moved(x, y, z, n[4])
+	end
+	local opts, wheels, wheelAt = {}, {}, {}
 	for _, it in ipairs(items) do
 		if it.o then for k, v in pairs(it.o) do opts[k] = v end
 		elseif it.w then
@@ -623,7 +664,36 @@ local function resolveWheels(job)
 					local width = evalVal(opts.tireWidth, vars) or hubWidth
 					-- steered: rows with a steering axis, else the front wheels by name (FR, FL, F2R...)
 					local steered = it.s or (type(it.w) == "string" and string.sub(it.w, 1, 1) == "F")
-					wheels[#wheels + 1] = { mx, my, mz, ax, ay, az, radius, width, s = steered or nil, n = it.w }
+					local at = wheelAt[it.w] or (#wheels + 1) -- a later row of the same wheel replaces it (like the loader)
+					wheelAt[it.w] = at
+					wheels[at] = { x = mx, y = my, z = mz, ax = ax, ay = ay, az = az, r = radius, wd = width, s = steered or nil, n = it.w }
+				end
+			end
+		end
+	end
+	-- rim / tire / hubcap meshes: flexbody pos moved like the part's nodes (same slot nodeOffset), stored relative
+	-- to the wheel center, so a wheel object turns and rolls around its own origin
+	local byName = {}
+	for _, w in ipairs(wheels) do if type(w.n) == "string" then byName[w.n] = w end end
+	for _, it in ipairs(flex) do
+		local fb, off = it[1], it[2]
+		local w = nil
+		for _, side in ipairs(fb.w or {}) do w = w or byName[side] end
+		local p = fb.p
+		local lm = type(fb.m) == "string" and string.lower(fb.m) or ""
+		local hidden = string.find(lm, "brake", 1, true) or string.find(lm, "disc", 1, true) or string.find(lm, "caliper", 1, true)
+		if w and type(fb.m) == "string" and p and not hidden then -- brake parts sit behind the rim
+			local x, y, z = evalVal(p[1], vars), evalVal(p[2], vars), evalVal(p[3], vars)
+			if x and y and z then
+				x, y, z = moved(x, y, z, off)
+				local r, sc = fb.r or {}, fb.s or {}
+				w.m = w.m or {}
+				local dup = false
+				for _, e in ipairs(w.m) do if e[1] == fb.m then dup = true end end
+				if not dup and #w.m < MAX_WHEEL_MESHES then
+					if fb.t then w.mt = true end -- has a tire mesh (else the drawn cylinder stays as the tire)
+					w.m[#w.m + 1] = { fb.m, x - w.x, y - w.y, z - w.z, evalVal(r[1], vars) or 0, evalVal(r[2], vars) or 0, evalVal(r[3], vars) or 0,
+						evalVal(sc[1], vars) or 1, evalVal(sc[2], vars) or 1, evalVal(sc[3], vars) or 1 }
 				end
 			end
 		end
@@ -636,10 +706,10 @@ local function checkWheels(wheels, shape)
 	if type(wheels) ~= "table" then return nil end
 	local out = {}
 	for _, w in ipairs(wheels) do
-		local ok = w[7] >= 0.1 and w[7] <= 1.6 and w[8] >= 0.04 and w[8] <= 1.5
+		local ok = w.r >= 0.1 and w.r <= 1.6 and w.wd >= 0.04 and w.wd <= 1.5
 		if ok and shape.minX then
-			ok = w[1] > shape.minX - 1 and w[1] < shape.maxX + 1 and w[2] > shape.minY - 1 and w[2] < shape.maxY + 1
-				and w[3] > shape.minZ - 1 and w[3] < shape.maxZ + 1
+			ok = w.x > shape.minX - 1 and w.x < shape.maxX + 1 and w.y > shape.minY - 1 and w.y < shape.maxY + 1
+				and w.z > shape.minZ - 1 and w.z < shape.maxZ + 1
 		end
 		if ok then out[#out + 1] = w end
 	end
@@ -648,13 +718,14 @@ end
 
 local function logWheels(job, wheels, note)
 	if wheels then
-		local rmin, rmax, wmin, wmax = math.huge, 0, math.huge, 0
+		local rmin, rmax, wmin, wmax, meshes, names = math.huge, 0, math.huge, 0, 0, {}
 		for _, w in ipairs(wheels) do
-			rmin, rmax = math.min(rmin, w[7]), math.max(rmax, w[7])
-			wmin, wmax = math.min(wmin, w[8]), math.max(wmax, w[8])
+			rmin, rmax = math.min(rmin, w.r), math.max(rmax, w.r)
+			wmin, wmax = math.min(wmin, w.wd), math.max(wmax, w.wd)
+			for _, e in ipairs(w.m or {}) do meshes = meshes + 1 if not names[e[1]] then names[e[1]] = true names[#names + 1] = e[1] end end
 		end
-		log('I', 'MPProxyMeshGE', string.format("Proxy wheels for %s/%s: %d wheels, radius %.2f-%.2f m, width %.2f-%.2f m (source: jbeam%s)",
-			job.model, string.sub(job.key, -16), #wheels, rmin, rmax, wmin, wmax, note or ""))
+		log('I', 'MPProxyMeshGE', string.format("Proxy wheels for %s/%s: %d wheels, radius %.2f-%.2f m, width %.2f-%.2f m, %d rim/tire meshes (%s) (source: jbeam%s)",
+			job.model, string.sub(job.key, -16), #wheels, rmin, rmax, wmin, wmax, meshes, table.concat(names, ", ", 1, math.min(#names, 6)), note or ""))
 	else
 		log('I', 'MPProxyMeshGE', string.format("Proxy wheels for %s/%s: estimated from the body bounds (source: estimate, %s)",
 			job.model, string.sub(job.key, -16), note or "no wheel rows resolved"))
@@ -1044,6 +1115,211 @@ local function ensureMaterials(list)
 	end
 end
 
+-- ============= REAL WHEEL MESHES =============
+-- Each wheel of a config (rim, tire, hubcap flexbodies from resolveWheels) becomes a small .dae of its own: the
+-- meshes are copied from the shared /vehicles/common/ (or the model's) .dae files with the jbeam flexbody
+-- transform baked into their node matrix, relative to the wheel center. Wheels with the same meshes and
+-- transform share the file (left and right differ by the flexbody rotation), so the engine imports each once.
+-- They are built after the body meshes, when no body job waits.
+local wheelFiles = {}     -- [wheel .dae path] = "queued" | "ready" | "failed"
+local wheelJobs = {}      -- FIFO of wheel mesh builds
+local wheelMeshFile = nil -- [mesh name] = source .dae where it was found (disk cached)
+local wheelDaeList = {}   -- [model] = candidate source .dae files
+local wheelMissing = {}   -- [mesh name] = true: searched this session without finding it
+local WHEEL_FILES_CACHE = CACHE_DIR .. "wheelmeshes_" .. CACHE_VERSION .. "_files.json"
+local MAX_WHEEL_FILE_TRIES = 12 -- source files scanned per mesh name that is not in the cache yet
+
+local function wheelPath(w)
+	if w.path ~= nil then return w.path end
+	if type(w.m) ~= "table" or #w.m == 0 then w.path = false return false end
+	local list = {}
+	for _, e in ipairs(w.m) do
+		list[#list + 1] = string.format("%s|%.3f|%.3f|%.3f|%.1f|%.1f|%.1f|%.3f|%.3f|%.3f", tostring(e[1]), e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9], e[10])
+	end
+	table.sort(list)
+	w.path = CACHE_DIR .. "wheel_" .. CACHE_VERSION .. "_" .. hashString(table.concat(list, ";")) .. ".dae"
+	return w.path
+end
+
+local function queueWheelMeshes(shape, model)
+	if not cfg.realWheels or type(shape.wheels) ~= "table" then return end
+	for _, w in ipairs(shape.wheels) do
+		local path = wheelPath(w)
+		if path and wheelFiles[path] == nil then
+			if FS:fileExists(path) then wheelFiles[path] = "ready"
+			else
+				wheelFiles[path] = "queued"
+				wheelJobs[#wheelJobs + 1] = { wheelJob = true, key = path, model = model, m = w.m }
+			end
+		end
+	end
+end
+
+local function wheelCandidates(model)
+	local list = wheelDaeList[model]
+	if list then return list end
+	list = {}
+	for _, d in ipairs({ "/vehicles/common/wheels/", "/vehicles/common/tires/", "/vehicles/common/hubcaps/", "/vehicles/common/wheels_square/",
+		"/vehicles/common/" .. model .. "/", "/vehicles/" .. model .. "/" }) do
+		for _, f in ipairs(FS:findFiles(d, "*.dae", -1, false, false) or {}) do list[#list + 1] = f end
+		checkBudget()
+	end
+	wheelDaeList[model] = list
+	return list
+end
+
+-- how well a file path matches a mesh name: longest common prefix with one of its folder / file names
+-- ("steelwheel_02a_16x8" -> .../steelwheel_02a/steelwheel_02a.dae, "tire_01a_18x9_26" -> tires/tires.dae)
+local function nameScore(mesh, path)
+	local m, best = string.lower(mesh), 0
+	for comp in string.gmatch(string.lower(path), "[^/]+") do
+		comp = string.gsub(comp, "%.dae$", "")
+		local n = 0
+		for i = 1, math.min(#m, #comp) do
+			if string.byte(m, i) == string.byte(comp, i) then n = i else break end
+		end
+		if n > best then best = n end
+	end
+	return best
+end
+
+-- the node block with the flexbody transform (scale, rotation: euler +Z +X +Y intrinsic, then position relative to
+-- the wheel center) applied in front of its own matrix; nil for nodes using other transform elements
+local function bakeNode(block, e, unit)
+	if string.find(block, "<translate", 1, true) or string.find(block, "<rotate", 1, true) or string.find(block, "<scale", 1, true) then return nil end
+	local m = {}
+	local mtx = string.match(block, "<matrix[^>]*>([^<]*)</matrix>")
+	if mtx then for num in string.gmatch(mtx, "%S+") do m[#m + 1] = tonumber(num) or 0 end end
+	if #m ~= 16 then m = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1} end
+	local rx, ry, rz = math.rad(e[5]), math.rad(e[6]), math.rad(e[7])
+	local cx, sx, cy, sy, cz, sz = math.cos(rx), math.sin(rx), math.cos(ry), math.sin(ry), math.cos(rz), math.sin(rz)
+	-- R = Rz * Rx * Ry
+	local zx = { {cz, -sz * cx, sz * sx}, {sz, cz * cx, -cz * sx}, {0, sx, cx} }
+	local R = {}
+	for i = 1, 3 do
+		R[i] = { zx[i][1] * cy - zx[i][3] * sy, zx[i][2], zx[i][1] * sy + zx[i][3] * cy }
+	end
+	local sc = { e[8], e[9], e[10] }
+	local t = { e[2] / unit, e[3] / unit, e[4] / unit } -- node matrices are in file units
+	local B = {}
+	for i = 1, 3 do B[i] = { R[i][1] * sc[1], R[i][2] * sc[2], R[i][3] * sc[3], t[i] } end
+	B[4] = { 0, 0, 0, 1 }
+	local out = {}
+	for i = 1, 4 do
+		for j = 1, 4 do
+			local v = 0
+			for k = 1, 4 do v = v + B[i][k] * m[(k - 1) * 4 + j] end
+			out[#out + 1] = string.format("%.7g", v)
+		end
+	end
+	local newMtx = '<matrix sid="transform">' .. table.concat(out, " ") .. '</matrix>'
+	if mtx then
+		return (string.gsub(block, "<matrix[^>]*>[^<]*</matrix>", function() return newMtx end, 1))
+	end
+	return (string.gsub(block, "^(<node[^>]*>)", function(open) return open .. newMtx end, 1))
+end
+
+local function loadMaterialsNear(file)
+	local dir = string.match(file, "^(.*/)") or "/"
+	if materialsLoaded["dir:" .. dir] then return end
+	materialsLoaded["dir:" .. dir] = true
+	for _, mf in ipairs(FS:findFiles(dir, "*materials.json", 0, true, false) or {}) do
+		loadJsonMaterialsFile(mf)
+		coroutine.yield()
+	end
+end
+
+local function runWheelJob(job)
+	setPhase("wheel meshes")
+	if wheelMeshFile == nil then
+		local c = FS:fileExists(WHEEL_FILES_CACHE) and jsonReadFile(WHEEL_FILES_CACHE) or nil
+		wheelMeshFile = (type(c) == "table" and c.sig == tostring(beamng_version or "?") and type(c.files) == "table") and c.files or {}
+	end
+	local need = {}
+	for _, e in ipairs(job.m) do need[e[1]] = true end
+	local found, scanned, learned = {}, {}, false
+	local function scan(file, names)
+		if scanned[file] then return end
+		scanned[file] = true
+		local part = filterDae(file, names, {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}, nil)
+		coroutine.yield()
+		if not part then return end
+		for _, n in ipairs(part.nodes) do
+			if need[n.name] and not found[n.name] then
+				found[n.name] = { part = part, node = n, file = file }
+				if wheelMeshFile[n.name] ~= file then wheelMeshFile[n.name] = file learned = true end
+			end
+		end
+	end
+	local byFile = {}
+	for name in pairs(need) do
+		local f = wheelMeshFile[name]
+		if f then byFile[f] = byFile[f] or {} byFile[f][name] = true end
+	end
+	for f, names in pairs(byFile) do if FS:fileExists(f) then scan(f, names) end end
+	for name in pairs(need) do
+		if not found[name] and not wheelMissing[name] then
+			local rest = {}
+			for n2 in pairs(need) do if not found[n2] then rest[n2] = true end end
+			local scored = {}
+			for _, f in ipairs(wheelCandidates(job.model)) do
+				if not scanned[f] then scored[#scored + 1] = { f = f, s = nameScore(name, f) } end
+			end
+			table.sort(scored, function(a, b) return a.s > b.s end)
+			checkBudget()
+			for i = 1, math.min(#scored, MAX_WHEEL_FILE_TRIES) do
+				if found[name] then break end
+				scan(scored[i].f, rest)
+			end
+			if not found[name] then wheelMissing[name] = true end
+		end
+	end
+	if learned then
+		FS:directoryCreate(CACHE_DIR, true)
+		jsonWriteFile(WHEEL_FILES_CACHE, { sig = tostring(beamng_version or "?"), files = wheelMeshFile }, false)
+	end
+	local groups, order, sig0, mats, used, names = {}, {}, nil, {}, 0, {}
+	for _, e in ipairs(job.m) do
+		local fnd = found[e[1]]
+		local part = fnd and fnd.part
+		local gsig = part and daeSignature(part.header)
+		local up = part and (string.match(part.header, "<up_axis>(.-)</up_axis>") or "Z_UP")
+		local unit = part and tonumber(string.match(part.header, '<unit[^>]-meter="([^"]+)"') or "1") or 1
+		if unit <= 0 then unit = 1 end
+		sig0 = sig0 or gsig
+		local baked = part and up == "Z_UP" and gsig == sig0 and bakeNode(fnd.node.block, e, unit)
+		if baked then
+			local g = groups[part]
+			if not g then g = { header = part.header, nodes = {}, geoms = {}, used = {}, file = fnd.file } groups[part] = g order[#order + 1] = g end
+			g.nodes[#g.nodes + 1] = baked
+			collectMaterials(baked, mats)
+			local url = fnd.node.url
+			if not g.used[url] and part.geomById[url] then g.used[url] = true g.geoms[#g.geoms + 1] = part.geomById[url] end
+			used = used + 1
+			names[#names + 1] = e[1]
+		end
+	end
+	if used == 0 then
+		wheelFiles[job.key] = "failed"
+		log('W', 'MPProxyMeshGE', string.format("Proxy wheel mesh for %s: none of %d meshes found or usable (%s), drawn wheels stay", job.model, #job.m, job.m[1] and job.m[1][1] or "?"))
+		return
+	end
+	setPhase("wheel merge")
+	FS:directoryCreate(CACHE_DIR, true)
+	local text = mergeDae(order)
+	coroutine.yield()
+	if not writeFile(job.key, text) then wheelFiles[job.key] = "failed" return end
+	text = nil
+	setPhase("materials")
+	for _, g in ipairs(order) do loadMaterialsNear(g.file) end
+	local matList = {}
+	for name in pairs(mats) do matList[#matList + 1] = name end
+	ensureMaterials(matList)
+	wheelFiles[job.key] = "ready"
+	log('I', 'MPProxyMeshGE', string.format("Proxy wheel mesh %s for %s: %d of %d meshes (%s) from %d files",
+		string.match(job.key, "([^/]+)$"), job.model, used, #job.m, table.concat(names, ", "), #order))
+end
+
 local function runJob(job)
 	local shape = shapes[job.key]
 	shape.state = "building"
@@ -1216,12 +1492,13 @@ end
 local function stepJobs()
 	if not currentJob then
 		local job = table.remove(jobs, 1)
+		if not job and #wheelJobs > 0 then job = table.remove(wheelJobs, 1) end
 		if not job and cfg.prebuild then
 			job = table.remove(prebuildJobs, 1)
 			while job and shapes[job.key] and shapes[job.key].state ~= "queued" do job = table.remove(prebuildJobs, 1) end
 		end
 		if not job then return end
-		currentJob = { job = job, co = coroutine.create(runJob), started = clock, maxStepMs = 0, maxStepPhase = "", frames = 0,
+		currentJob = { job = job, co = coroutine.create(job.wheelJob and runWheelJob or runJob), started = clock, maxStepMs = 0, maxStepPhase = "", frames = 0,
 			totalMs = 0, worstFrameMs = 0, phaseMs = {} }
 		jobPhase = "start"
 	end
@@ -1240,17 +1517,19 @@ local function stepJobs()
 		if stepMs > cj.maxStepMs then cj.maxStepMs, cj.maxStepPhase = stepMs, phase end
 		if frameMs > cj.worstFrameMs then cj.worstFrameMs = frameMs end
 		if not ok then
-			log('E', 'MPProxyMeshGE', "Building proxy mesh for "..tostring(currentJob.job.model).." failed: "..tostring(err))
-			shapes[currentJob.job.key].state = "failed"
+			log('E', 'MPProxyMeshGE', "Building proxy mesh for "..tostring(currentJob.job.model)..(currentJob.job.wheelJob and " (wheels)" or "").." failed: "..tostring(err))
+			if currentJob.job.wheelJob then wheelFiles[currentJob.job.key] = "failed"
+			elseif shapes[currentJob.job.key] then shapes[currentJob.job.key].state = "failed" end
 			currentJob = nil
 		elseif coroutine.status(currentJob.co) == "dead" then
-			local sh = shapes[currentJob.job.key]
+			local sh = not cj.job.wheelJob and shapes[cj.job.key] or nil
+			if sh and sh.state == "ready" then queueWheelMeshes(sh, cj.job.model) end
 			local phases = {}
 			for name, ms in pairs(cj.phaseMs) do if ms >= 0.05 then phases[#phases + 1] = string.format("%s %.1f", name, ms) end end
 			table.sort(phases)
 			log(cj.worstFrameMs > frameBudget * 3 and 'W' or 'I', 'MPProxyMeshGE', string.format(
 				"Mesh job %s%s: total %.1f ms over %d frames (%.1f s), worst frame %.1f ms, longest step %.1f ms (%s); ms per step: %s",
-				cj.job.model, (sh and sh.fromCache) and " (from disk cache)" or "", cj.totalMs, cj.frames, clock - cj.started,
+				cj.job.model, cj.job.wheelJob and " (wheel meshes)" or ((sh and sh.fromCache) and " (from disk cache)" or ""), cj.totalMs, cj.frames, clock - cj.started,
 				cj.worstFrameMs, cj.maxStepMs, cj.maxStepPhase, table.concat(phases, ", ")))
 			currentJob = nil
 		end
@@ -1362,14 +1641,14 @@ local function importInterval(shape, tier)
 end
 
 -- ============= TSSTATIC POOL =============
-local function createStatic(path)
+local function createStatic(path, plain)
 	local obj = createObject('TSStatic')
 	if not obj then return nil end
 	obj:setField('shapeName', 0, path)
 	obj:setField('dynamic', 0, 'true')       -- moved every frame (same as trafficSignals)
 	obj:setField('collisionType', 0, 'None')
 	obj:setField('decalType', 0, 'None')
-	obj.useInstanceRenderData = true         -- per instance paint (instanceColor*)
+	obj.useInstanceRenderData = not plain    -- per instance paint (instanceColor*), not for wheels
 	obj.canSave = false
 	obj:registerObject(Sim.getUniqueName("beammpProxyMesh"))
 	liveCount = liveCount + 1
@@ -1377,10 +1656,10 @@ local function createStatic(path)
 	return obj:getId()
 end
 
-local function takeStatic(path)
+local function takeStatic(path, plain)
 	local pool = pools[path]
 	if pool and #pool > 0 then return table.remove(pool) end
-	return createStatic(path)
+	return createStatic(path, plain)
 end
 
 local function returnStatic(path, id)
@@ -1427,7 +1706,57 @@ local function attach(p, shape, tier)
 	p.meshShape = shape
 end
 
+local function detachWheels(p)
+	if not p.wheelObjects then return end
+	for _, o in pairs(p.wheelObjects) do returnStatic(o.path, o.id) end
+	p.wheelObjects = nil
+	p.wheelShape = nil
+end
+
+-- real wheel objects for a proxy with body meshes, once every wheel file of its config is built; first imports
+-- share the engine import interval with the body meshes
+local function attachWheels(p, shape)
+	local paths, newCount, allCdae = {}, 0, true
+	for i, w in ipairs(shape.wheels) do
+		local path = wheelPath(w)
+		if path then
+			if wheelFiles[path] == nil then queueWheelMeshes(shape, string.match(p.meshKey or "", "^(.-)_v%d") or "?") end
+			if wheelFiles[path] == "queued" then return false end
+			if wheelFiles[path] == "ready" then
+				paths[i] = path
+				if not importedPaths[path] then
+					newCount = newCount + 1
+					if not hasCdae(path) then allCdae = false end
+				end
+			end
+		end
+	end
+	if next(paths) == nil then return false end
+	if newCount > 0 then
+		if clock < nextNewShapeAllowed then return false end
+		nextNewShapeAllowed = clock + (allCdae and CACHED_SHAPE_INTERVAL or NEW_SHAPE_INTERVAL)
+	end
+	p.wheelObjects, p.wheelShape = {}, shape
+	for i, path in pairs(paths) do
+		local importTimer = not importedPaths[path] and TIMER() or nil
+		importedPaths[path] = true
+		local id = takeStatic(path, true)
+		if importTimer then
+			local ms = importTimer:stop()
+			log(ms > 20 and 'W' or 'I', 'MPProxyMeshGE', string.format("Engine import of wheel %s (%s): %.1f ms, compiled .cdae was %s",
+				string.match(path, "([^/]+)$") or path, tostring(shape.wheels[i].n), ms, cdaeCache[path] and "on disk" or "not on disk (compiled now)"))
+		end
+		local obj = id and scenetree.findObjectById(id)
+		if obj then
+			obj.hidden = false
+			p.wheelObjects[i] = { path = path, id = id, obj = obj, roll = 0 }
+		end
+	end
+	return true
+end
+
 local function detach(p)
+	detachWheels(p)
 	if not p.meshObjects then return end
 	for _, o in ipairs(p.meshObjects) do returnStatic(o.path, o.id) end
 	p.meshObjects = nil
@@ -1508,6 +1837,15 @@ local function decide(vehicles, refPos)
 			end
 		end
 	end
+	-- real wheels: nearest proxies in the full / parts tiers
+	local wheelsLeft = cfg.realWheels and cfg.realWheelsMax or 0
+	for _, c in ipairs(candidates) do
+		local p = c.v.proxy
+		local want = wheelsLeft > 0 and p.meshObjects and p.meshShape and p.meshShape.wheels and p.meshTier and p.meshTier <= TIER_PARTS and true or false
+		if want then wheelsLeft = wheelsLeft - 1 end
+		if p.wheelObjects and (not want or p.wheelShape ~= p.meshShape) then detachWheels(p) end
+		if want and not p.wheelObjects then attachWheels(p, p.meshShape) end
+	end
 end
 
 local tmpV = vec3()
@@ -1518,6 +1856,8 @@ local ffiFound = ffi and ffi.C and true or false
 local drawCylinder = ffiFound and ffi.C.BNG_DBG_DRAW_Cylinder or nop
 local wheelColor = color(25, 25, 25, 255)
 local MAX_STEER = math.rad(30) -- drawn front wheel angle at full steering
+local wheelDir, wheelUp, wheelQuat = vec3(), vec3(), quat()
+local TWO_PI = 2 * math.pi
 
 local function toWorld(lx, ly, lz)
 	return org.x + axX.x*lx + axY.x*ly + axZ.x*lz, org.y + axX.y*lx + axY.y*ly + axZ.y*lz, org.z + axX.z*lx + axY.z*ly + axZ.z*lz
@@ -1543,17 +1883,40 @@ local function drawProxy(p, dist)
 			obj:updateInstanceRenderData()
 		end
 	end
-	if cfg.wheels and shape.wheels then
+	if (cfg.wheels or p.wheelObjects) and shape.wheels then -- real wheel objects are moved even with drawn wheels off
 		-- jbeam wheels: centers, axes, radius and width in the same jbeam space as the body mesh
 		local steer = math.max(-1, math.min(1, p.steer or 0)) * MAX_STEER
 		local sc, ss = math.cos(steer), math.sin(steer)
-		for _, w in ipairs(shape.wheels) do
-			local ax, ay, az = w[4], w[5], w[6]
-			if w.s and steer ~= 0 then ax, ay = ax * sc - ay * ss, ax * ss + ay * sc end
-			local h = w[8] * 0.5
-			local x1, y1, z1 = toWorld(w[1] - ax * h, w[2] - ay * h, w[3] - az * h)
-			local x2, y2, z2 = toWorld(w[1] + ax * h, w[2] + ay * h, w[3] + az * h)
-			drawCylinder(x1, y1, z1, x2, y2, z2, w[7], wheelColor, true)
+		local objs = p.wheelShape == shape and p.wheelObjects or nil
+		local dt = math.min(math.max(clock - (p.wheelT or clock), 0), 0.25)
+		p.wheelT = clock
+		-- rolling: forward speed (jbeam -Y) over the radius
+		local vf = 0
+		if objs and p.svel then vf = -(p.svel.x * axY.x + p.svel.y * axY.y + p.svel.z * axY.z) end
+		for i, w in ipairs(shape.wheels) do
+			local o = objs and objs[i]
+			if o and o.obj then
+				local roll = (o.roll + vf * dt / math.max(w.r, 0.1)) % TWO_PI
+				o.roll = roll
+				local st = w.s and steer or 0
+				local cs, sn, cr, sr = math.cos(st), math.sin(st), math.cos(roll), math.sin(roll)
+				-- wheel axes in jbeam space: roll about the axle (X), then steer about Z
+				local yx, yy, yz = -sn * cr, cs * cr, sr
+				local zx, zy, zz = sn * sr, -cs * sr, cr
+				wheelDir:set(axX.x*yx + axY.x*yy + axZ.x*yz, axX.y*yx + axY.y*yy + axZ.y*yz, axX.z*yx + axY.z*yy + axZ.z*yz)
+				wheelUp:set(axX.x*zx + axY.x*zy + axZ.x*zz, axX.y*zx + axY.y*zy + axZ.y*zz, axX.z*zx + axY.z*zy + axZ.z*zz)
+				wheelQuat:setFromDir(wheelDir, wheelUp)
+				local px, py, pz = toWorld(w.x, w.y, w.z)
+				o.obj:setPosRot(px, py, pz, wheelQuat.x, wheelQuat.y, wheelQuat.z, wheelQuat.w)
+			end
+			if cfg.wheels and not (o and o.obj and w.mt) then -- drawn tire when there is no tire mesh
+				local ax, ay, az = w.ax, w.ay, w.az
+				if w.s and steer ~= 0 then ax, ay = ax * sc - ay * ss, ax * ss + ay * sc end
+				local h = w.wd * 0.5
+				local x1, y1, z1 = toWorld(w.x - ax * h, w.y - ay * h, w.z - az * h)
+				local x2, y2, z2 = toWorld(w.x + ax * h, w.y + ay * h, w.z + az * h)
+				drawCylinder(x1, y1, z1, x2, y2, z2, w.r, wheelColor, true)
+			end
 		end
 	elseif cfg.wheels and shape.minX then
 		local W, L, H = shape.maxX - shape.minX, shape.maxY - shape.minY, shape.maxZ - shape.minZ
@@ -1714,7 +2077,7 @@ local function onUpdate(dtReal)
 	clock = clock + (dtReal or 0)
 	if not cfg.enabled then return end
 	updateFpsCap(dtReal or 0, clock)
-	if currentJob or #jobs > 0 then
+	if currentJob or #jobs > 0 or #wheelJobs > 0 then
 		if buildTimer == nil then
 			local ok, t = pcall(function() return (hptimer and hptimer()) or (HighPerfTimer and HighPerfTimer()) end)
 			buildTimer = ok and t or false
@@ -1769,6 +2132,8 @@ local function reset()
 	shapes = {} -- rebuilt from the disk cache (cheap) on the next request
 	jobs = {}
 	prebuildJobs = {}
+	wheelJobs = {}
+	wheelFiles = {}
 	fallbackOf = {}
 	defaultKeys = {}
 	prebuildStarted = false
@@ -1782,7 +2147,7 @@ end
 
 --- Clears the per proxy references after reset (objects are gone).
 local function forget(p)
-	if p then p.meshObjects = nil p.meshShape = nil p.meshKey = nil end
+	if p then p.meshObjects = nil p.meshShape = nil p.meshKey = nil p.wheelObjects = nil p.wheelShape = nil end
 end
 
 local function onSettingsChanged() readSettings() if not preload then frameBudget = cfg.frameBudget end end
