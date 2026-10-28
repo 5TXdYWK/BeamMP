@@ -37,6 +37,9 @@ local cfg = {
 	maxPredict = 0.3,
 	farShape = true,
 	queueByDistance = true,
+	engineSound = false,
+	engineSoundDist = 60,
+	engineSoundMax = 6,
 	lodShape = 600, -- low poly car shape below, a box in the paint colour above (LOD tiers after the mesh ones)
 }
 
@@ -72,6 +75,9 @@ local function readSettings()
 	cfg.farShape = settings.getValue("proxyFarShape", true) ~= false
 	cfg.queueByDistance = settings.getValue("proxyQueueByDistance", true) ~= false
 	cfg.lodShape = math.max(0, tonumber(settings.getValue("proxyLodShapeDistance", 600)) or 600)
+	cfg.engineSound = settings.getValue("proxyEngineSound", false) == true
+	cfg.engineSoundDist = math.max(5, tonumber(settings.getValue("proxyEngineSoundDistance", 60)) or 60)
+	cfg.engineSoundMax = math.min(16, math.max(0, math.floor(tonumber(settings.getValue("proxyEngineSoundMax", 6)) or 6)))
 	cfg.maxPredict = math.min(math.max(tonumber(settings.getValue("proxyMaxPrediction", 0.3)) or 0.3, 0.05), 2)
 end
 
@@ -127,7 +133,7 @@ local function getModelInfo(jbeam)
 		local class = modelData and TYPE_TO_CLASS[modelData.Type] or "car"
 		dims = CLASS_DIMS[class] or CLASS_DIMS.car
 	end
-	info = { valid = modelData ~= nil, dims = dims }
+	info = { valid = modelData ~= nil, dims = dims, class = modelData and TYPE_TO_CLASS[modelData.Type] or "car" }
 	modelInfoCache[jbeam] = info
 	return info
 end
@@ -736,7 +742,26 @@ end
 -- @tparam string kind "inputs", "electrics", "powertrain" or "nodes"
 local function captureState(kind, vehicle, code, data)
 	if kind == "inputs" and vehicle and vehicle.proxy and type(data) == "string" and isHeld(vehicle) then
-		vehicle.proxy.steer = tonumber(string.match(data, '"s"%s*:%s*([^,}%s]+)')) or vehicle.proxy.steer -- drawn wheels
+		local p = vehicle.proxy
+		p.steer = tonumber(string.match(data, '"s"%s*:%s*([^,}%s]+)')) or p.steer -- drawn wheels
+		p.sndThrottle = tonumber(string.match(data, '"t"%s*:%s*([^,}%s]+)')) or p.sndThrottle -- engine sound
+		p.sndGear = string.match(data, '"g"%s*:%s*"?([^,}"]+)') or p.sndGear
+		p.sndInputT = clock
+	elseif kind == "powertrain" and code == "e" and vehicle and vehicle.proxy and type(data) == "string" and isHeld(vehicle) then
+		-- engine data: ignLvl (0 off .. 3 starting) and per engine ign / isStalled, only sent on change
+		local d = jsonDecode(data)
+		if type(d) == "table" then
+			local p = vehicle.proxy
+			if d.ignLvl ~= nil then p.sndIgnLvl = tonumber(d.ignLvl) end
+			if type(d.ICE) == "table" then
+				for _, e in pairs(d.ICE) do
+					if type(e) == "table" then
+						if e.isStalled ~= nil then p.sndStalled = e.isStalled == true end
+						if e.ign ~= nil then p.sndIgn = tonumber(e.ign) end
+					end
+				end
+			end
+		end
 	end
 	if not cfg.replayState or not isHeld(vehicle) or type(data) ~= "string" then return false end
 	if kind == "nodes" and code ~= "n" and code ~= "g" then return false end
@@ -994,6 +1019,158 @@ local function updateQueuedSpawns(vehicles)
 	end
 end
 
+
+-- ============= ENGINE SOUND (proxyEngineSound) =============
+-- Proxies have no vehicle object, so the game's own engine sound (bound to vehicle nodes) cannot run for them.
+-- A few looping FMOD sources (Engine.Audio.createSource) are placed on the nearest running proxies instead and
+-- driven with the RPM / Load parameters of the engine events. RPM is not in the synced data, it is estimated from
+-- the synced throttle and gear (inputs packet) and the proxy speed.
+local ENGINE_BY_CLASS = { car = "I4_2", truck = "V8", bus = "I6D_bus", semi = "I6D_semi" }
+local ENGINE_BY_MODEL = { citybus = "bus", us_semi = "semi" }
+local DIESEL = { bus = true, semi = true }
+local FALLBACK_EVENT = "event:>Engine>Bands>Synth>i4_01_eng"
+local SOUND_FADE = 2           -- volume per second
+local SOUND_INPUT_STALE = 5    -- s without inputs packets: throttle is no longer trusted
+local soundEvents = {}         -- [sample name] = event name
+local soundPool = {}           -- { id, event, owner (vehicle), vol, rpm, playing }
+local soundMat = nil
+
+local function soundEventFor(jbeam)
+	local class = ENGINE_BY_MODEL[jbeam] or getModelInfo(jbeam).class
+	local sample = ENGINE_BY_CLASS[class]
+	if not sample then return nil end
+	local ev = soundEvents[sample]
+	if ev == nil then
+		local base = "art/sound/blends/" .. sample .. "_engine.sfxBlend"
+		local data = jsonReadFile(base .. "2D.json") or jsonReadFile(base .. "2d.json")
+		ev = type(data) == "table" and type(data.eventName) == "string" and data.eventName or FALLBACK_EVENT
+		soundEvents[sample] = ev
+	end
+	return ev, DIESEL[class]
+end
+
+--- false when the synced engine state says the engine is off or stalled, true when unknown
+local function proxyEngineRunning(p)
+	if p.sndIgnLvl and p.sndIgnLvl < 2 then return false end
+	if p.sndStalled or (p.sndIgn and p.sndIgn <= 0) then return false end
+	return true
+end
+
+local function estimateRpm(p, diesel, speed)
+	local idle, redline = diesel and 650 or 850, diesel and 2400 or 6200
+	local fresh = p.sndInputT and clock - p.sndInputT < SOUND_INPUT_STALE
+	local thr = fresh and math.min(math.max(p.sndThrottle or 0, 0), 1) or (speed > 1 and 0.3 or 0)
+	local g = p.sndGear and tostring(p.sndGear) or nil
+	if g == "N" or g == "P" or (speed < 0.5 and not fresh) then
+		return idle + thr * (redline - idle) * 0.7, thr
+	end
+	local n = tonumber(g and string.match(g, "%d+"))
+	local perGear = diesel and 4 or 9 -- m/s per gear at redline in first, grows with the gear
+	if g == "R" then n = 1 end
+	if not n then -- automatic: shift up once past a throttle dependent point
+		local shiftAt = redline * (0.45 + 0.4 * thr)
+		n = 1
+		while n < 8 and idle + speed / (perGear * n) * (redline - idle) > shiftAt do n = n + 1 end
+	end
+	local rpm = idle + speed / (perGear * math.max(n, 1)) * (redline - idle)
+	return math.min(math.max(rpm, idle), redline), thr
+end
+
+local function soundSource(entry)
+	return entry.id and scenetree.findObjectById(entry.id) or nil
+end
+
+local function releaseSound(entry)
+	local src = soundSource(entry)
+	if src then pcall(src.stop, src, -1) pcall(src.delete, src) end
+	entry.id, entry.event, entry.owner, entry.playing = nil, nil, nil, false
+end
+
+local function stopAllSounds()
+	for _, entry in ipairs(soundPool) do releaseSound(entry) end
+	table.clear(soundPool)
+end
+
+local function soundEligible(v)
+	local p = v.proxy
+	if v.isLocal or v.isDeleted or not p or not p.hasData or p.isPerson then return false end
+	if v.proxyHandover then return v.proxyHandover.state == "spawning" end -- real car hidden, not playing yet
+	return (v.isProxy and not v.isSpawned) or v.hybridPaused == true
+end
+
+--- every decision pass: nearest running proxies get a source, the others fade out
+local function assignSounds(vehicles)
+	if not cfg.engineSound or cfg.engineSoundMax == 0 or not (Engine and Engine.Audio and Engine.Audio.createSource) then
+		if #soundPool > 0 then stopAllSounds() end
+		return
+	end
+	local maxD2 = cfg.engineSoundDist * cfg.engineSoundDist
+	local wanted = {}
+	for _, v in pairs(vehicles) do
+		if soundEligible(v) and proxyEngineRunning(v.proxy) then
+			local d2 = refPos:squaredDistance(v.proxy.rpos)
+			if d2 < maxD2 then wanted[#wanted + 1] = { v = v, d2 = d2 } end
+		end
+	end
+	table.sort(wanted, function(a, b) return a.d2 < b.d2 end)
+	local keep = {}
+	for i = 1, math.min(#wanted, cfg.engineSoundMax) do keep[wanted[i].v] = true end
+	for _, entry in ipairs(soundPool) do -- owners that lost their slot fade out (owner kept until silent)
+		if entry.owner and not keep[entry.owner] then entry.leaving = true end
+		if entry.owner and keep[entry.owner] then entry.leaving = false keep[entry.owner] = entry end
+	end
+	for v, slot in pairs(keep) do
+		if slot == true then
+			local event, diesel = soundEventFor(v.jbeam)
+			if event then
+				local entry
+				for _, e in ipairs(soundPool) do if not e.owner and e.event == event then entry = e break end end
+				if not entry then for _, e in ipairs(soundPool) do if not e.owner then entry = e break end end end
+				if not entry and #soundPool < cfg.engineSoundMax then entry = {} soundPool[#soundPool + 1] = entry end
+				if entry then
+					if entry.event ~= event then
+						releaseSound(entry)
+						local ok, id = pcall(Engine.Audio.createSource, "AudioDefaultLoop3D", event)
+						entry.id = ok and id or nil
+						entry.event = event
+					end
+					entry.owner, entry.diesel, entry.leaving, entry.vol = v, diesel, false, 0
+				end
+			end
+		end
+	end
+	for i = #soundPool, cfg.engineSoundMax + 1, -1 do releaseSound(soundPool[i]) table.remove(soundPool, i) end
+end
+
+--- every frame, only for the few sources in use: position, RPM, load and fades
+local function updateSounds(dt)
+	if #soundPool == 0 then return end
+	soundMat = soundMat or MatrixF(true)
+	for _, entry in ipairs(soundPool) do
+		local v = entry.owner
+		if v then
+			local src = soundSource(entry)
+			local p = v.proxy
+			local alive = src and p and soundEligible(v) and proxyEngineRunning(p)
+			local target = (alive and not entry.leaving) and 1 or 0
+			entry.vol = entry.vol + math.max(-SOUND_FADE * dt, math.min(SOUND_FADE * dt, target - entry.vol))
+			if not src or not p or (entry.vol <= 0 and target == 0) then
+				if src and entry.playing then pcall(src.stop, src, -1) end
+				entry.owner, entry.playing, entry.leaving = nil, false, false
+			else
+				local rpm, load = estimateRpm(p, entry.diesel, p.svel:length())
+				entry.rpm = entry.rpm and entry.rpm + (rpm - entry.rpm) * math.min(1, dt * 6) or rpm
+				soundMat:setPosition(p.rpos)
+				src:setTransform(soundMat)
+				src:setParameter("RPM", entry.rpm)
+				src:setParameter("Load", load)
+				src:setParameter("volume", entry.vol)
+				if not entry.playing then src:play(-1) entry.playing = true end
+			end
+		end
+	end
+end
+
 -- ============= SWAP MANAGER =============
 local function isEligibleForReal(v)
 	return v.isProxy and not v.isSpawned and not v.isDeleted and not v.isIllegal and not v.spawnQueue
@@ -1140,6 +1317,7 @@ local function update(dt, cameraPos, activeVehID)
 	end
 
 	stats.mesh, stats.box, stats.prism, stats.hidden = nMesh, nBox, nPrism, nHidden
+	updateSounds(dt)
 
 	updateHandovers(vehicles)
 	hybridContacts(vehicles)
@@ -1153,6 +1331,7 @@ local function update(dt, cameraPos, activeVehID)
 		updateQueuedSpawns(vehicles)
 		decide(vehicles, activeVehID)
 		updateColliders(vehicles)
+		assignSounds(vehicles)
 		if MPProxyMeshGE then
 			MPProxyMeshGE.decide(vehicles, refPos)
 			for _, v in pairs(vehicles) do -- use the real mesh bounds for the box fallback once known
@@ -1235,6 +1414,7 @@ end
 
 local function reset()
 	removeAllColliders()
+	stopAllSounds()
 	if MPProxyMeshGE then MPProxyMeshGE.reset() end
 	nextSpawnAllowed, nextDespawnAllowed, nextColliderSpawnAllowed = 0, 0, 0
 end
@@ -1277,6 +1457,8 @@ M.flushReplay         = flushReplay
 M.onVehicleResetWhileHeld = onVehicleResetWhileHeld
 M.finishHandover      = finishHandover
 M.onExtensionLoaded   = onExtensionLoaded
+M.onExtensionUnloaded = function() stopAllSounds() end
+M.getSoundPool        = function() return soundPool end
 M.onInit = function() setExtensionUnloadMode(M, "manual") end
 
 return M

@@ -286,6 +286,9 @@ export default function (deps) {
     beammpProxyHybrid(values) {
         return values.enableProxyVehicles!==false && values.proxyHybridMode===true
     },
+    beammpProxyEngineSound(values) {
+        return values.enableProxyVehicles!==false && values.proxyEngineSound===true
+    },
     beammpEnableBlobs(values) {
         return values.enableBlobs===true
     },
