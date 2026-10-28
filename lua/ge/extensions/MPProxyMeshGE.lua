@@ -2166,8 +2166,10 @@ local function drawProxy(p, dist)
 	end
 	-- parked / unchanged: the objects keep their transform, skip the engine calls
 	local lb = p.meshLast
-	local moved = not (cfg.skipStatic and lb and math.abs(lb[1] - bx) < 1e-4 and math.abs(lb[2] - by) < 1e-4 and math.abs(lb[3] - bz) < 1e-4
-		and math.abs(lb[4] - qx) < 1e-6 and math.abs(lb[5] - qy) < 1e-6 and math.abs(lb[6] - qz) < 1e-6 and math.abs(lb[7] - qw) < 1e-6)
+	-- compared with the last pose sent to the engine (not last frame), so slow creeping adds up and still updates:
+	-- 5 mm, and 0.1 deg of rotation (|dot| > cos(0.05 deg) = 1 - 3.8e-7)
+	local moved = not (cfg.skipStatic and lb and (lb[1] - bx)^2 + (lb[2] - by)^2 + (lb[3] - bz)^2 < 2.5e-5
+		and math.abs(lb[4] * qx + lb[5] * qy + lb[6] * qz + lb[7] * qw) > 1 - 3.8e-7)
 	if moved then
 		lb = lb or {}
 		lb[1], lb[2], lb[3], lb[4], lb[5], lb[6], lb[7] = bx, by, bz, qx, qy, qz, qw
@@ -2206,8 +2208,9 @@ local function drawProxy(p, dist)
 				local px, py, pz = toWorld(w.x, w.y, w.z + (susp and susp.off[i] or 0))
 				local q = wheelQuat
 				local l = o.last
-				if not (cfg.skipStatic and l and math.abs(l[1] - px) < 1e-4 and math.abs(l[2] - py) < 1e-4 and math.abs(l[3] - pz) < 1e-4
-					and math.abs(l[4] - q.x) < 1e-6 and math.abs(l[5] - q.y) < 1e-6 and math.abs(l[6] - q.z) < 1e-6 and math.abs(l[7] - q.w) < 1e-6) then
+				-- wheels: 5 mm and 0.5 deg of roll / steer (1 - cos(0.25 deg) = 9.5e-6) against the last sent pose
+				if not (cfg.skipStatic and l and (l[1] - px)^2 + (l[2] - py)^2 + (l[3] - pz)^2 < 2.5e-5
+					and math.abs(l[4] * q.x + l[5] * q.y + l[6] * q.z + l[7] * q.w) > 1 - 9.5e-6) then
 					l = l or {}
 					l[1], l[2], l[3], l[4], l[5], l[6], l[7] = px, py, pz, q.x, q.y, q.z, q.w
 					o.last = l
