@@ -295,6 +295,9 @@ export default function (deps) {
     beammpProxySuspension(values) {
         return values.enableProxyVehicles!==false && values.proxyMeshEnabled!==false && values.proxySuspension===true
     },
+    beammpProxyTireScreech(values) {
+        return values.enableProxyVehicles!==false && values.proxyTireScreech===true
+    },
     beammpProxyAutoReal(values) {
         return values.enableProxyVehicles!==false && values.proxyAutoReal===true
     },

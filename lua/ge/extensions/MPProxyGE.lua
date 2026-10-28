@@ -79,6 +79,8 @@ local function readSettings()
 	cfg.autoShift = settings.getValue("proxyEngineAutoShift", true) ~= false
 	cfg.engineSoundDist = math.max(5, tonumber(settings.getValue("proxyEngineSoundDistance", 60)) or 60)
 	cfg.engineSoundMax = math.min(16, math.max(0, math.floor(tonumber(settings.getValue("proxyEngineSoundMax", 6)) or 6)))
+	cfg.tireScreech = settings.getValue("proxyTireScreech", false) == true
+	cfg.screechDist = math.max(5, tonumber(settings.getValue("proxyTireScreechDistance", 50)) or 50)
 	cfg.tabCycle = settings.getValue("proxyTabCycle", true) ~= false
 	cfg.maxPredict = math.min(math.max(tonumber(settings.getValue("proxyMaxPrediction", 0.3)) or 0.3, 0.05), 2)
 end
@@ -1223,6 +1225,101 @@ local function updateSounds(dt)
 	end
 end
 
+
+-- ============= TIRE SCREECH =============
+-- a few looping skid sources (the event lua/vehicle/sounds.lua uses on rigid ground) for the nearest proxies
+-- whose motion says the tires slide: sideways speed (drifting) or hard braking, from the predicted kinematics
+local skid = { pool = {}, fwd = vec3(), right = vec3(), mat = nil, EVENT = "event:>Surfaces>skid_rigid_v2", MAX = 3 }
+
+function skid.slip(p)
+	local speed = p.svel:length()
+	if speed < 3 then return 0 end
+	skid.fwd:setRotate(p.rrot, vec3(0, -1, 0)) -- vehicles face -Y
+	skid.right:setRotate(p.rrot, vec3(1, 0, 0))
+	local lat = math.abs(p.svel:dot(skid.right))
+	local vf = p.svel:dot(skid.fwd)
+	local brake = -p.acc:dot(skid.fwd) * (vf >= 0 and 1 or -1) -- deceleration along the travel direction
+	return math.max(clamp((lat - 1.2) / 4, 0, 1), clamp((brake - 6) / 6, 0, 1))
+end
+
+function skid.release(e)
+	local src = e.id and scenetree.findObjectById(e.id)
+	if src then pcall(src.stop, src, -1) pcall(src.delete, src) end
+	e.id, e.owner, e.playing = nil, nil, false
+end
+
+function skid.stopAll()
+	for _, e in ipairs(skid.pool) do skid.release(e) end
+	table.clear(skid.pool)
+end
+
+function skid.assign(vehicles)
+	if not cfg.tireScreech or not (Engine and Engine.Audio and Engine.Audio.createSource) then
+		if #skid.pool > 0 then skid.stopAll() end
+		return
+	end
+	local maxD2 = cfg.screechDist * cfg.screechDist
+	local wanted = {}
+	for _, v in pairs(vehicles) do
+		local p = v.proxy
+		if soundEligible(v) and p.hasData then
+			local d2 = refPos:squaredDistance(p.rpos)
+			if d2 < maxD2 and skid.slip(p) > 0.05 then wanted[#wanted + 1] = { v = v, d2 = d2 } end
+		end
+	end
+	table.sort(wanted, function(a, b) return a.d2 < b.d2 end)
+	local keep = {}
+	for i = 1, math.min(#wanted, skid.MAX) do keep[wanted[i].v] = true end
+	for _, e in ipairs(skid.pool) do if e.owner and keep[e.owner] then keep[e.owner] = e end end
+	for v, slot in pairs(keep) do
+		if slot == true then
+			local entry
+			for _, e in ipairs(skid.pool) do if not e.owner then entry = e break end end
+			if not entry and #skid.pool < skid.MAX then entry = { vol = 0 } skid.pool[#skid.pool + 1] = entry end
+			if entry then
+				if not entry.id then
+					local ok, id = pcall(Engine.Audio.createSource, "AudioDefaultLoop3D", skid.EVENT)
+					entry.id = ok and id or nil
+					local src = entry.id and scenetree.findObjectById(entry.id)
+					soundCounter = soundCounter + 1
+					if src then
+						pcall(src.setName, src, "beammpProxySound_" .. soundCounter)
+						-- tire property parameters as sounds.lua sets them, neutral values
+						pcall(src.setParameter, src, "c_tirPrpVolSkd", 1)
+						pcall(src.setParameter, src, "c_tirPrpPitch", 1)
+						pcall(src.setParameter, src, "c_tirPrpSoft", 0.5)
+					end
+				end
+				entry.owner, entry.vol = v, 0
+			end
+		end
+	end
+end
+
+function skid.update(dt)
+	if #skid.pool == 0 then return end
+	skid.mat = skid.mat or MatrixF(true)
+	for _, e in ipairs(skid.pool) do
+		local v = e.owner
+		if v then
+			local src = e.id and scenetree.findObjectById(e.id)
+			local p = v.proxy
+			local target = (src and p and soundEligible(v)) and skid.slip(p) or 0
+			e.vol = e.vol + (target - e.vol) * math.min(1, dt * 8)
+			if not src or (e.vol < 0.02 and target == 0) then
+				if src and e.playing then pcall(src.stop, src, -1) end
+				e.owner, e.playing = nil, false
+			else
+				skid.mat:setPosition(p.rpos)
+				src:setTransform(skid.mat)
+				if src.setVolumePitch then pcall(src.setVolumePitch, src, e.vol, 1, e.vol + 0.5, 0)
+				else pcall(src.setParameter, src, "volume", e.vol) end
+				if not e.playing then src:play(-1) e.playing = true end
+			end
+		end
+	end
+end
+
 -- ============= SWAP MANAGER =============
 local function isEligibleForReal(v)
 	return v.isProxy and not v.isSpawned and not v.isDeleted and not v.isIllegal and not v.spawnQueue
@@ -1372,6 +1469,7 @@ local function update(dt, cameraPos, activeVehID)
 
 	stats.mesh, stats.box, stats.prism, stats.hidden = nMesh, nBox, nPrism, nHidden
 	updateSounds(dt)
+	skid.update(dt)
 
 	updateHandovers(vehicles)
 	hybridContacts(vehicles)
@@ -1386,6 +1484,7 @@ local function update(dt, cameraPos, activeVehID)
 		decide(vehicles, activeVehID)
 		updateColliders(vehicles)
 		assignSounds(vehicles)
+		skid.assign(vehicles)
 		if MPProxyMeshGE then
 			MPProxyMeshGE.decide(vehicles, refPos)
 			for _, v in pairs(vehicles) do -- use the real mesh bounds for the box fallback once known
@@ -1613,6 +1712,7 @@ end
 local function reset()
 	removeAllColliders()
 	stopAllSounds()
+	skid.stopAll()
 	if MPProxyMeshGE then MPProxyMeshGE.reset() end
 	nextSpawnAllowed, nextDespawnAllowed, nextColliderSpawnAllowed = 0, 0, 0
 end
@@ -1680,7 +1780,7 @@ M.flushReplay         = flushReplay
 M.onVehicleResetWhileHeld = onVehicleResetWhileHeld
 M.finishHandover      = finishHandover
 M.onExtensionLoaded   = onExtensionLoaded
-M.onExtensionUnloaded = function() stopAllSounds() pcall(removeTabHook) end
+M.onExtensionUnloaded = function() stopAllSounds() skid.stopAll() pcall(removeTabHook) end
 M.isTabFocused        = function() return tab.v ~= nil end
 M.getSoundPool        = function() return soundPool end
 M.onInit = function() setExtensionUnloadMode(M, "manual") end

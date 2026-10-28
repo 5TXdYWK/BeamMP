@@ -86,6 +86,8 @@
   "proxyComRideHeight"          : [ "local", true ],
   "proxyLiveries"               : [ "local", true ],
   "proxyWheelDetails"           : [ "local", false ],
+  "proxyTireScreech"            : [ "local", false ],
+  "proxyTireScreechDistance"    : [ "local", 50 ],
   "proxyMeshRealWheelsMax"      : [ "local", 12 ],
   "showPlayerIDs"               : [ "cloud", true  ],
   "licensePlateUsesPlayerName"  : [ "cloud", true ],

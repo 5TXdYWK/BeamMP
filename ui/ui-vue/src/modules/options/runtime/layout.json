@@ -6234,6 +6234,60 @@
                 "tooltip",
                 "setting"
               ]
+            },
+            {
+              "version": "0.38",
+              "label": "ui.options.beammp.proxyTireScreech",
+              "tooltip": "ui.options.beammp.proxyTireScreech.tooltip",
+              "setting": "proxyTireScreech",
+              "interactive": true,
+              "condition_always_off": false,
+              "condition_not_shipping": false,
+              "condition_simplemenu": "",
+              "condition_visible": "beammpEnableProxyVehicles",
+              "condition_enabled": "beammpEnableProxyVehicles",
+              "itemType": "checkbox",
+              "component": "OptionsCheckbox",
+              "separateLabel": true,
+              "lua": "",
+              "luaOff": "",
+              "valueOn": true,
+              "valueOff": false,
+              "search": [
+                "label",
+                "caption",
+                "tooltip",
+                "setting"
+              ]
+            },
+            {
+              "version": "0.38",
+              "label": "ui.options.beammp.proxyTireScreechDistance",
+              "tooltip": "ui.options.beammp.proxyTireScreechDistance.tooltip",
+              "setting": "proxyTireScreechDistance",
+              "interactive": true,
+              "condition_always_off": false,
+              "condition_not_shipping": false,
+              "condition_simplemenu": "",
+              "condition_visible": "beammpProxyTireScreech",
+              "condition_enabled": "beammpProxyTireScreech",
+              "itemType": "slider",
+              "component": "BngSlider",
+              "separateLabel": true,
+              "min": 10,
+              "max": 150,
+              "step": 5,
+              "compact": false,
+              "valueMultiplier": 1,
+              "unit": "m",
+              "lua": "",
+              "basic_interaction": false,
+              "search": [
+                "label",
+                "caption",
+                "tooltip",
+                "setting"
+              ]
             }
           ]
         },
