@@ -82,6 +82,7 @@
   "proxyCleanupOnReload"        : [ "local", true ],
   "proxySkipStaticUpdates"      : [ "local", true ],
   "proxyEngineAutoShift"        : [ "local", true ],
+  "proxyTabCycle"               : [ "local", true ],
   "proxyMeshRealWheelsMax"      : [ "local", 12 ],
   "showPlayerIDs"               : [ "cloud", true  ],
   "licensePlateUsesPlayerName"  : [ "cloud", true ],

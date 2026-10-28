@@ -127,6 +127,8 @@
     "ui.options.beammp.proxySkipStaticUpdates.tooltip": "Proxy body and wheel objects that did not move since the last frame are not moved again (saves engine calls for parked cars).",
     "ui.options.beammp.proxyEngineAutoShift": "Automatic gear shifts",
     "ui.options.beammp.proxyEngineAutoShift.tooltip": "For proxies driving in an automatic gear (D), the engine sound shifts through the gears with a short shift time and kickdown, instead of jumping to the gear that fits the speed.",
+    "ui.options.beammp.proxyTabCycle": "Tab cycles through proxies",
+    "ui.options.beammp.proxyTabCycle.tooltip": "After your real vehicles, Tab moves the camera to each proxy vehicle (orbit it with the usual camera controls) and spawns it for real in the background, then enters it once ready.",
     "ui.options.beammp.proxyGroup.general": "General",
     "ui.options.beammp.proxyGroup.realVehicles": "Real vehicles & spawning",
     "ui.options.beammp.proxyGroup.meshes": "Meshes & detail",

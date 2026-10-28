@@ -79,6 +79,7 @@ local function readSettings()
 	cfg.autoShift = settings.getValue("proxyEngineAutoShift", true) ~= false
 	cfg.engineSoundDist = math.max(5, tonumber(settings.getValue("proxyEngineSoundDistance", 60)) or 60)
 	cfg.engineSoundMax = math.min(16, math.max(0, math.floor(tonumber(settings.getValue("proxyEngineSoundMax", 6)) or 6)))
+	cfg.tabCycle = settings.getValue("proxyTabCycle", true) ~= false
 	cfg.maxPredict = math.min(math.max(tonumber(settings.getValue("proxyMaxPrediction", 0.3)) or 0.3, 0.05), 2)
 end
 
@@ -1320,6 +1321,8 @@ local function resetPerf()
 	stats.frames, stats.totalMs, stats.maxMs, stats.decideMs, stats.decides = 0, 0, 0, 0, 0
 end
 
+local tabUpdate -- Tab cycling onto proxies, defined below requestReal
+
 local function update(dt, cameraPos, activeVehID)
 	local perfTimer = getPerfTimer()
 	if perfTimer then perfTimer:stopAndReset() end
@@ -1397,6 +1400,7 @@ local function update(dt, cameraPos, activeVehID)
 			end
 		end
 	end
+	tabUpdate(dt)
 	if perfTimer then
 		local ms = perfTimer:stop()
 		stats.frames = stats.frames + 1
@@ -1449,6 +1453,138 @@ local function requestReal(vehicle)
 	return false
 end
 
+
+-- Tab cycling: after the real vehicles, Tab walks through the proxies. The camera orbits the proxy (free camera
+-- placed every frame, driven by the same MoveManager yaw/pitch/zoom values the orbit camera mode reads) while a
+-- real spawn is requested through requestReal, then we enter the real vehicle once it is ready.
+local tab = { v = nil, home = nil, yaw = 0, pitch = 12, dist = 8, target = vec3(), seeded = false }
+local origSwitchCycle = nil
+
+local function tabProxyList(vehicles)
+	local list = {}
+	for _, v in pairs(vehicles) do
+		local p = v.proxy
+		if ((v.isProxy and not v.isSpawned) or v.hybridPaused) and not v.isLocal and not v.isDeleted and p and p.hasData then
+			list[#list + 1] = v
+		end
+	end
+	table.sort(list, function(a, b) return (tonumber(a.serverVehicleID) or 0) < (tonumber(b.serverVehicleID) or 0) end)
+	return list
+end
+
+local function tabRealList()
+	local order = {}
+	for i = 0, be:getObjectCount() - 1 do
+		local veh = be:getObject(i)
+		if veh and veh:getJBeamFilename() ~= "unicycle" and veh.playerUsable ~= false and veh:getActive()
+			and not colliders[veh:getId()] then
+			order[#order + 1] = veh:getId()
+		end
+	end
+	return order
+end
+
+local function tabStop(enterId)
+	local hadFocus = tab.v ~= nil
+	tab.v = nil
+	if not hadFocus then return end
+	if commands and commands.setGameCamera then commands.setGameCamera(0) end
+	local veh = enterId and getObjectByID(enterId)
+	if veh then
+		be:enterVehicle(0, veh)
+		extensions.hook('trackNewVeh')
+		extensions.hook("onVehicleSwitchPerformendByUser")
+	end
+end
+
+local function tabFocus(v)
+	if not tab.v then tab.home = be:getPlayerVehicleID(0) end
+	tab.v = v
+	tab.seeded = false
+	tab.target:set(v.proxy.rpos)
+	local fwd = v.proxy.rrot * vec3(0, -1, 0) -- BeamNG vehicles face -Y
+	tab.yaw = math.deg(math.atan2(fwd.x, fwd.y))
+	if commands and commands.setFreeCamera and not commands.isFreeCamera(0) then commands.setFreeCamera(0) end
+	requestReal(v)
+	log('I', 'MPProxyGE', "Tab: camera on proxy " .. tostring(v.serverVehicleID) .. ", real spawn requested")
+end
+
+local function switchCycle(player, dir)
+	if not (cfg.enabled and cfg.tabCycle) or (player or 0) ~= 0 or not MPVehicleGE then
+		return origSwitchCycle(player, dir)
+	end
+	local reals, proxies = tabRealList(), tabProxyList(MPVehicleGE.getVehicles())
+	if #proxies == 0 then tabStop(nil) return origSwitchCycle(player, dir) end
+	local n = #reals + #proxies
+	local cur
+	if tab.v then
+		for i, v in ipairs(proxies) do if v == tab.v then cur = #reals + i end end
+	else
+		local id = be:getPlayerVehicleID(0)
+		for i, rid in ipairs(reals) do if rid == id then cur = i end end
+	end
+	cur = cur or (dir > 0 and 0 or 1)
+	local nextI = ((cur - 1 + dir) % n) + 1
+	if nextI <= #reals then
+		if tab.v then tabStop(reals[nextI]) else return origSwitchCycle(player, dir) end
+	else
+		tabFocus(proxies[nextI - #reals])
+	end
+end
+
+local function installTabHook()
+	local vs = extensions.core_input_vehicleSwitching
+	if not vs then
+		extensions.load("core_input_vehicleSwitching")
+		vs = extensions.core_input_vehicleSwitching
+	end
+	if vs and vs.switchCycleVehicle ~= switchCycle then
+		origSwitchCycle = vs.switchCycleVehicle
+		vs.switchCycleVehicle = switchCycle
+	end
+end
+
+local function removeTabHook()
+	local vs = extensions.core_input_vehicleSwitching
+	if vs and origSwitchCycle and vs.switchCycleVehicle == switchCycle then vs.switchCycleVehicle = origSwitchCycle end
+	tabStop(nil)
+end
+
+local camOff, camLook = vec3(), quat()
+tabUpdate = function(dt)
+	local v = tab.v
+	if not v then return end
+	if v.isDeleted or not v.proxy then
+		log('I', 'MPProxyGE', "Tab: focused proxy went away, back to own vehicle")
+		return tabStop(tab.home)
+	end
+	if v.isSpawned and not v.proxyHandover and not v.hybridPaused and v.gameVehicleID and getObjectByID(v.gameVehicleID) then
+		log('I', 'MPProxyGE', "Tab: real vehicle ready, entering " .. tostring(v.serverVehicleID))
+		return tabStop(v.gameVehicleID)
+	end
+	if tab.seeded and not commands.isFreeCamera(0) then tab.v = nil return end -- user changed camera, let go
+	tab.seeded = true
+	if not v.proxyForceReal and v.isProxy and not v.isSpawned then requestReal(v) end
+	-- same inputs as cameraModes/orbit.lua (MoveManager yaw/pitch relative and axis values, zoomIn/zoomOut)
+	local mm = MoveManager
+	if mm then
+		local dtf = dt * 1000
+		local maxRotDt = 1000 * dt
+		tab.yaw = tab.yaw - (clamp(mm.yawRelative * 10, -maxRotDt, maxRotDt) + 0.1 * (mm.yawRight - mm.yawLeft) * dtf)
+		tab.pitch = clamp(tab.pitch - (clamp(mm.pitchRelative * -10, -maxRotDt, maxRotDt) + 0.1 * (mm.pitchDown - mm.pitchUp) * dtf), -85, 85)
+		tab.dist = clamp(tab.dist + (mm.zoomIn - mm.zoomOut) * dtf * 0.01, 2.5, 60)
+	end
+	local k = 1 - math.exp(-dt * 12)
+	tab.target:setLerp(tab.target, v.proxy.rpos, k)
+	local yr, pr = math.rad(tab.yaw), math.rad(tab.pitch)
+	camOff:set(-math.sin(yr) * math.cos(pr), -math.cos(yr) * math.cos(pr), math.sin(pr))
+	local h = (v.proxy.H or 1.5) * 0.5
+	local tx, ty, tz = tab.target.x, tab.target.y, tab.target.z + h
+	camOff:setScaled(tab.dist)
+	camLook:setFromDir(vec3(-camOff.x, -camOff.y, -camOff.z), vec3(0, 0, 1))
+	core_camera.setPosRot(0, tx + camOff.x, ty + camOff.y, tz + camOff.z, camLook.x, camLook.y, camLook.z, camLook.w)
+end
+
 --- Our own ping in milliseconds (positionGE.setPing), used to map the senders' clocks onto ours.
 local function setOwnPing(ping)
 	local s = (tonumber(ping) or 0) / 1000
@@ -1498,6 +1634,8 @@ end
 
 local function onExtensionLoaded()
 	readSettings()
+	local okHook, errHook = pcall(installTabHook)
+	if not okHook then log('W', 'MPProxyGE', "Tab cycle hook failed: " .. tostring(errHook)) end
 	if settings.getValue("proxyCleanupOnReload", true) ~= false then
 		local ok, err = pcall(removeLeftovers)
 		if not ok then log('W', 'MPProxyGE', "Leftover cleanup failed: " .. tostring(err)) end
@@ -1531,7 +1669,8 @@ M.flushReplay         = flushReplay
 M.onVehicleResetWhileHeld = onVehicleResetWhileHeld
 M.finishHandover      = finishHandover
 M.onExtensionLoaded   = onExtensionLoaded
-M.onExtensionUnloaded = function() stopAllSounds() end
+M.onExtensionUnloaded = function() stopAllSounds() pcall(removeTabHook) end
+M.isTabFocused        = function() return tab.v ~= nil end
 M.getSoundPool        = function() return soundPool end
 M.onInit = function() setExtensionUnloadMode(M, "manual") end
 
