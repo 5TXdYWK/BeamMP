@@ -36,6 +36,7 @@ local cfg = {
 	hybridMaxAwake = 6,
 	maxPredict = 0.3,
 	farShape = true,
+	queueByDistance = true,
 	lodShape = 600, -- low poly car shape below, a box in the paint colour above (LOD tiers after the mesh ones)
 }
 
@@ -69,6 +70,7 @@ local function readSettings()
 	cfg.hybridWakeDist = math.max(10, tonumber(settings.getValue("proxyHybridWakeDistance", 80)) or 80)
 	cfg.hybridMaxAwake = math.max(0, math.floor(tonumber(settings.getValue("proxyHybridMaxAwake", 6)) or 6))
 	cfg.farShape = settings.getValue("proxyFarShape", true) ~= false
+	cfg.queueByDistance = settings.getValue("proxyQueueByDistance", true) ~= false
 	cfg.lodShape = math.max(0, tonumber(settings.getValue("proxyLodShapeDistance", 600)) or 600)
 	cfg.maxPredict = math.min(math.max(tonumber(settings.getValue("proxyMaxPrediction", 0.3)) or 0.3, 0.05), 2)
 end
@@ -949,6 +951,49 @@ local function isHybridPaused(vehicle)
 	return vehicle ~= nil and vehicle.hybridPaused == true
 end
 
+-- ============= DISTANCE AWARE SPAWN QUEUE =============
+-- A real spawn waiting in BeamMP's spawn queue (enableSpawnQueue) for a vehicle that drove out of range is
+-- dropped again, the vehicle stays a proxy (its latest config stays in players_vehicle_configs, so the proxy mesh
+-- follows edits). When it comes back into range the spawn is queued again from that latest config, or spawned
+-- right away if the player does not use the queue (MPVehicleGE.promoteToReal decides that).
+local QUEUE_DROP_MARGIN = 60 -- m beyond the spawn range before a queued spawn is dropped
+
+local function queueRanges()
+	local spawnRange = cfg.spawnDist
+	if hybridActive then spawnRange = math.max(spawnRange, cfg.hybridWakeDist) end
+	return spawnRange, math.max(cfg.despawnDist, spawnRange + QUEUE_DROP_MARGIN)
+end
+
+local function updateQueuedSpawns(vehicles)
+	if not cfg.enabled or not cfg.queueByDistance then return end
+	local spawnRange, dropRange = queueRanges()
+	for sid, v in pairs(vehicles) do
+		if not v.isLocal and v.isProxy and not v.isSpawned and v.proxy and v.proxy.hasData then
+			local d = refPos:distance(v.proxy.rpos)
+			if v.spawnQueue and not v.proxyForceReal and d > dropRange then
+				if MPVehicleGE.demoteToProxy(sid) then -- drops the queued event and updates the queue counter
+					v.proxyQueueDropped = true
+					v.proxyHandover = nil
+					if MPProxyMeshGE then MPProxyMeshGE.release(v.proxy) end -- re-attached by the mesh LOD pass
+					log('I', 'MPProxyGE', string.format("Dropped queued spawn of %s, it is %.0f m away", sid, d))
+				end
+			elseif v.proxyQueueDropped and not v.spawnQueue and d < spawnRange and MPVehicleGE.hasSpawnData(sid) then
+				local queued = settings.getValue("enableSpawnQueue")
+				if queued or clock >= nextSpawnAllowed then -- direct spawns stutter: same rate limit as the others
+					if not queued then nextSpawnAllowed = clock + cfg.spawnInterval end
+					v.proxyQueueDropped = nil
+					startHandover(v)
+					if MPVehicleGE.promoteToReal(sid) then
+						log('I', 'MPProxyGE', string.format("%s is back in range (%.0f m), spawn %s again", sid, d, queued and "queued" or "started"))
+					else
+						finishHandover(v, "spawn not started")
+					end
+				end
+			end
+		end
+	end
+end
+
 -- ============= SWAP MANAGER =============
 local function isEligibleForReal(v)
 	return v.isProxy and not v.isSpawned and not v.isDeleted and not v.isIllegal and not v.spawnQueue
@@ -983,7 +1028,9 @@ local function decide(vehicles, activeVehID)
 				end
 			elseif isEligibleForReal(v) and cooled then
 				-- only explicit requests (spectate / requestRealVehicle) unless distance based real spawns are enabled
-				local wanted = (not cfg.enabled) or hybridActive or v.proxyForceReal or (cfg.autoReal and d < cfg.spawnDist)
+				-- hybrid mode spawns everything in range (paused when not near), dropped queue entries come back by distance
+				local wanted = (not cfg.enabled) or v.proxyForceReal or (hybridActive and d < queueRanges())
+					or (cfg.autoReal and d < cfg.spawnDist)
 				local dd = v.proxyForceReal and -1 or d
 				if wanted and dd < nearestCandD then nearestCand, nearestCandD = v, dd end
 			end
@@ -1103,6 +1150,7 @@ local function update(dt, cameraPos, activeVehID)
 	if didDecide then
 		decisionTimer = DECISION_INTERVAL
 		updateHybrid(vehicles, activeVehID)
+		updateQueuedSpawns(vehicles)
 		decide(vehicles, activeVehID)
 		updateColliders(vehicles)
 		if MPProxyMeshGE then

@@ -70,6 +70,7 @@
   "proxyLodPartsDistance"       : [ "local", 60 ],
   "proxyLodShellDistance"       : [ "local", 150 ],
   "proxyLodShapeDistance"       : [ "local", 600 ],
+  "proxyQueueByDistance"        : [ "local", true ],
   "showPlayerIDs"               : [ "cloud", true  ],
   "licensePlateUsesPlayerName"  : [ "cloud", true ],
   "protectConfigFromClone"      : [ "cloud", false ],

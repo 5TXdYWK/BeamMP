@@ -1829,7 +1829,10 @@ local function demoteToProxy(serverVehicleID)
 	end
 	local current = getPlayerVehicle(0)
 	if current and current:getID() == gameVehicleID then return false end -- never pull the vehicle the camera is in
-	if vehicle.editQueue then vehicle.editQueue = nil end -- already merged into players_vehicle_configs
+	if vehicle.editQueue then -- already merged into players_vehicle_configs, used when it is spawned again
+		vehicle.editQueue = nil
+		UI.updateQueue(getQueueCounts())
+	end
 	vehicle.proxyHandover = nil
 	if MPProxyGE then MPProxyGE.seedFromVehicle(vehicle, veh) end
 	proxyDemoting[gameVehicleID] = true

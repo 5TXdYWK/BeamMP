@@ -105,6 +105,8 @@
     "ui.options.beammp.proxyLodShellDistance.tooltip": "Up to this distance proxies show only their biggest body panels. Further out they are drawn as a low poly car shape. Also capped by the proxy mesh distance.",
     "ui.options.beammp.proxyLodShapeDistance": "Proxy LOD: shape distance",
     "ui.options.beammp.proxyLodShapeDistance.tooltip": "Up to this distance proxies without a mesh are drawn as a low poly car shape, further out as a box in their paint colour.",
+    "ui.options.beammp.proxyQueueByDistance": "Distance aware spawn queue",
+    "ui.options.beammp.proxyQueueByDistance.tooltip": "A queued real spawn of a vehicle that drives out of range is dropped (it stays a proxy) and queued again from its latest config when it comes back. Without the spawn queue it is spawned straight away when back in range.",
     "ui.options.beammp.enableBlobs": "Enable blobs for unspawned vehicles",
     "ui.options.beammp.enableBlobs.tooltip": "Unspawned vehicles will appear as colored spheres (blobs)",
     "ui.options.beammp.showSpectators": "Show spectators' nametag under vehicle nametags",
