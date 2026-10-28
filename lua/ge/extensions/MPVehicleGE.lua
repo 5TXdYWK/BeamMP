@@ -2895,8 +2895,14 @@ local function onPreRender(dt)
 				dir:set(veh:getDirectionVectorXYZ())
 				dirUp:set(veh:getDirectionVectorUpXYZ())
 				v.rotation:setFromDir(dir,dirUp)
-			elseif v.isProxy and v.proxy then -- proxy, position is predicted by MPProxyGE, nametag goes above the box
-				heightOffset = v.proxy.H - v.proxy.cogH + 0.3
+			elseif v.isProxy and v.proxy then -- proxy (mesh, box, prism or person), use the drawn position and height
+				local p = v.proxy
+				if not p.hasData then goto skip_vehicle end -- nothing drawn yet, the position would be the map origin
+				v.position:set(p.rpos)
+				local top = p.H or 1.5
+				if p.isPerson then top = 1.85
+				elseif p.meshObjects and p.meshShape and p.meshShape.maxZ then top = p.meshShape.maxZ - (p.meshShape.groundZ or 0) end
+				heightOffset = top - (p.cogH or 0.5) + 0.3
 			end
 
 			if not v.position then goto skip_vehicle end -- return if no position has been received yet
