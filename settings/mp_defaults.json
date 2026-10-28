@@ -84,6 +84,7 @@
   "proxyEngineAutoShift"        : [ "local", true ],
   "proxyTabCycle"               : [ "local", true ],
   "proxyComRideHeight"          : [ "local", true ],
+  "proxyLiveries"               : [ "local", true ],
   "proxyMeshRealWheelsMax"      : [ "local", 12 ],
   "showPlayerIDs"               : [ "cloud", true  ],
   "licensePlateUsesPlayerName"  : [ "cloud", true ],

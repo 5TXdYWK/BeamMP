@@ -5877,6 +5877,31 @@
                 "tooltip",
                 "setting"
               ]
+            },
+            {
+              "version": "0.38",
+              "label": "ui.options.beammp.proxyLiveries",
+              "tooltip": "ui.options.beammp.proxyLiveries.tooltip",
+              "setting": "proxyLiveries",
+              "interactive": true,
+              "condition_always_off": false,
+              "condition_not_shipping": false,
+              "condition_simplemenu": "",
+              "condition_visible": "beammpProxyMesh",
+              "condition_enabled": "beammpProxyMesh",
+              "itemType": "checkbox",
+              "component": "OptionsCheckbox",
+              "separateLabel": true,
+              "lua": "",
+              "luaOff": "",
+              "valueOn": true,
+              "valueOff": false,
+              "search": [
+                "label",
+                "caption",
+                "tooltip",
+                "setting"
+              ]
             }
           ]
         },

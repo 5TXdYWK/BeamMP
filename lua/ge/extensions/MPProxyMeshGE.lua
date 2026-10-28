@@ -53,6 +53,7 @@ local function readSettings()
 	cfg.maxProxies = math.max(0, math.floor(tonumber(settings.getValue("proxyMaxMeshProxies", 48)) or 48))
 	cfg.wheels = settings.getValue("proxyMeshWheels", true) ~= false
 	cfg.realWheels = settings.getValue("proxyMeshRealWheels", true) ~= false
+	cfg.liveries = settings.getValue("proxyLiveries", true) ~= false
 	cfg.comRide = settings.getValue("proxyComRideHeight", true) ~= false
 	cfg.metallicPaint = settings.getValue("proxyMetallicPaint", true) ~= false
 	cfg.skipStatic = settings.getValue("proxySkipStaticUpdates", true) ~= false
@@ -215,7 +216,7 @@ end
 -- that also have a wheel section (hubs, wheels, suspension), body node lists are big and not needed
 -- node: default nodeWeight of the jbeam loader (lua/common/jbeam/loader.lua); wheel: pressure wheel nodes are
 -- generated at spawn, a rough wheel + tire mass instead
-local MASS = { node = 25, wheel = 30 }
+local MASS = { node = 25, wheel = 30, skinKeys = { slotType = true, skinType = true, skinName = true, globalSkin = true } } -- skinKeys: livery fields
 local WHEEL_KEYS = { slots = true, slots2 = true, pressureWheels = true, hubWheels = true, variables = true, nodes = true }
 
 local function extractFlexbodies(text, out, sections, wheelSecs)
@@ -237,7 +238,15 @@ local function extractFlexbodies(text, out, sections, wheelSecs)
 				if not q then return false end
 				if byte(text, q) == 92 then e = q + 2 else e = q break end
 			end
-			lastString, lastDepth, lastEnd = sub(text, s + 1, e - 1), depth, e
+			local str = sub(text, s + 1, e - 1)
+			-- livery: string fields of the part ("slotType": "paint_design", "globalSkin": "police", ...)
+			if depth == 2 and partName and wheelSecs and lastString and lastDepth == 2 and MASS.skinKeys[lastString]
+				and match(sub(text, lastEnd + 1, s - 1), "^%s*:%s*$") then
+				partSecs = partSecs or {}
+				partSecs.skin = partSecs.skin or {}
+				partSecs.skin[lastString] = str
+			end
+			lastString, lastDepth, lastEnd = str, depth, e
 			pos = e + 1
 		elseif c == 47 then -- comment
 			local nx = byte(text, s + 1)
@@ -291,7 +300,7 @@ end
 local ENGINE_FIELDS = { idleRPM = true, maxRPM = true, revLimiterRPM = true, soundConfig = true, soundConfigExhaust = true, requiredEnergyType = true }
 local SOUND_FIELDS = { sampleName = true, sampleFolder = true, mainGain = true, onLoadGain = true, offLoadGain = true,
 	intakeMuffling = true, exhaustAudioMufflingBaseCoef = true }
-local ENGINE_INDEX_VERSION = 5 -- part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists, 5: node mass buckets)
+local ENGINE_INDEX_VERSION = 6 -- 6: livery fields; part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists, 5: node mass buckets)
 local BODY_VERSION = 2 -- per config meta written before this is not reused as is (2: wheel / tire / brake meshes left out of the body)
 
 local function keepFields(decoded, fields)
@@ -347,6 +356,7 @@ local function compactWheelPart(secs, filename)
 		return ok and type(d) == "table" and d or nil
 	end
 	local out, any = {}, false
+	if type(secs.skin) == "table" and (secs.skin.skinName or secs.skin.globalSkin) then out.skin = secs.skin any = true end
 	local is2 = secs.slots2 ~= nil
 	local sl = dec(is2 and "slots2" or "slots")
 	if sl then
@@ -583,7 +593,7 @@ end
 -- (x away from the center line: posX + sign(posX) * x, lua/common/jbeam/utils.lua), pressureWheels options apply
 -- to the wheel rows after them, and each wheel is placed like lua/common/jbeam/sections/wheelTypes/pressureWheels.lua:
 -- midpoint of node1/node2 (or offsetFromNode), moved by wheelOffset along the axis, tireWidth wide, radius.
-local WHEEL_VERSION = 4 -- 4: centre of mass estimate; 3: tire flag per mesh; 2: named fields (mixed tables did not survive the json round trip), rim / tire meshes
+local WHEEL_VERSION = 5 -- 5: livery (skin) name; 4: 4: centre of mass estimate; 3: tire flag per mesh; 2: named fields (mixed tables did not survive the json round trip), rim / tire meshes
 local MAX_WHEEL_MESHES = 6 -- per wheel
 
 -- jbeam values: numbers, "$var", or "$=expression" (arithmetic, comparisons, and/or/not, case(c1, v1, ..., default),
@@ -661,6 +671,17 @@ local function resolveWheels(job)
 				else nodes[r[1]] = { r[2], r[3], r[4], cur } end
 			end
 		end
+		if d.skin then
+			-- same rule as lua/common/jbeam/sections/licenseplatesSkins.lua: a skin_* or paint_design slot part sets
+			-- the vehicle skin "<skinType or slotType>.<skinName or globalSkin>", paint_design maps to ""
+			local st = d.skin.slotType or ""
+			if string.find(st, "skin_", 1, true) or st == "paint_design" then
+				local slot = (d.skin.skinType and d.skin.skinType ~= "") and d.skin.skinType or st
+				if slot == "paint_design" then slot = "" end
+				local nm = d.skin.skinName or d.skin.globalSkin
+				if nm and nm ~= "" and string.sub(nm, 1, 1) ~= "$" then job.skin = slot .. "." .. nm end
+			end
+		end
 		if d.mass then for _, g in ipairs(d.mass) do mass[#mass + 1] = { g, off } end end
 		if d.pw then for _, it in ipairs(d.pw) do items[#items + 1] = it end end
 		if d.fb then for _, fb in ipairs(d.fb) do flex[#flex + 1] = { fb, off } end end
@@ -734,6 +755,7 @@ local function resolveWheels(job)
 	end
 	job.com = mw > 0 and { mx / mw, my / mw, mz / mw, mw } or nil
 	if job.com then
+		if job.skin then log('I', 'MPProxyMeshGE', string.format("Proxy livery for %s: skin %s", tostring(job.model), job.skin)) end
 		log('I', 'MPProxyMeshGE', string.format("Proxy centre of mass for %s: %.2f %.2f %.2f m, %.0f kg node mass", tostring(job.model), job.com[1], job.com[2], job.com[3], mw))
 	end
 	-- rim / tire / hubcap meshes: flexbody pos moved like the part's nodes (same slot nodeOffset), stored relative
@@ -1433,6 +1455,7 @@ local function runJob(job)
 				local w, why = resolveWheels(job)
 				meta.wheels = checkWheels(w, shape) or false
 				meta.com = job.com or false
+				meta.skin = job.skin or false
 				meta.wheelV = WHEEL_VERSION
 				logWheels(job, meta.wheels or nil, why)
 				jsonWriteFile(metaFile, meta, false)
@@ -1441,6 +1464,7 @@ local function runJob(job)
 			end
 			shape.wheels = meta.wheels or nil
 			shape.com = meta.com or nil
+			shape.skin = meta.skin or nil
 			setPhase("materials")
 			loadModelMaterials(job.model)
 			ensureMaterials(meta.materials)
@@ -1485,10 +1509,10 @@ local function runJob(job)
 			local w, why = resolveWheels(job)
 			shape.wheels = checkWheels(w, shape)
 			logWheels(job, shape.wheels, why)
-			shape.com = job.com
-			mm.wheels, mm.wheelV, mm.bodyV, mm.com = shape.wheels or false, WHEEL_VERSION, BODY_VERSION, job.com or false
+			shape.com, shape.skin = job.com, job.skin
+			mm.wheels, mm.wheelV, mm.bodyV, mm.com, mm.skin = shape.wheels or false, WHEEL_VERSION, BODY_VERSION, job.com or false, job.skin or false
 			jsonWriteFile(metaFile, mm, false)
-			mm.sound, mm.wheels, mm.wheelV, mm.bodyV, mm.com = nil, nil, nil, nil, nil
+			mm.sound, mm.wheels, mm.wheelV, mm.bodyV, mm.com, mm.skin = nil, nil, nil, nil, nil, nil
 			shape.paths = mm.paths
 			shape.tiers = mm.tiers
 			shape.fromCache = true
@@ -1574,9 +1598,9 @@ local function runJob(job)
 	finishBBox(shape, bbox, job.model)
 	local wl, why = resolveWheels(job)
 	shape.wheels = checkWheels(wl, shape)
-	shape.com = job.com
+	shape.com, shape.skin = job.com, job.skin
 	logWheels(job, shape.wheels, why)
-	metaData.com = job.com or false
+	metaData.com, metaData.skin = job.com or false, job.skin or false
 	metaData.sound, metaData.wheels, metaData.wheelV, metaData.bodyV = shape.sound, shape.wheels or false, WHEEL_VERSION, BODY_VERSION
 	jsonWriteFile(metaFile, metaData, false)
 	shape.paths = paths
@@ -1804,6 +1828,9 @@ local function attach(p, shape, tier)
 				if cfg.metallicPaint then -- same field and format the game sets on vehicles (core/vehicle/partmgmt.lua)
 					for i = 1, 3 do obj:setField('metallicPaintData', i - 1, metallicString(paints[i] or paints[1])) end
 				end
+				-- livery: the TSStatic skin field takes the same "<slot>.<name>" string as vehicleObj:setSkin; always set,
+				-- pooled objects may carry an earlier proxy's skin
+				obj:setField('skin', 0, (cfg.liveries and shape.skin) or "")
 				obj.hidden = false
 				p.meshObjects[#p.meshObjects + 1] = { path = path, id = id, obj = obj }
 			end

@@ -131,6 +131,8 @@
     "ui.options.beammp.proxyTabCycle.tooltip": "After your real vehicles, Tab moves the camera to each proxy vehicle (orbit it with the usual camera controls) and spawns it for real in the background, then enters it once ready.",
     "ui.options.beammp.proxyComRideHeight": "Ride height from the centre of mass",
     "ui.options.beammp.proxyComRideHeight.tooltip": "Places the proxy mesh using the vehicle's centre of mass worked out from its jbeam node weights, instead of a guess from the body bounds. Fixes proxies that float or sink.",
+    "ui.options.beammp.proxyLiveries": "Show liveries",
+    "ui.options.beammp.proxyLiveries.tooltip": "Applies the vehicle's livery (skin) from its config to the proxy mesh, like police or taxi designs.",
     "ui.options.beammp.proxyGroup.general": "General",
     "ui.options.beammp.proxyGroup.realVehicles": "Real vehicles & spawning",
     "ui.options.beammp.proxyGroup.meshes": "Meshes & detail",
