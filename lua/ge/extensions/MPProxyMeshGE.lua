@@ -23,6 +23,7 @@ local M = {}
 
 local D = require("beammp.proxy.dae")       -- .dae streaming, filtering, merging (pure, budget checks via setBudgetCheck)
 local J = require("beammp.proxy.jbeamText")  -- jbeam text scanning and value expressions (pure)
+local MM = require("beammp.proxy.matMerge")  -- one mesh per material in each body piece (fewer draw calls)
 
 setmetatable(_G,{}) -- temporarily disable global notifications
 
@@ -177,6 +178,7 @@ local function checkBudget()
 	if budgetTimer and budgetTimer:stop() > frameBudget then coroutine.yield() end
 end
 D.setBudgetCheck(checkBudget)
+MM.setBudgetCheck(checkBudget)
 J.setBudgetCheck(checkBudget)
 
 -- ============= BUILD STEPS (inside the coroutine) =============
@@ -202,7 +204,7 @@ local function modelSignature(model)
 end
 
 local ENGINE_INDEX_VERSION = 7 -- 7: hub / brake disc flexbodies; 6: livery fields; part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists, 5: node mass buckets)
-local BODY_VERSION = 3 -- per config meta and mesh set meta written before this are not reused (3: parts under MIN_FAR_PART left out of the far tiers; 2: wheel / tire / brake meshes left out of the body)
+local BODY_VERSION = 4 -- per config meta, mesh set meta and piece names (4: meshes merged by material; 3: parts under MIN_FAR_PART left out of the far tiers; 2: wheel / tire / brake meshes left out of the body)
 
 local engineIndex = {} -- [model] = engine sections by part (see addEngineSections)
 
@@ -947,7 +949,7 @@ local function runJob(job)
 			table.sort(fl)
 			local desc = {}
 			for _, f in ipairs(fl) do table.sort(files[f]) desc[#desc + 1] = f .. ":" .. table.concat(files[f], ",") end
-			local path = CACHE_DIR .. job.model .. "_" .. CACHE_VERSION .. "_p" .. hashString(table.concat(desc, ";")) .. ".dae"
+			local path = CACHE_DIR .. job.model .. "_" .. CACHE_VERSION .. "_p" .. hashString(BODY_VERSION .. ";" .. table.concat(desc, ";")) .. ".dae"
 			if not pieces[path] then pieces[path] = { files = files, order = fl } paths[#paths + 1] = path end
 			list[#list + 1] = path
 		end
@@ -981,6 +983,7 @@ local function runJob(job)
 	end
 	-- build the pieces not on disk yet; their source files are scanned once (again, when the info came from disk)
 	local need, built, reused = {}, 0, 0
+	local meshesBefore, meshesAfter = 0, 0 -- meshes of the pieces built now, before / after the material merge
 	for _, path in ipairs(paths) do
 		if FS:fileExists(path) then reused = reused + 1
 		else for f, names in pairs(pieces[path].files) do need[f] = need[f] or {} for _, nm in ipairs(names) do need[f][nm] = true end end end
@@ -1017,7 +1020,11 @@ local function runJob(job)
 			end
 			if ok and #lists > 0 then
 				setPhase("merge")
-				local text = D.mergeDae(lists)
+				local merged, nb, na = MM.mergeByMaterial(lists)
+				meshesBefore, meshesAfter = meshesBefore + nb, meshesAfter + na
+				lists = nil
+				local text = D.mergeDae(merged)
+				merged = nil
 				coroutine.yield()
 				setPhase("write") -- streamed in slices, budget checks between them
 				if D.writePieces(path, text) then built = built + 1 else ok = false end
@@ -1032,8 +1039,8 @@ local function runJob(job)
 		end
 	end
 	parsed = nil
-	log('I', 'MPProxyMeshGE', string.format("Proxy mesh tiers for %s: full %s, parts %s, shell %s; %d pieces, %d built, %d shared from disk, %d of %d mesh facts scanned now",
-		job.model, tierInfo[1], tierInfo[2], tierInfo[3], #paths, built, reused, nUnknown, count))
+	log('I', 'MPProxyMeshGE', string.format("Proxy mesh tiers for %s: full %s, parts %s, shell %s; %d pieces, %d built (%d meshes merged into %d by material), %d shared from disk, %d of %d mesh facts scanned now",
+		job.model, tierInfo[1], tierInfo[2], tierInfo[3], #paths, built, meshesBefore, meshesAfter, reused, nUnknown, count))
 	setPhase("materials")
 	loadModelMaterials(job.model)
 	local matList = {}
