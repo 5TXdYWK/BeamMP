@@ -21,12 +21,14 @@
 
 local M = {}
 
+local D = require("beammp.proxy.dae")       -- .dae streaming, filtering, merging (pure, budget checks via setBudgetCheck)
+local J = require("beammp.proxy.jbeamText")  -- jbeam text scanning and value expressions (pure)
+
 setmetatable(_G,{}) -- temporarily disable global notifications
 
 local TIMER = (HighPerfTimer or hptimer)
 local CACHE_DIR = "/temp/beammp/proxymeshes/"
 local CACHE_VERSION = "v6" -- v6: shared pieces per (source .dae, jbeam part) instead of one file per mesh set and tier; v5: three LOD tier mesh sets per config, v4: triangle budget (smallest parts dropped), v3: one merged .dae per mesh set, signatures
-local READ_CHUNK = 128 * 1024     -- bytes per read step (smaller steps keep each resume near the frame budget)
 local FRAME_BUDGET_MS = 2         -- coroutine work per frame in game (proxyMeshFrameBudgetMs)
 local PRELOAD_BUDGET_MS = 40      -- while the join loading screen hides the stutter
 local frameBudget = FRAME_BUDGET_MS
@@ -173,29 +175,10 @@ local function setPhase(name) jobPhase = name end
 local function checkBudget()
 	if budgetTimer and budgetTimer:stop() > frameBudget then coroutine.yield() end
 end
+D.setBudgetCheck(checkBudget)
+J.setBudgetCheck(checkBudget)
 
 -- ============= BUILD STEPS (inside the coroutine) =============
-local function isOffsetModifier(row)
-	local function nz(t) return type(t) == "table" and ((t.x or 0) ~= 0 or (t.y or 0) ~= 0 or (t.z or 0) ~= 0) end
-	local s = row.scale
-	return nz(row.pos) or nz(row.rot) or (type(s) == "table" and ((s.x or 1) ~= 1 or (s.y or 1) ~= 1 or (s.z or 1) ~= 1))
-end
-
--- flexbody rows that are never part of the body mesh sets: wheels, tires, hubcaps and brakes (bound to wheel /
--- tire / hubcap / wheelhub groups, they come from the wheel system), and rows placed by their own pos / rot /
--- scale (the body sets use the raw mesh position, those would end up at the vehicle origin)
-local BODY_SKIP_GROUPS = { wheel = true, tire = true, tyre = true, hubcap = true, rim = true, wheelhub = true }
-local function isWheelFlexRow(row)
-	local last = row[#row]
-	if #row > 1 and type(last) == "table" and last[1] == nil and isOffsetModifier(last) then return true end
-	if type(row[2]) == "table" then
-		for _, g in ipairs(row[2]) do
-			local pre = type(g) == "string" and string.match(g, "^(%a+)_")
-			if pre and BODY_SKIP_GROUPS[string.lower(pre)] then return true end
-		end
-	end
-	return false
-end
 
 -- ============= CACHE VALIDATION =============
 -- game version + count and total size of the model's jbeam/dae/json files (works for zips and mods alike)
@@ -217,277 +200,15 @@ local function modelSignature(model)
 	return sig
 end
 
--- Finds the "flexbodies" array of every part in a jbeam text without decoding the file: a large jbeam (nodes,
--- beams, triangles of a body) took tens of ms in one jsonDecode. Strings, // and /* */ comments are skipped,
--- out[partName] = text of the part's flexbodies array (decoded alone, it is small). Returns false if the text
--- did not look like a jbeam (the caller then decodes the whole file).
--- array sections read for the wheel placement (wheelSecs[partName][key] = array text); nodes only of parts
--- that also have a wheel section (hubs, wheels, suspension), body node lists are big and not needed
--- node: default nodeWeight of the jbeam loader (lua/common/jbeam/loader.lua); wheel: pressure wheel nodes are
--- generated at spawn, a rough wheel + tire mass instead
-local MASS = { node = 25, wheel = 30, skinKeys = { slotType = true, skinType = true, skinName = true, globalSkin = true } } -- skinKeys: livery fields
-local WHEEL_KEYS = { slots = true, slots2 = true, pressureWheels = true, hubWheels = true, variables = true, nodes = true }
-
-local function extractFlexbodies(text, out, sections, wheelSecs)
-	local find, sub, byte, match = string.find, string.sub, string.byte, string.match
-	local pos, depth, n = 1, 0, 0
-	local partName, flexStart = nil, nil
-	local secStart, secKey = nil, nil -- engine / sound sections (sections[partName][key] = object text)
-	local arrStart, arrKey = nil, nil -- wheel related array sections
-	local partSecs, nodesFrom, nodesTo = nil, nil, nil
-	local lastString, lastDepth, lastEnd = nil, -1, 0
-	while true do
-		local s = find(text, '[{}%[%]"/]', pos)
-		if not s then break end
-		local c = byte(text, s)
-		if c == 34 then -- string
-			local e = s + 1
-			while true do
-				local q = find(text, '["\\]', e)
-				if not q then return false end
-				if byte(text, q) == 92 then e = q + 2 else e = q break end
-			end
-			local str = sub(text, s + 1, e - 1)
-			-- livery: string fields of the part ("slotType": "paint_design", "globalSkin": "police", ...)
-			if depth == 2 and partName and wheelSecs and lastString and lastDepth == 2 and MASS.skinKeys[lastString]
-				and match(sub(text, lastEnd + 1, s - 1), "^%s*:%s*$") then
-				partSecs = partSecs or {}
-				partSecs.skin = partSecs.skin or {}
-				partSecs.skin[lastString] = str
-			end
-			lastString, lastDepth, lastEnd = str, depth, e
-			pos = e + 1
-		elseif c == 47 then -- comment
-			local nx = byte(text, s + 1)
-			if nx == 47 then local e = find(text, "\n", s + 2, true) pos = e and e + 1 or #text + 1
-			elseif nx == 42 then local e = find(text, "*/", s + 2, true) pos = e and e + 2 or #text + 1
-			else pos = s + 1 end
-		elseif c == 123 or c == 91 then
-			depth = depth + 1
-			local isKey = lastString and lastDepth == depth - 1 and match(sub(text, lastEnd + 1, s - 1), "^%s*:%s*$")
-			if depth == 2 and c == 123 then partName = isKey and lastString or nil partSecs, nodesFrom = nil, nil
-			elseif depth == 3 and c == 91 and isKey and lastString == "flexbodies" and partName then flexStart = s
-			elseif depth == 3 and c == 91 and isKey and partName and wheelSecs and WHEEL_KEYS[lastString] then arrStart, arrKey = s, lastString
-			elseif depth == 3 and c == 123 and isKey and partName and sections
-				and (lastString == "mainEngine" or sub(lastString, 1, 11) == "soundConfig") then secStart, secKey = s, lastString end
-			lastString = nil
-			pos = s + 1
-		else
-			if depth == 3 and flexStart and c == 93 then out[partName] = sub(text, flexStart, s) flexStart = nil end
-			if depth == 3 and secStart and c == 125 then
-				sections[partName] = sections[partName] or {}
-				sections[partName][secKey] = sub(text, secStart, s)
-				secStart = nil
-			end
-			if depth == 3 and arrStart and c == 93 then
-				if arrKey == "nodes" then nodesFrom, nodesTo = arrStart, s
-				else partSecs = partSecs or {} partSecs[arrKey] = sub(text, arrStart, s) end
-				arrStart = nil
-			end
-			if depth == 2 then
-				if nodesFrom then -- every part's nodes: wheel placement and the mass estimate (centre of mass)
-					partSecs = partSecs or {}
-					partSecs.nodes = sub(text, nodesFrom, nodesTo)
-				end
-				if partSecs then
-					wheelSecs[partName] = partSecs
-				end
-				partName, partSecs, nodesFrom = nil, nil, nil
-			end
-			depth = depth - 1
-			if depth < 0 then return false end
-			lastString = nil
-			pos = s + 1
-		end
-		n = n + 1
-		if n >= 400 then n = 0 checkBudget() end
-	end
-	return depth == 0
-end
-
--- fields kept from the jbeam engine device and its sound sections (as read by combustionEngine.lua init)
-local ENGINE_FIELDS = { idleRPM = true, maxRPM = true, revLimiterRPM = true, soundConfig = true, soundConfigExhaust = true, requiredEnergyType = true }
-local SOUND_FIELDS = { sampleName = true, sampleFolder = true, mainGain = true, onLoadGain = true, offLoadGain = true,
-	intakeMuffling = true, exhaustAudioMufflingBaseCoef = true }
 local ENGINE_INDEX_VERSION = 7 -- 7: hub / brake disc flexbodies; 6: livery fields; part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists, 5: node mass buckets)
 local BODY_VERSION = 2 -- per config meta written before this is not reused as is (2: wheel / tire / brake meshes left out of the body)
-
-local function keepFields(decoded, fields)
-	local out, any = {}, false
-	for k in pairs(fields) do
-		local v = decoded[k]
-		if type(v) == "number" or (type(v) == "string" and string.sub(v, 1, 1) ~= "$") then out[k] = v any = true end
-	end
-	return any and out or nil
-end
-
--- engine[partName] = { mainEngine = {...}, [soundConfig section name] = {...} }
-local function addEngineSections(engine, sectionTexts, filename)
-	for partName, secs in pairs(sectionTexts) do
-		for key, txt in pairs(secs) do
-			local ok, d = pcall(jsonDecode, txt, filename)
-			local kept = ok and type(d) == "table" and keepFields(d, key == "mainEngine" and ENGINE_FIELDS or SOUND_FIELDS) or nil
-			if kept then
-				engine[partName] = engine[partName] or {}
-				engine[partName][key] = kept
-			end
-			checkBudget()
-		end
-	end
-end
 
 local engineIndex = {} -- [model] = engine sections by part (see addEngineSections)
 
 -- ============= WHEEL SECTIONS (compact, for the wheel placement) =============
-local WHEEL_OPTS = { radius = true, tireWidth = true, hubRadius = true, hubWidth = true, wheelOffset = true, offsetFromNode = true }
 local wheelIndex = {}         -- [model] = { [partName] = compact wheel data } (model and /vehicles/common/<model>/)
 local commonWheelIndex = nil  -- same for the shared tire / wheel / hubcap folders of /vehicles/common/
 local COMMON_WHEEL_DIRS = { "tires", "wheels", "wheels_square", "hubcaps" }
-
-local function scalar(v) return (type(v) == "number" or type(v) == "string") and v or nil end
-local function vec3Raw(o) return type(o) == "table" and { scalar(o.x) or 0, scalar(o.y) or 0, scalar(o.z) or 0 } or false end
-
-local function headerIndex(row, names)
-	local idx = {}
-	if type(row) ~= "table" then return idx end
-	for i, v in ipairs(row) do if names[v] then idx[v] = i end end
-	return idx
-end
-
--- slots (child slot types / names, slot nodeOffset), variable defaults, wheel rows and options in order,
--- and node positions with their nodeOffset modifiers
-local function compactWheelPart(secs, filename)
-	local function dec(key)
-		local t = secs[key]
-		if not t then return nil end
-		local ok, d = pcall(jsonDecode, t, filename)
-		checkBudget()
-		return ok and type(d) == "table" and d or nil
-	end
-	local out, any = {}, false
-	if type(secs.skin) == "table" and (secs.skin.skinName or secs.skin.globalSkin) then out.skin = secs.skin any = true end
-	local is2 = secs.slots2 ~= nil
-	local sl = dec(is2 and "slots2" or "slots")
-	if sl then
-		local list = {}
-		for _, row in ipairs(sl) do
-			if type(row) == "table" and type(row[1]) == "string" and row[1] ~= "type" and row[1] ~= "name" then
-				local e = { n = row[1], t = row[1] }
-				if is2 then local a = row[2] e.t = type(a) == "table" and a[1] or (type(a) == "string" and a) or row[1] end
-				for i = 2, #row do
-					if type(row[i]) == "table" and row[i].nodeOffset then e.o = vec3Raw(row[i].nodeOffset) end
-				end
-				list[#list + 1] = e
-			end
-		end
-		if #list > 0 then out.slots = list any = true end
-	end
-	local vars = dec("variables")
-	if vars then
-		local h = headerIndex(vars[1], { name = true, default = true })
-		local di = h.default or 5
-		local v = {}
-		for i, row in ipairs(vars) do
-			if i > 1 and type(row) == "table" and type(row[1]) == "string" and scalar(row[di]) then v[row[1]] = row[di] any = true end
-		end
-		if any then out.vars = v end
-	end
-	local pw = dec("pressureWheels") or dec("hubWheels")
-	if pw then
-		local h = headerIndex(pw[1], { ["node1:"] = true, ["node2:"] = true, wheelDir = true })
-		local list = {}
-		for i, row in ipairs(pw) do
-			if type(row) == "table" then
-				if row[1] == nil then -- options
-					local o, has = {}, false
-					for k in pairs(WHEEL_OPTS) do if scalar(row[k]) then o[k] = row[k] has = true end end
-					if has then list[#list + 1] = { o = o } end
-				elseif i > 1 and type(row[1]) == "string" and h["node1:"] and h["node2:"] then
-					local last = row[#row]
-					list[#list + 1] = { w = row[1], a = row[h["node1:"]], b = row[h["node2:"]], d = tonumber(row[h.wheelDir or 0]) or 1,
-						s = type(last) == "table" and (last["steerAxisUp:"] ~= nil or last.steerAxisUp ~= nil) or nil }
-				end
-			end
-		end
-		if #list > 0 then out.pw = list any = true end
-	end
-	local nodes = dec("nodes")
-	if nodes then
-		local list = {}
-		-- mass buckets per nodeOffset group: weight, weighted x / y / z sums and the weight on each x side
-		-- (the slot / modifier offset moves x away from the centre line, see moved() in resolveWheels)
-		local groups, g, weight, lastOff = {}, nil, MASS.node, nil
-		for _, row in ipairs(nodes) do
-			if type(row) == "table" then
-				if row[1] == nil then
-					if row.nodeOffset ~= nil then lastOff = vec3Raw(row.nodeOffset) list[#list + 1] = { off = lastOff } g = nil end
-					if row.nodeWeight ~= nil then weight = tonumber(row.nodeWeight) or MASS.node end
-				elseif type(row[1]) == "string" and row[1] ~= "id" and scalar(row[2]) and scalar(row[3]) and scalar(row[4]) then
-					if out.pw then list[#list + 1] = { row[1], scalar(row[2]), scalar(row[3]), scalar(row[4]) } end
-					local x, y, z = tonumber(row[2]), tonumber(row[3]), tonumber(row[4])
-					local last = row[#row]
-					local wt = type(last) == "table" and tonumber(last.nodeWeight) or weight
-					if x and y and z and wt and wt > 0 then
-						if not g then
-							-- mod: an explicit modifier row (false = reset to the slot offset), else the slot offset applies
-							g = { w = 0, x = 0, y = 0, z = 0, p = 0, n = 0, o = lastOff or nil, mod = lastOff ~= nil or nil }
-							groups[#groups + 1] = g
-						end
-						g.w, g.x, g.y, g.z = g.w + wt, g.x + wt * x, g.y + wt * y, g.z + wt * z
-						if x > 0 then g.p = g.p + wt elseif x < 0 then g.n = g.n + wt end
-					end
-				end
-			end
-		end
-		if out.pw and #list > 0 then out.nodes = list end
-		if #groups > 0 then out.mass = groups any = true end
-	end
-	return any and out or nil
-end
-
--- positioned flexbodies of the wheels (rim, tire, hubcap): mesh, the wheel names from its groups ("tire_FR" -> FR),
--- pos / rot / scale as written (values may be "$var" / "$=" expressions, evaluated per config)
-local WHEEL_GROUPS = { wheel = true, tire = true, tyre = true, hubcap = true, rim = true, wheelhub = "d", hub = "d", brake = "d" } -- "d": detail
-local function compactWheelFlex(text, filename)
-	if not (string.find(text, "tire_", 1, true) or string.find(text, "wheel_", 1, true) or string.find(text, "hubcap_", 1, true)
-		or string.find(text, "hub_", 1, true) or string.find(text, "brake_", 1, true)) then return nil end
-	local ok, rows = pcall(jsonDecode, text, filename)
-	checkBudget()
-	if not ok or type(rows) ~= "table" then return nil end
-	local list = {}
-	for _, row in ipairs(rows) do
-		if type(row) == "table" and type(row[1]) == "string" and row[1] ~= "mesh" and type(row[2]) == "table" then
-			local opt = row[#row]
-			opt = (type(opt) == "table" and opt[1] == nil and type(opt.pos) == "table") and opt or nil
-			local sides, seen, tire, detail = {}, {}, nil, true
-			for _, g in ipairs(row[2]) do
-				local pre, side = string.match(type(g) == "string" and g or "", "^(%a+)_(.+)$")
-				pre = pre and string.lower(pre)
-				if pre and WHEEL_GROUPS[pre] and WHEEL_GROUPS[pre] ~= "d" then detail = nil end
-				if pre and WHEEL_GROUPS[pre] and not seen[side] then seen[side] = true sides[#sides + 1] = side end
-				if pre == "tire" or pre == "tyre" then tire = true end
-			end
-			if opt and #sides > 0 then
-				list[#list + 1] = { m = row[1], w = sides, p = vec3Raw(opt.pos), r = vec3Raw(opt.rot) or nil, s = vec3Raw(opt.scale) or nil, t = tire, d = detail }
-			end
-		end
-	end
-	return #list > 0 and list or nil
-end
-
-local function addWheelParts(into, wheelSecs, filename, flexTexts)
-	for partName, secs in pairs(wheelSecs) do
-		local c = compactWheelPart(secs, filename)
-		if c then into[partName] = c end
-	end
-	for partName, text in pairs(flexTexts or {}) do
-		local fb = compactWheelFlex(text, filename)
-		if fb then
-			into[partName] = into[partName] or {}
-			into[partName].fb = fb
-		end
-	end
-end
 
 -- the shared tire / wheel folders, once (disk cached, rebuilt when the game version or file count changes)
 local function buildCommonWheelIndex()
@@ -506,7 +227,7 @@ local function buildCommonWheelIndex()
 		checkBudget()
 		if text then
 			table.clear(flexTexts) table.clear(wheelSecs)
-			if extractFlexbodies(text, flexTexts, nil, wheelSecs) then addWheelParts(parts, wheelSecs, filename, flexTexts) end
+			if J.extractFlexbodies(text, flexTexts, nil, wheelSecs) then J.addWheelParts(parts, wheelSecs, filename, flexTexts) end
 		end
 		text = nil
 		checkBudget()
@@ -539,9 +260,9 @@ local function buildPartIndex(model)
 		checkBudget()
 		if text then -- engine / sound sections and the hubs, suspensions and their slots
 			table.clear(flexTexts) table.clear(sectionTexts) table.clear(wheelSecs)
-			if extractFlexbodies(text, flexTexts, sectionTexts, wheelSecs) then
-				addEngineSections(engine, sectionTexts, filename)
-				addWheelParts(wheels, wheelSecs, filename, flexTexts)
+			if J.extractFlexbodies(text, flexTexts, sectionTexts, wheelSecs) then
+				J.addEngineSections(engine, sectionTexts, filename)
+				J.addWheelParts(wheels, wheelSecs, filename, flexTexts)
 			end
 		end
 		text = nil
@@ -556,9 +277,9 @@ local function buildPartIndex(model)
 		checkBudget()
 		local hasSound = text and string.find(text, "soundConfig", 1, true)
 		if text then
-			if extractFlexbodies(text, flexTexts, hasSound and sectionTexts or nil, wheelSecs) then
-				addEngineSections(engine, sectionTexts, filename)
-				addWheelParts(wheels, wheelSecs, filename, flexTexts)
+			if J.extractFlexbodies(text, flexTexts, hasSound and sectionTexts or nil, wheelSecs) then
+				J.addEngineSections(engine, sectionTexts, filename)
+				J.addWheelParts(wheels, wheelSecs, filename, flexTexts)
 				data = {}
 				for partName, arr in pairs(flexTexts) do
 					local ok, rows = pcall(jsonDecode, arr, filename)
@@ -579,9 +300,9 @@ local function buildPartIndex(model)
 						if type(row) == "table" then
 							if row[1] ~= nil then
 								local mesh = row[1]
-								if type(mesh) == "string" and mesh ~= "mesh" and not offset and not isWheelFlexRow(row) then list[#list + 1] = mesh end
+								if type(mesh) == "string" and mesh ~= "mesh" and not offset and not J.isWheelFlexRow(row) then list[#list + 1] = mesh end
 							else
-								offset = isOffsetModifier(row) -- positioned meshes (mirrored/moved) would be misplaced
+								offset = J.isOffsetModifier(row) -- positioned meshes (mirrored/moved) would be misplaced
 							end
 						end
 					end
@@ -605,52 +326,6 @@ end
 -- to the wheel rows after them, and each wheel is placed like lua/common/jbeam/sections/wheelTypes/pressureWheels.lua:
 -- midpoint of node1/node2 (or offsetFromNode), moved by wheelOffset along the axis, tireWidth wide, radius.
 local WHEEL_VERSION = 6 -- 6: every skin slot; 5: livery (skin) name; 4: 4: centre of mass estimate; 3: tire flag per mesh; 2: named fields (mixed tables did not survive the json round trip), rim / tire meshes
-
--- jbeam values: numbers, "$var", or "$=expression" (arithmetic, comparisons, and/or/not, case(c1, v1, ..., default),
--- min/max/abs...). Unknown variables (also "$components.x") become nil like in the game's evaluator.
-local EXPR_NAMES = { ["nil"] = true, ["true"] = true, ["false"] = true, ["and"] = true, ["or"] = true, ["not"] = true,
-	__case = true, min = true, max = true, abs = true, floor = true, ceil = true, sqrt = true, clamp = true }
-local EXPR_ENV = { min = math.min, max = math.max, abs = math.abs, floor = math.floor, ceil = math.ceil, sqrt = math.sqrt,
-	clamp = function(x, a, b) return math.min(math.max(x, a), b) end,
-	__case = function(...)
-		local n = select("#", ...)
-		local args = { ... }
-		for i = 1, n - 1, 2 do if args[i] then return args[i + 1] end end
-		if n % 2 == 1 then return args[n] end
-		return nil
-	end }
-local exprCache = {}
-
-local function evalVal(v, vars)
-	if type(v) == "number" then return v end
-	if type(v) ~= "string" then return nil end
-	if string.sub(v, 1, 2) == "$=" then
-		local expr = string.gsub(string.sub(v, 3), "%$([%w_%.]+)", function(n)
-			local x = tonumber(vars["$" .. n])
-			return x and string.format("(%.17g)", x) or "nil"
-		end)
-		expr = string.gsub(expr, "!=", "~=")
-		expr = string.gsub(expr, "&&", " and ")
-		expr = string.gsub(expr, "||", " or ")
-		expr = string.gsub(expr, "case%(", "__case(")
-		for name in string.gmatch(expr, "[%a_][%w_]*") do
-			if not EXPR_NAMES[name] and not string.match(name, "^[eE]%d*$") then return nil end
-		end
-		if string.find(expr, "[^%w_%.%+%-%*/%(%)%s,<>=~^%%]") then return nil end
-		local fn = exprCache[expr]
-		if fn == nil then
-			fn = loadstring("return " .. expr) or false
-			if fn then setfenv(fn, EXPR_ENV) end
-			exprCache[expr] = fn
-		end
-		if not fn then return nil end
-		local ok, r = pcall(fn)
-		return ok and tonumber(r) or nil
-	elseif string.sub(v, 1, 1) == "$" then
-		return tonumber(vars[v])
-	end
-	return tonumber(v)
-end
 
 local function resolveWheels(job)
 	local vcf = job.vcf
@@ -709,7 +384,7 @@ local function resolveWheels(job)
 	visit(vcf.mainPartName or job.model, nil, "/", 0)
 	local function moved(x, y, z, o)
 		if o then
-			local ox, oy, oz = evalVal(o[1], vars) or 0, evalVal(o[2], vars) or 0, evalVal(o[3], vars) or 0
+			local ox, oy, oz = J.evalVal(o[1], vars) or 0, J.evalVal(o[2], vars) or 0, J.evalVal(o[3], vars) or 0
 			x = x + (x > 0 and 1 or (x < 0 and -1 or 0)) * ox
 			y, z = y + oy, z + oz
 		end
@@ -718,7 +393,7 @@ local function resolveWheels(job)
 	local function nodePos(name)
 		local n = nodes[name]
 		if not n then return nil end
-		local x, y, z = evalVal(n[1], vars), evalVal(n[2], vars), evalVal(n[3], vars)
+		local x, y, z = J.evalVal(n[1], vars), J.evalVal(n[2], vars), J.evalVal(n[3], vars)
 		if not (x and y and z) then return nil end
 		return moved(x, y, z, n[4])
 	end
@@ -733,15 +408,15 @@ local function resolveWheels(job)
 				local len = math.sqrt(ax * ax + ay * ay + az * az)
 				if len > 1e-4 then
 					ax, ay, az = ax / len, ay / len, az / len
-					local hubWidth = evalVal(opts.hubWidth, vars) or len
+					local hubWidth = J.evalVal(opts.hubWidth, vars) or len
 					local mx, my, mz = (x1 + x2) * 0.5, (y1 + y2) * 0.5, (z1 + z2) * 0.5
-					local ofn = evalVal(opts.offsetFromNode, vars)
+					local ofn = J.evalVal(opts.offsetFromNode, vars)
 					if ofn == 1 then mx, my, mz = x1 + ax * hubWidth * 0.5, y1 + ay * hubWidth * 0.5, z1 + az * hubWidth * 0.5
 					elseif ofn == 2 then mx, my, mz = x2 - ax * hubWidth * 0.5, y2 - ay * hubWidth * 0.5, z2 - az * hubWidth * 0.5 end
-					local wo = evalVal(opts.wheelOffset, vars)
+					local wo = J.evalVal(opts.wheelOffset, vars)
 					if wo then mx, my, mz = mx + ax * wo, my + ay * wo, mz + az * wo end
-					local radius = evalVal(opts.radius, vars) or evalVal(opts.hubRadius, vars) or 0.5
-					local width = evalVal(opts.tireWidth, vars) or hubWidth
+					local radius = J.evalVal(opts.radius, vars) or J.evalVal(opts.hubRadius, vars) or 0.5
+					local width = J.evalVal(opts.tireWidth, vars) or hubWidth
 					-- steered: rows with a steering axis, else the front wheels by name (FR, FL, F2R...)
 					local steered = it.s or (type(it.w) == "string" and string.sub(it.w, 1, 1) == "F")
 					local at = wheelAt[it.w] or (#wheels + 1) -- a later row of the same wheel replaces it (like the loader)
@@ -758,12 +433,12 @@ local function resolveWheels(job)
 		local o = off
 		if g.mod then o = g.o or off end
 		local ox, oy, oz = 0, 0, 0
-		if type(o) == "table" then ox, oy, oz = evalVal(o[1], vars) or 0, evalVal(o[2], vars) or 0, evalVal(o[3], vars) or 0 end
+		if type(o) == "table" then ox, oy, oz = J.evalVal(o[1], vars) or 0, J.evalVal(o[2], vars) or 0, J.evalVal(o[3], vars) or 0 end
 		mw = mw + g.w
 		mx, my, mz = mx + g.x + ox * (g.p - g.n), my + g.y + oy * g.w, mz + g.z + oz * g.w
 	end
 	for _, w in ipairs(wheels) do
-		mw, mx, my, mz = mw + MASS.wheel, mx + MASS.wheel * w.x, my + MASS.wheel * w.y, mz + MASS.wheel * w.z
+		mw, mx, my, mz = mw + J.MASS.wheel, mx + J.MASS.wheel * w.x, my + J.MASS.wheel * w.y, mz + J.MASS.wheel * w.z
 	end
 	job.com = mw > 0 and { mx / mw, my / mw, mz / mw, mw } or nil
 	if job.com then
@@ -784,7 +459,7 @@ local function resolveWheels(job)
 		local hidden = string.find(lm, "caliper", 1, true)
 			or (not cfg.wheelDetails and (fb.d or string.find(lm, "brake", 1, true) or string.find(lm, "disc", 1, true)))
 		if w and type(fb.m) == "string" and p and not hidden then -- brake parts sit behind the rim
-			local x, y, z = evalVal(p[1], vars), evalVal(p[2], vars), evalVal(p[3], vars)
+			local x, y, z = J.evalVal(p[1], vars), J.evalVal(p[2], vars), J.evalVal(p[3], vars)
 			if x and y and z then
 				x, y, z = moved(x, y, z, off)
 				local r, sc = fb.r or {}, fb.s or {}
@@ -792,8 +467,8 @@ local function resolveWheels(job)
 				local dup = false
 				for _, e in ipairs(w.m) do if e[1] == fb.m then dup = true end end
 				if not dup and #w.m < 6 then -- meshes per wheel
-					w.m[#w.m + 1] = { fb.m, x - w.x, y - w.y, z - w.z, evalVal(r[1], vars) or 0, evalVal(r[2], vars) or 0, evalVal(r[3], vars) or 0,
-						evalVal(sc[1], vars) or 1, evalVal(sc[2], vars) or 1, evalVal(sc[3], vars) or 1, fb.t and 1 or 0 }
+					w.m[#w.m + 1] = { fb.m, x - w.x, y - w.y, z - w.z, J.evalVal(r[1], vars) or 0, J.evalVal(r[2], vars) or 0, J.evalVal(r[3], vars) or 0,
+						J.evalVal(sc[1], vars) or 1, J.evalVal(sc[2], vars) or 1, J.evalVal(sc[3], vars) or 1, fb.t and 1 or 0 }
 				end
 			end
 		end
@@ -891,361 +566,11 @@ local function loadModelMaterials(model)
 	materialsLoaded[model] = true
 end
 
-local function updateBBox(bbox, geometryBlock)
-	local arr = string.match(geometryBlock, '<float_array id="[^"]*positions%-array" count="%d+">([^<]*)</float_array>')
-	if not arr then return end
-	local i, n = 0, 0
-	local x, y = 0, 0
-	for num in string.gmatch(arr, "%S+") do
-		local v = tonumber(num) or 0
-		local axis = i % 3
-		if axis == 0 then x = v elseif axis == 1 then y = v else
-			if x < bbox[1] then bbox[1] = x end
-			if x > bbox[4] then bbox[4] = x end
-			if y < bbox[2] then bbox[2] = y end
-			if y > bbox[5] then bbox[5] = y end
-			if v < bbox[3] then bbox[3] = v end
-			if v > bbox[6] then bbox[6] = v end
-		end
-		i = i + 1
-		n = n + 1
-		if n >= 3000 then n = 0 checkBudget() end
-	end
-end
-
--- triangles of a geometry block (triangles / polylist / polygons primitives, polygons counted as one each)
-local function countTriangles(block)
-	local n = 0
-	for tag, count in string.gmatch(block, "<(%a+)[^>]-count=\"(%d+)\"") do
-		if tag == "triangles" or tag == "polylist" or tag == "polygons" or tag == "tristrips" then n = n + (tonumber(count) or 0) end
-	end
-	return n
-end
-
---- Streams one .dae. keepGeom(id, name) picks geometry blocks (appended to geoms, ids to keptIds),
--- onNode(block, name, url) sees every flat scene node. geomsOnly stops after the geometry library.
-local function scanDae(filename, keepGeom, onNode, geomsOnly, header, geoms, keptIds, bbox)
-	local f = io.open(filename, "r")
-	if not f then return false end
-	local find, sub, match = string.find, string.sub, string.match
-	local mode = "header"
-	local buf, at = "", 1 -- unconsumed data is buf[at..]; buf is only rebuilt once per read chunk
-	local pendGeom = nil -- a geometry longer than a chunk, collected in pieces
-	local eof = false
-	while true do
-		if not eof then
-			local chunk = f:read(READ_CHUNK)
-			if chunk then
-				buf = (at > 1 and sub(buf, at) or buf) .. chunk -- one copy per chunk instead of one per geometry
-				at = 1
-			else
-				eof = true
-			end
-		end
-		local progressed = true
-		while progressed do
-			progressed = false
-			if mode == "header" then
-				local s = find(buf, "<library_geometries>", at, true)
-				if s then
-					header[#header + 1] = sub(buf, at, s - 1)
-					at = s + 20
-					mode = "geoms"
-					progressed = true
-				elseif #buf - at > 64 then
-					header[#header + 1] = sub(buf, at, #buf - 64)
-					at = #buf - 63
-				end
-			elseif mode == "geoms" then
-				local s = find(buf, "<geometry ", at, true)
-				local libEnd = find(buf, "</library_geometries>", at, true)
-				if libEnd and (not s or libEnd < s) then
-					at = libEnd + 21
-					mode = geomsOnly and "done" or "prescene"
-					progressed = true
-				elseif s then
-					local e = find(buf, "</geometry>", s, true)
-					if e then
-						local id, name = match(buf, '^<geometry id="([^"]*)" name="([^"]*)"', s)
-						if id and keepGeom(id, name) then
-							local block = sub(buf, s, e + 10) -- only kept blocks are copied
-							geoms[#geoms + 1] = block
-							keptIds[id] = true
-							if bbox then -- per geometry local bounds, placed by the node transform later
-								local gb = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
-								updateBBox(gb, block)
-								gb.tris = countTriangles(block)
-								bbox[id] = gb
-							end
-						end
-						at = e + 11
-						progressed = true
-						checkBudget()
-					elseif #buf - s > READ_CHUNK then
-						-- long geometry: collect it in pieces (no re-copy and re-search of the growing buffer per chunk)
-						local id, name = match(buf, '^<geometry id="([^"]*)" name="([^"]*)"', s)
-						local keep = id and keepGeom(id, name)
-						pendGeom = { id = id, keep = keep, parts = keep and { sub(buf, s, #buf - 11) } or nil }
-						at = #buf - 10 -- the last bytes stay, "</geometry>" may start there
-						mode = "ingeom"
-					else
-						at = s -- wait for the rest of this geometry
-					end
-				elseif #buf - at > 32 then
-					at = #buf - 31
-				end
-			elseif mode == "ingeom" then
-				local e = find(buf, "</geometry>", at, true)
-				local pg = pendGeom
-				if e then
-					if pg.keep then
-						pg.parts[#pg.parts + 1] = sub(buf, at, e + 10)
-						local block = table.concat(pg.parts)
-						geoms[#geoms + 1] = block
-						keptIds[pg.id] = true
-						checkBudget()
-						if bbox then
-							local gb = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
-							updateBBox(gb, block)
-							checkBudget()
-							gb.tris = countTriangles(block)
-							bbox[pg.id] = gb
-						end
-					end
-					pendGeom = nil
-					at = e + 11
-					mode = "geoms"
-					progressed = true
-					checkBudget()
-				elseif #buf - at > 11 then
-					if pg.keep then pg.parts[#pg.parts + 1] = sub(buf, at, #buf - 11) end
-					at = #buf - 10
-				end
-			elseif mode == "prescene" then
-				local s = find(buf, "<visual_scene", at, true)
-				if s then
-					at = s + 13
-					mode = "scene"
-					progressed = true
-				elseif #buf - at > 32 then
-					at = #buf - 31
-				end
-			elseif mode == "scene" then
-				local s = find(buf, "<node ", at, true)
-				local sceneEnd = find(buf, "</visual_scene>", at, true)
-				if sceneEnd and (not s or sceneEnd < s) then
-					mode = "done"
-				elseif s then
-					local e = find(buf, "</node>", s, true)
-					if e then
-						local nested = find(buf, "<node ", s + 1, true)
-						if not nested or nested > e then -- flat nodes only, nested ones are skipped
-							local block = sub(buf, s, e + 6)
-							local name = match(block, 'name="([^"]*)"')
-							local url = match(block, 'instance_geometry url="#([^"]*)"')
-							if name and url then onNode(block, name, url) end
-						end
-						at = e + 7
-						progressed = true
-						checkBudget()
-					else
-						at = s
-					end
-				elseif #buf - at > 32 then
-					at = #buf - 31
-				end
-			end
-		end
-		if mode == "done" or eof then break end
-		coroutine.yield() -- one chunk per step
-	end
-	f:close()
-	return true
-end
-
---- Streams one .dae and returns the filtered collada text (or nil if no wanted mesh is in it).
--- Meshes are matched by scene node name (what jbeam flexbodies reference). Exporters like Blender name
--- the geometry blocks differently ("Mesh.038"), those are fetched in a second pass by the node's url.
--- adds a node's geometry bounds to bbox, transformed by the node matrix (collada: row major, column vectors).
--- Some vehicle .dae files keep meshes in centimeters or offset with a scaled/translated node, raw vertex
--- bounds of those were hundreds of meters (the "bigger than the map" boxes).
-local function mergeNodeBBox(bbox, block, gb)
-	if not gb or gb[1] > gb[4] then return end
-	local m = {}
-	local mtx = string.match(block, "<matrix[^>]*>([^<]*)</matrix>")
-	if mtx then for num in string.gmatch(mtx, "%S+") do m[#m + 1] = tonumber(num) or 0 end end
-	if #m ~= 16 then m = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1} end
-	for i = 0, 7 do
-		local x = (i % 2 == 0) and gb[1] or gb[4]
-		local y = (math.floor(i / 2) % 2 == 0) and gb[2] or gb[5]
-		local z = (i < 4) and gb[3] or gb[6]
-		local wx = m[1]*x + m[2]*y + m[3]*z + m[4]
-		local wy = m[5]*x + m[6]*y + m[7]*z + m[8]
-		local wz = m[9]*x + m[10]*y + m[11]*z + m[12]
-		if wx < bbox[1] then bbox[1] = wx end
-		if wx > bbox[4] then bbox[4] = wx end
-		if wy < bbox[2] then bbox[2] = wy end
-		if wy > bbox[5] then bbox[5] = wy end
-		if wz < bbox[3] then bbox[3] = wz end
-		if wz > bbox[6] then bbox[6] = wz end
-	end
-end
-
-local function collectMaterials(block, mats)
-	if not mats then return end
-	for sym in string.gmatch(block, '<instance_material symbol="([^"]+)"') do
-		mats[(string.gsub(sym, "%-material$", ""))] = true
-	end
-end
-
-local function filterDae(filename, wanted, bbox, mats)
-	local header, geoms, nodes, keptIds, missing = {}, {}, {}, {}, {}
-	local missingCount = 0
-	local geomBoxes = {}
-	local function keepByName(id, name) return wanted[name] or wanted[string.gsub(id, "%-mesh$", "")] end
-	local function addNode(block, url, name)
-		local nb = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
-		mergeNodeBBox(nb, block, geomBoxes[url])
-		mergeNodeBBox(bbox, block, geomBoxes[url])
-		local size = nb[1] <= nb[4] and math.sqrt((nb[4]-nb[1])^2 + (nb[5]-nb[2])^2 + (nb[6]-nb[3])^2) or 0
-		nodes[#nodes + 1] = { block = block .. "\n", url = url, name = name, tris = geomBoxes[url] and geomBoxes[url].tris or 0, size = size, mats = {}, bb = nb[1] <= nb[4] and nb or nil }
-		collectMaterials(block, nodes[#nodes].mats)
-	end
-	local ok = scanDae(filename, keepByName, function(block, name, url)
-		if not wanted[name] then return end
-		if keptIds[url] then addNode(block, url, name)
-		elseif not missing[url] then missing[url] = { block, name } missingCount = missingCount + 1 end
-	end, false, header, geoms, keptIds, geomBoxes)
-	if not ok then return nil end
-	if missingCount > 0 then
-		scanDae(filename, function(id) return missing[id] ~= nil and not keptIds[id] end, function() end, true, {}, geoms, keptIds, geomBoxes)
-		for url, m in pairs(missing) do
-			if keptIds[url] then addNode(m[1], url, m[2]) end
-		end
-	end
-	if #nodes == 0 then return nil end
-	local geomById = {}
-	for _, g in ipairs(geoms) do
-		local id = string.match(g, '^<geometry id="([^"]*)"')
-		if id then geomById[id] = g end
-	end
-	return { header = table.concat(header), geomById = geomById, nodes = nodes }
-end
-
--- keeps the biggest parts (by size) that fit into the triangle budget, over all files of a mesh set, and turns
--- the parts into the plain lists mergeDae wants (only geometries some kept node uses)
--- marks n.keep on the nodes that pass filter and fit the budget (biggest first); returns kept count and triangles
-local function selectNodes(all, filter, budget, minSize)
-	table.sort(all, function(a, b) if a.size ~= b.size then return a.size > b.size end return a.name < b.name end)
-	local sum, kept = 0, 0
-	for _, n in ipairs(all) do
-		n.keep = false
-		if (not filter or filter(n)) and n.size >= (minSize or 0) and (budget <= 0 or sum + n.tris <= budget or sum == 0) then
-			n.keep = true
-			sum, kept = sum + n.tris, kept + 1
-		end
-	end
-	return kept, sum
-end
-
 -- ============= MERGING =============
--- All filtered parts of one config go into a single .dae, so the engine imports one shape per mesh set.
--- ids are prefixed per source file (Blender names like "Mesh_038-mesh" repeat across files), materials,
--- effects and images are deduplicated by id. Files with a different <unit>/<up_axis> get their own output.
-local function prefixIds(block, pre, refsToo, out)
-	-- big geometries (several MB) in slices cut at a '<' (the patterns hold no '<', so none straddles a cut),
-	-- appended to out with a budget check between slices instead of one long gsub over the whole block
-	local gsub, find, sub = string.gsub, string.find, string.sub
-	local n, at = #block, 1
-	while at <= n do
-		local cut = at + READ_CHUNK <= n and (find(block, "<", at + READ_CHUNK, true) or n + 1) or n + 1
-		local piece = sub(block, at, cut - 1)
-		piece = gsub(piece, ' id="', ' id="' .. pre)
-		if refsToo then
-			piece = gsub(piece, '="#', '="#' .. pre) -- geometry internal references (sources, vertices)
-		else
-			piece = gsub(piece, 'url="#', 'url="#' .. pre) -- node -> geometry, material targets stay
-		end
-		out[#out + 1] = piece
-		at = cut
-		checkBudget()
-	end
-end
-
--- writes the pieces to path.tmp across frames (budget checks between writes), then renames it into place
-local function writePieces(path, pieces)
-	local tmp = path .. ".tmp"
-	local f = io.open(tmp, "wb")
-	if not f then return writeFile(path, table.concat(pieces)) end -- fallback: one step
-	local buf, size = {}, 0
-	for i = 1, #pieces do
-		buf[#buf + 1] = pieces[i]
-		size = size + #pieces[i]
-		if size >= READ_CHUNK * 2 or i == #pieces then
-			if not f:write(table.concat(buf)) then f:close() FS:removeFile(tmp) return false end
-			buf, size = {}, 0
-			checkBudget()
-		end
-	end
-	f:close()
-	if FS:fileExists(path) then FS:removeFile(path) end
-	if FS:renameFile(tmp, path) ~= 0 and not FS:fileExists(path) then -- rename failed: copy through memory once
-		local ok = writeFile(path, table.concat(pieces))
-		FS:removeFile(tmp)
-		return ok
-	end
-	return FS:fileExists(path)
-end
-
-local function collectLib(header, lib, tag, seen, out)
-	local inner = string.match(header, "<" .. lib .. ">(.-)</" .. lib .. ">")
-	if not inner then return end
-	for block, id in string.gmatch(inner, '(<' .. tag .. ' id="([^"]*)".-</' .. tag .. '>)') do
-		if not seen[id] then seen[id] = true out[#out + 1] = block end
-	end
-end
-
-local function daeSignature(header)
-	return (string.match(header, "<unit[^>]*>") or "") .. (string.match(header, "<up_axis>(.-)</up_axis>") or "Z_UP")
-end
-
-local function mergeDae(list)
-	local first = list[1].header
-	local preamble = string.match(first, "^(.-)<asset>") or '<?xml version="1.0" encoding="utf-8"?>\n<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">\n'
-	local out = { preamble, string.match(first, "<asset>.-</asset>") or "", "\n" }
-	for _, lib in ipairs({ { "library_images", "image" }, { "library_effects", "effect" }, { "library_materials", "material" } }) do
-		local seen, blocks = {}, {}
-		for _, part in ipairs(list) do collectLib(part.header, lib[1], lib[2], seen, blocks) end
-		if #blocks > 0 then out[#out + 1] = "<" .. lib[1] .. ">\n" .. table.concat(blocks, "\n") .. "\n</" .. lib[1] .. ">\n" end
-	end
-	out[#out + 1] = "<library_geometries>\n"
-	for i, part in ipairs(list) do
-		local pre = "f" .. i .. "_"
-		for _, g in ipairs(part.geoms) do prefixIds(g, pre, true, out) out[#out + 1] = "\n" checkBudget() end
-	end
-	out[#out + 1] = '</library_geometries>\n<library_visual_scenes>\n<visual_scene id="Scene" name="Scene">\n'
-	for i, part in ipairs(list) do
-		local pre = "f" .. i .. "_"
-		for _, n in ipairs(part.nodes) do prefixIds(n, pre, false, out) end
-		checkBudget()
-	end
-	out[#out + 1] = '</visual_scene>\n</library_visual_scenes>\n<scene>\n<instance_visual_scene url="#Scene"/>\n</scene>\n</COLLADA>\n'
-	return out -- pieces, written by writePieces
-end
-
-
--- plausible vehicle bounds: length up to 25 m, width and height up to 6 m
-local function validBBox(b)
-	if type(b) ~= "table" or #b ~= 6 then return false end
-	for i = 1, 6 do if type(b[i]) ~= "number" or b[i] ~= b[i] or b[i] == math.huge or b[i] == -math.huge then return false end end
-	local w, l, h = b[4] - b[1], b[5] - b[2], b[6] - b[3]
-	return w > 0.1 and l > 0.1 and h > 0.1 and w <= 6 and l <= 25 and h <= 6
-		and math.abs(b[1] + b[4]) < 20 and math.abs(b[2] + b[5]) < 30 -- roughly centered on the jbeam origin
-end
 
 local function finishBBox(shape, bbox, model)
 	shape.minX = nil
-	if not validBBox(bbox) then
+	if not D.validBBox(bbox) then
 		if bbox and bbox[1] and bbox[1] <= (bbox[4] or -math.huge) then
 			log('W', 'MPProxyMeshGE', string.format("Ignoring implausible mesh bounds for %s: %s", tostring(model), table.concat(bbox, ", ")))
 		end
@@ -1254,56 +579,6 @@ local function finishBBox(shape, bbox, model)
 	shape.minX, shape.minY, shape.minZ, shape.maxX, shape.maxY, shape.maxZ = bbox[1], bbox[2], bbox[3], bbox[4], bbox[5], bbox[6]
 	-- jbeam vehicles stand on z = 0, use the mesh bottom only if that does not look like it
 	shape.groundZ = (bbox[3] > -0.3 and bbox[3] < 0.7) and 0 or bbox[3]
-end
-
--- BeamNG creates glow map materials (signals, lights) at spawn when no material file defines them
--- (lua/common/jbeam/materials.lua), a TSStatic does not, so do the same to avoid [NO-MATERIAL]
-local function ensureMaterials(list)
-	for _, name in ipairs(list or {}) do
-		if not scenetree.findObject(name) then
-			local mat = createObject("Material")
-			if mat then
-				mat.mapTo = name
-				mat.canSave = false
-				mat:registerObject(name)
-			end
-			checkBudget()
-		end
-	end
-end
-
--- TSStatic skin field: "old=new" pairs (";" separated) rename material targets starting with "old" to the same name
--- with "new" in its place, only when a Material named like the result exists. Vehicle skin materials are named
--- "<material>.<slot>.<skin>", the paint_design slot ("" in the vehicle skin string) as "skin" (e.g. pickup.skin.old,
--- autobello_interior_a.skin_interior.black in the game's materials.json files), so each material of the merged
--- file gets its own pair when that skin material exists. Longest names first, so "pickup_dark" is not caught by the
--- shorter "pickup" pair. Memoized per skin string and material list.
-local skinFields = {}
-local function skinField(skin, mats, what)
-	if not skin or skin == "" or type(mats) ~= "table" or #mats == 0 then return "" end
-	local key = skin .. "|" .. table.concat(mats, ",")
-	local v = skinFields[key]
-	if v then return v end
-	local sorted = {}
-	for _, m in ipairs(mats) do sorted[#sorted + 1] = m end
-	table.sort(sorted, function(a, b) if #a ~= #b then return #a > #b end return a < b end)
-	local rules, found, missing = {}, {}, 0
-	for entry in string.gmatch(skin, "[^;]+") do
-		local slot, nm = string.match(entry, "^([^.]*)%.(.+)$")
-		if nm then
-			local mid = (slot == "" and "skin" or slot) .. "." .. nm
-			for _, m in ipairs(sorted) do
-				local target = m .. "." .. mid
-				if scenetree.findObject(target) then rules[#rules + 1] = m .. "=" .. target found[#found + 1] = target
-				else missing = missing + 1 end
-			end
-		end
-	end
-	v = table.concat(rules, ";")
-	skinFields[key] = v
-	log(#rules > 0 and 'I' or 'W', 'MPProxyMeshGE', string.format("Proxy livery %s for %s: skin field \"%s\" (%d renames, %d material / skin pairs have no skin material%s)",
-		skin, tostring(what), v, #rules, missing, #found > 0 and (": " .. table.concat(found, ", ")) or ", nothing to rename"))
-	return v
 end
 
 -- ============= REAL WHEEL MESHES =============
@@ -1345,50 +620,6 @@ local function queueWheelMeshes(shape, model)
 	end
 end
 
--- scene node names of one .dae. The visual scene sits at the end of the file (after the geometries), so the file
--- is read backwards from its end until the scene starts; files that cannot seek are read forward.
-local function sceneNodeNames(file, out)
-	local f = io.open(file, "rb")
-	if not f then return end
-	local okSeek, size = pcall(f.seek, f, "end")
-	local text = nil
-	if okSeek and type(size) == "number" and size > 0 then
-		local parts, pos = {}, size
-		while pos > 0 do
-			local from = math.max(0, pos - READ_CHUNK * 2)
-			f:seek("set", from)
-			local chunk = f:read(pos - from)
-			if not chunk then break end
-			table.insert(parts, 1, chunk)
-			pos = from
-			local joined = table.concat(parts)
-			parts = { joined }
-			if string.find(joined, "<visual_scene", 1, true) then break end
-			coroutine.yield()
-		end
-		text = parts[1]
-	else
-		local list = {}
-		while true do
-			local chunk = f:read(READ_CHUNK)
-			if not chunk then break end
-			list[#list + 1] = chunk
-			coroutine.yield()
-		end
-		text = table.concat(list)
-	end
-	f:close()
-	if not text then return end
-	local sceneAt = string.find(text, "<visual_scene", 1, true) or 1
-	local n = 0
-	for name in string.gmatch(string.sub(text, sceneAt), '<node [^>]-name="([^"]+)"') do
-		if out[name] == nil then out[name] = file end
-		n = n + 1
-		if n >= 200 then n = 0 checkBudget() end
-	end
-	checkBudget()
-end
-
 -- [scene node name] = .dae for the shared wheel / tire / hubcap folders ("common") or one model's folders
 local function meshIndex(which)
 	local idx = meshIndexes[which]
@@ -1411,7 +642,7 @@ local function meshIndex(which)
 	setPhase("mesh index")
 	local t0 = os.clock()
 	idx = {}
-	for _, fl in ipairs(files) do sceneNodeNames(fl, idx) end
+	for _, fl in ipairs(files) do D.sceneNodeNames(fl, idx) end
 	local count = 0
 	for _ in pairs(idx) do count = count + 1 end
 	FS:directoryCreate(CACHE_DIR, true)
@@ -1419,42 +650,6 @@ local function meshIndex(which)
 	log('I', 'MPProxyMeshGE', string.format("Indexed %d scene nodes in %d .dae files (%s)", count, #files, which))
 	meshIndexes[which] = idx
 	return idx
-end
-
--- the node block with the flexbody transform (scale, rotation: euler +Z +X +Y intrinsic, then position relative to
--- the wheel center) applied in front of its own matrix; nil for nodes using other transform elements
-local function bakeNode(block, e, unit)
-	if string.find(block, "<translate", 1, true) or string.find(block, "<rotate", 1, true) or string.find(block, "<scale", 1, true) then return nil end
-	local m = {}
-	local mtx = string.match(block, "<matrix[^>]*>([^<]*)</matrix>")
-	if mtx then for num in string.gmatch(mtx, "%S+") do m[#m + 1] = tonumber(num) or 0 end end
-	if #m ~= 16 then m = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1} end
-	local rx, ry, rz = math.rad(e[5]), math.rad(e[6]), math.rad(e[7])
-	local cx, sx, cy, sy, cz, sz = math.cos(rx), math.sin(rx), math.cos(ry), math.sin(ry), math.cos(rz), math.sin(rz)
-	-- R = Rz * Rx * Ry
-	local zx = { {cz, -sz * cx, sz * sx}, {sz, cz * cx, -cz * sx}, {0, sx, cx} }
-	local R = {}
-	for i = 1, 3 do
-		R[i] = { zx[i][1] * cy - zx[i][3] * sy, zx[i][2], zx[i][1] * sy + zx[i][3] * cy }
-	end
-	local sc = { e[8], e[9], e[10] }
-	local t = { e[2] / unit, e[3] / unit, e[4] / unit } -- node matrices are in file units
-	local B = {}
-	for i = 1, 3 do B[i] = { R[i][1] * sc[1], R[i][2] * sc[2], R[i][3] * sc[3], t[i] } end
-	B[4] = { 0, 0, 0, 1 }
-	local out = {}
-	for i = 1, 4 do
-		for j = 1, 4 do
-			local v = 0
-			for k = 1, 4 do v = v + B[i][k] * m[(k - 1) * 4 + j] end
-			out[#out + 1] = string.format("%.7g", v)
-		end
-	end
-	local newMtx = '<matrix sid="transform">' .. table.concat(out, " ") .. '</matrix>'
-	if mtx then
-		return (string.gsub(block, "<matrix[^>]*>[^<]*</matrix>", function() return newMtx end, 1))
-	end
-	return (string.gsub(block, "^(<node[^>]*>)", function(open) return open .. newMtx end, 1))
 end
 
 local function loadMaterialsNear(file)
@@ -1481,7 +676,7 @@ local function runWheelJob(job)
 	end
 	local found = {}
 	for fl, names in pairs(byFile) do
-		local part = filterDae(fl, names, {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}, nil)
+		local part = D.filterDae(fl, names, {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}, nil)
 		coroutine.yield()
 		if part then
 			for _, n in ipairs(part.nodes) do
@@ -1497,17 +692,17 @@ local function runWheelJob(job)
 	for _, e in ipairs(job.m) do
 		local fnd = found[e[1]]
 		local part = fnd and fnd.part
-		local gsig = part and daeSignature(part.header)
+		local gsig = part and D.daeSignature(part.header)
 		local up = part and (string.match(part.header, "<up_axis>(.-)</up_axis>") or "Z_UP")
 		local unit = part and tonumber(string.match(part.header, '<unit[^>]-meter="([^"]+)"') or "1") or 1
 		if unit <= 0 then unit = 1 end
 		sig0 = sig0 or gsig
-		local baked = part and up == "Z_UP" and gsig == sig0 and bakeNode(fnd.node.block, e, unit)
+		local baked = part and up == "Z_UP" and gsig == sig0 and D.bakeNode(fnd.node.block, e, unit)
 		if baked then
 			local g = groups[part]
 			if not g then g = { header = part.header, nodes = {}, geoms = {}, used = {}, file = fnd.file } groups[part] = g order[#order + 1] = g end
 			g.nodes[#g.nodes + 1] = baked
-			collectMaterials(baked, mats)
+			D.collectMaterials(baked, mats)
 			local url = fnd.node.url
 			if not g.used[url] and part.geomById[url] then g.used[url] = true g.geoms[#g.geoms + 1] = part.geomById[url] end
 			used = used + 1
@@ -1522,15 +717,15 @@ local function runWheelJob(job)
 	end
 	setPhase("wheel merge")
 	FS:directoryCreate(CACHE_DIR, true)
-	local text = mergeDae(order)
+	local text = D.mergeDae(order)
 	coroutine.yield()
-	if not writePieces(job.key, text) then wheelFiles[job.key] = "failed" return end
+	if not D.writePieces(job.key, text) then wheelFiles[job.key] = "failed" return end
 	text = nil
 	setPhase("materials")
 	for _, g in ipairs(order) do loadMaterialsNear(g.file) end
 	local matList = {}
 	for name in pairs(mats) do matList[#matList + 1] = name end
-	ensureMaterials(matList)
+	D.ensureMaterials(matList)
 	table.sort(matList)
 	wheelInfo[job.key] = { tire = hasTire, rim = hasRim, mats = matList }
 	jsonWriteFile((string.gsub(job.key, "%.dae$", ".json")), wheelInfo[job.key], false)
@@ -1587,7 +782,7 @@ local function runJob(job)
 			shape.skin = meta.skin or nil
 			setPhase("materials")
 			loadModelMaterials(job.model)
-			ensureMaterials(meta.materials)
+			D.ensureMaterials(meta.materials)
 			shape.materials = meta.materials
 			shape.paths = meta.paths
 			shape.tiers = meta.tiers
@@ -1624,7 +819,7 @@ local function runJob(job)
 		if ok then
 			setPhase("materials")
 			loadModelMaterials(job.model)
-			ensureMaterials(mm.materials)
+			D.ensureMaterials(mm.materials)
 			shape.materials = mm.materials
 			mm.sound = shape.sound -- per config, the mesh set is shared by configs with other engines
 			finishBBox(shape, mm.bbox, job.model)
@@ -1664,10 +859,10 @@ local function runJob(job)
 		setPhase("dae scan")
 		local scratch = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
 		for _, dae in ipairs(daes) do
-			local part = filterDae(dae, unknown, scratch, nil)
+			local part = D.filterDae(dae, unknown, scratch, nil)
 			if part then
 				parsed[dae] = part
-				info.gs[dae] = daeSignature(part.header)
+				info.gs[dae] = D.daeSignature(part.header)
 				for _, n in ipairs(part.nodes) do
 					if unknown[n.name] then -- first file with the name wins (all its nodes of that name are used)
 						unknown[n.name] = nil
@@ -1715,9 +910,9 @@ local function runJob(job)
 	for _, n in ipairs(all) do if n.size > maxSize then maxSize = n.size end end
 	local function visible(n) return isWantedMesh(n.name or "") end
 	local selections = {
-		[TIER_FULL] = function() return selectNodes(all, nil, 0, 0) end,
-		[TIER_PARTS] = function() return selectNodes(all, visible, cfg.triBudget, 0) end,
-		[TIER_SHELL] = function() return selectNodes(all, visible, math.max(3000, math.floor(cfg.triBudget / 6)), maxSize * 0.25) end,
+		[TIER_FULL] = function() return D.selectNodes(all, nil, 0, 0) end,
+		[TIER_PARTS] = function() return D.selectNodes(all, visible, cfg.triBudget, 0) end,
+		[TIER_SHELL] = function() return D.selectNodes(all, visible, math.max(3000, math.floor(cfg.triBudget / 6)), maxSize * 0.25) end,
 	}
 	-- the kept meshes of a tier become shared pieces: one file per (source .dae, jbeam part) when that part holds at
 	-- least PC.minBytes of geometry, the small rest of the tier in one file per .dae unit / up axis. File names hash
@@ -1789,7 +984,7 @@ local function runJob(job)
 		for nm in pairs(names) do if not have[nm] then part = nil break end end
 		if not part then
 			setPhase("dae scan")
-			parsed[f] = filterDae(f, names, {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}, nil)
+			parsed[f] = D.filterDae(f, names, {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}, nil)
 			coroutine.yield()
 		end
 	end
@@ -1814,10 +1009,10 @@ local function runJob(job)
 			end
 			if ok and #lists > 0 then
 				setPhase("merge")
-				local text = mergeDae(lists)
+				local text = D.mergeDae(lists)
 				coroutine.yield()
 				setPhase("write") -- streamed in slices, budget checks between them
-				if writePieces(path, text) then built = built + 1 else ok = false end
+				if D.writePieces(path, text) then built = built + 1 else ok = false end
 				text = nil
 				coroutine.yield()
 			end
@@ -1836,9 +1031,9 @@ local function runJob(job)
 	local matList = {}
 	for name in pairs(mats) do matList[#matList + 1] = name end
 	table.sort(matList)
-	ensureMaterials(matList)
+	D.ensureMaterials(matList)
 	shape.materials = matList
-	local metaData = { sig = sig, paths = paths, tiers = tiers, bbox = validBBox(bbox) and bbox or nil, materials = matList }
+	local metaData = { sig = sig, paths = paths, tiers = tiers, bbox = D.validBBox(bbox) and bbox or nil, materials = matList }
 	jsonWriteFile(meshMetaFile, metaData, false)
 	finishBBox(shape, bbox, job.model)
 	local wl, why = resolveWheels(job)
@@ -2012,7 +1207,6 @@ local function tierPaths(shape, tier)
 	return shape.tiers and (shape.tiers[tier] or shape.tiers[tostring(tier)]) or shape.paths
 end
 
-
 -- nil when every file of the tier is loaded this session, else the wait between two such first uses
 local function importInterval(shape, tier)
 	local cached, any = true, false
@@ -2113,7 +1307,7 @@ local function attach(p, shape, tier)
 				end
 				-- livery: "material=material.<slot>.<skin>" pairs (skinField); always set, pooled objects may carry an
 				-- earlier proxy's skin
-				obj:setField('skin', 0, cfg.liveries and skinField(shape.skin, shape.materials, string.match(p.meshKey or "", "^(.-)_v%d")) or "")
+				obj:setField('skin', 0, cfg.liveries and D.skinField(shape.skin, shape.materials, string.match(p.meshKey or "", "^(.-)_v%d")) or "")
 				obj.hidden = false
 				p.meshObjects[#p.meshObjects + 1] = { path = path, id = id, obj = obj }
 			end
@@ -2165,7 +1359,7 @@ local function attachWheels(p, shape)
 		local obj = id and scenetree.findObjectById(id)
 		if obj then
 			local info = wheelInfo[path]
-			obj:setField('skin', 0, cfg.liveries and info and skinField(shape.skin, info.mats, "wheel " .. tostring(shape.wheels[i].n)) or "")
+			obj:setField('skin', 0, cfg.liveries and info and D.skinField(shape.skin, info.mats, "wheel " .. tostring(shape.wheels[i].n)) or "")
 			obj.hidden = false
 			p.wheelObjects[i] = { path = path, id = id, obj = obj, roll = 0, info = wheelInfo[path] }
 		end
@@ -2778,7 +1972,7 @@ local function reset()
 	allObjects = {}
 	pools = {}
 	liveCount = 0
-	table.clear(skinFields) -- found / missing skin materials are per mission too
+	table.clear(D.skinFields) -- found / missing skin materials are per mission too
 	materialsLoaded = {} -- materials are invalidated on mission end (core_vehicle_manager does the same)
 	shapes = {} -- rebuilt from the disk cache (cheap) on the next request
 	jobs = {}
