@@ -962,6 +962,17 @@ local function soundFor(v)
 end
 
 local SHIFT_TIME = 0.5 -- s, fake automatic gearbox (proxyEngineAutoShift)
+local RAD_TO_RPM = 60 / (2 * math.pi)
+-- engine rpm in a gear: from the config's gear ratios, final drive and wheel radius when the mesh builder found them
+-- (snd.gear, see MPProxyMeshGE addGearing), otherwise a generic m/s per gear. No closure: runs every frame per sound.
+local function rpmIn(gear, speed, idle, redline, perGear, gr, reverse)
+	if gr then
+		local ratio = reverse and gr.r or gr.f[math.min(math.max(gear, 1), #gr.f)]
+		return math.max(idle, speed / gr.rad * ratio * gr.fd * RAD_TO_RPM)
+	end
+	return idle + speed / (perGear * math.max(gear, 1)) * (redline - idle)
+end
+
 local function estimateRpm(p, diesel, speed, snd)
 	local idle, redline = diesel and 650 or 850, diesel and 2400 or 6200
 	if snd and snd.idleRPM and snd.maxRPM and snd.maxRPM > snd.idleRPM + 500 then idle, redline = snd.idleRPM, snd.maxRPM end
@@ -972,9 +983,11 @@ local function estimateRpm(p, diesel, speed, snd)
 		return idle + thr * (redline - idle) * 0.7, thr
 	end
 	local n = tonumber(g and string.match(g, "%d+"))
-	local perGear = diesel and 4 or 9 -- m/s per gear at redline in first, grows with the gear
-	if g == "R" then n = 1 end
-	local function rpmIn(gear) return idle + speed / (perGear * math.max(gear, 1)) * (redline - idle) end
+	local perGear = diesel and 4 or 9 -- m/s per gear at redline in first, grows with the gear (no gearing data)
+	local gr = snd and snd.gear or nil
+	local reverse = g == "R"
+	if reverse then n = 1 end
+	local maxGear = gr and #gr.f or 8
 	if not n and cfg.autoShift then
 		-- automatic (D): a remembered gear that shifts up past a throttle dependent rpm, down below a lower one
 		-- (hysteresis), kicks down on full throttle, and blends the rpm over SHIFT_TIME while shifting
@@ -983,17 +996,17 @@ local function estimateRpm(p, diesel, speed, snd)
 		local down = idle + (redline - idle) * (0.18 + 0.35 * thr)
 		local want = cur
 		if clock >= (p.sndShiftEnd or 0) then
-			if want < 8 and rpmIn(want) > up then want = want + 1
-			elseif want > 1 and rpmIn(want) < down then want = want - 1
-			elseif thr > 0.85 and want > 1 and rpmIn(want - 1) < redline * 0.92 and rpmIn(want) < idle + (redline - idle) * 0.6 then
+			if want < maxGear and rpmIn(want, speed, idle, redline, perGear, gr) > up then want = want + 1
+			elseif want > 1 and rpmIn(want, speed, idle, redline, perGear, gr) < down then want = want - 1
+			elseif thr > 0.85 and want > 1 and rpmIn(want - 1, speed, idle, redline, perGear, gr) < redline * 0.92 and rpmIn(want, speed, idle, redline, perGear, gr) < idle + (redline - idle) * 0.6 then
 				want = want - 1 -- kickdown
 			end
 		end
 		if want ~= cur then
-			p.sndShiftFrom, p.sndShiftStart, p.sndShiftEnd = rpmIn(cur), clock, clock + SHIFT_TIME
+			p.sndShiftFrom, p.sndShiftStart, p.sndShiftEnd = rpmIn(cur, speed, idle, redline, perGear, gr), clock, clock + SHIFT_TIME
 			p.sndAutoGear = want
 		end
-		local rpm = rpmIn(p.sndAutoGear or 1)
+		local rpm = rpmIn(p.sndAutoGear or 1, speed, idle, redline, perGear, gr)
 		if p.sndShiftEnd and clock < p.sndShiftEnd then
 			local f = (clock - p.sndShiftStart) / SHIFT_TIME
 			rpm = p.sndShiftFrom + (rpm - p.sndShiftFrom) * f
@@ -1004,10 +1017,10 @@ local function estimateRpm(p, diesel, speed, snd)
 	if not n then -- automatic: shift up once past a throttle dependent point
 		local shiftAt = redline * (0.45 + 0.4 * thr)
 		n = 1
-		while n < 8 and idle + speed / (perGear * n) * (redline - idle) > shiftAt do n = n + 1 end
+		while n < maxGear and rpmIn(n, speed, idle, redline, perGear, gr) > shiftAt do n = n + 1 end
 	end
 	p.sndAutoGear = math.max(n, 1)
-	local rpm = rpmIn(n)
+	local rpm = rpmIn(n, speed, idle, redline, perGear, gr, reverse)
 	return math.min(math.max(rpm, idle), redline), thr
 end
 

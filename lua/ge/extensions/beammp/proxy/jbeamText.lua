@@ -87,7 +87,8 @@ local function extractFlexbodies(text, out, sections, wheelSecs)
 			elseif depth == 3 and c == 91 and isKey and lastString == "flexbodies" and partName then flexStart = s
 			elseif depth == 3 and c == 91 and isKey and partName and wheelSecs and WHEEL_KEYS[lastString] then arrStart, arrKey = s, lastString
 			elseif depth == 3 and c == 123 and isKey and partName and sections
-				and (lastString == "mainEngine" or sub(lastString, 1, 11) == "soundConfig") then secStart, secKey = s, lastString end
+				and (lastString == "mainEngine" or sub(lastString, 1, 11) == "soundConfig" or lastString == "gearbox"
+					or sub(lastString, 1, 12) == "differential") then secStart, secKey = s, lastString end
 			lastString = nil
 			pos = s + 1
 		else
@@ -138,12 +139,28 @@ local function keepFields(decoded, fields)
 	return any and out or nil
 end
 
--- engine[partName] = { mainEngine = {...}, [soundConfig section name] = {...} }
+-- gearbox / differential sections: the ratios, numbers or "$variable" / "$=expression" strings (evaluated
+-- with the config's variables by the caller, see evalVal)
+local function keepGearing(d)
+	local out = nil
+	if type(d.gearRatios) == "table" then
+		local list = {}
+		for i, v in ipairs(d.gearRatios) do
+			if type(v) == "number" or type(v) == "string" then list[i] = v else list = nil break end
+		end
+		if list and #list > 0 then out = { gearRatios = list } end
+	end
+	if type(d.gearRatio) == "number" or type(d.gearRatio) == "string" then out = out or {} out.gearRatio = d.gearRatio end
+	return out
+end
+
+-- engine[partName] = { mainEngine = {...}, [soundConfig section name] = {...}, gearbox = {...}, differential_X = {...} }
 local function addEngineSections(engine, sectionTexts, filename)
 	for partName, secs in pairs(sectionTexts) do
 		for key, txt in pairs(secs) do
 			local ok, d = pcall(jsonDecode, txt, filename)
-			local kept = ok and type(d) == "table" and keepFields(d, key == "mainEngine" and ENGINE_FIELDS or SOUND_FIELDS) or nil
+			local gearing = key == "gearbox" or string.sub(key, 1, 12) == "differential"
+			local kept = ok and type(d) == "table" and (gearing and keepGearing(d) or (not gearing and keepFields(d, key == "mainEngine" and ENGINE_FIELDS or SOUND_FIELDS))) or nil
 			if kept then
 				engine[partName] = engine[partName] or {}
 				engine[partName][key] = kept

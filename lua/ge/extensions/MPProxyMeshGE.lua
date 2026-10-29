@@ -203,7 +203,7 @@ local function modelSignature(model)
 	return sig
 end
 
-local ENGINE_INDEX_VERSION = 7 -- 7: hub / brake disc flexbodies; 6: livery fields; part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists, 5: node mass buckets)
+local ENGINE_INDEX_VERSION = 8 -- 8: gearbox / differential ratios; 7: hub / brake disc flexbodies; 6: livery fields; part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists, 5: node mass buckets)
 local BODY_VERSION = 4 -- per config meta, mesh set meta and piece names (4: meshes merged by material; 3: parts under MIN_FAR_PART left out of the far tiers; 2: wheel / tire / brake meshes left out of the body)
 
 local engineIndex = {} -- [model] = engine sections by part (see addEngineSections)
@@ -278,7 +278,7 @@ local function buildPartIndex(model)
 		local data = nil
 		local text = readFile(filename)
 		checkBudget()
-		local hasSound = text and string.find(text, "soundConfig", 1, true)
+		local hasSound = text and (string.find(text, "soundConfig", 1, true) or string.find(text, "gearRatio", 1, true))
 		if text then
 			if J.extractFlexbodies(text, flexTexts, hasSound and sectionTexts or nil, wheelSecs) then
 				J.addEngineSections(engine, sectionTexts, filename)
@@ -524,6 +524,52 @@ local function blendEvent(folder, name)
 	return type(ev) == "string" and ev ~= "" and ev or nil
 end
 
+-- gearing of a config for the proxy engine rpm (MPProxyGE.estimateRpm): forward ratios, reverse, final drive
+-- (largest differential ratio of the config, a transfer case low range is ignored) and the median wheel radius.
+-- sound.gear stays nil when anything is missing (electric drive, no wheels...), the rpm then uses the generic model.
+local GEAR_VERSION = 1
+local function addGearing(job, sound, wheels)
+	sound.gearV = GEAR_VERSION
+	sound.gear = nil
+	local index = engineIndex[job.model] or {}
+	local vars = {}
+	local widx = wheelIndex[job.model] or {}
+	for _, partName in ipairs(job.parts) do
+		local d = widx[partName] or (commonWheelIndex and commonWheelIndex[partName])
+		if d and d.vars then for k, v in pairs(d.vars) do vars[k] = v end end
+	end
+	if type(job.vcf) == "table" and type(job.vcf.vars) == "table" then for k, v in pairs(job.vcf.vars) do vars[k] = v end end
+	local ratios, final = nil, 0
+	for _, partName in ipairs(job.parts) do
+		local e = index[partName]
+		if e then
+			for key, sec in pairs(e) do
+				if key == "gearbox" and sec.gearRatios then ratios = sec.gearRatios
+				elseif string.sub(key, 1, 12) == "differential" and sec.gearRatio then
+					local r = J.evalVal(sec.gearRatio, vars)
+					if r and r > final then final = r end
+				end
+			end
+		end
+	end
+	local radii = {}
+	for _, w in ipairs(type(wheels) == "table" and wheels or {}) do if tonumber(w.r) and w.r > 0.1 then radii[#radii + 1] = w.r end end
+	table.sort(radii)
+	local rad = radii[math.max(1, math.ceil(#radii / 2))]
+	if not ratios or final <= 0 or not rad then return end
+	-- gearRatios: { reverse, 0 (neutral), first, second, ... } like the game's gearboxes
+	local fwd, rev = {}, nil
+	for i, v in ipairs(ratios) do
+		local r = J.evalVal(v, vars)
+		if not r then return end
+		if r < 0 then rev = rev or -r elseif r > 0 and i > 1 then fwd[#fwd + 1] = r end
+	end
+	if #fwd == 0 then return end
+	sound.gear = { f = fwd, r = rev or fwd[1], fd = final, rad = rad }
+	log('I', 'MPProxyMeshGE', string.format("Proxy gearing for %s/%s: %d gears %s, final drive %.2f, wheel radius %.2f m", job.model, string.sub(job.key, -16),
+		#fwd, table.concat(fwd, "/"), final, rad))
+end
+
 local function resolveSound(job, cachedNote)
 	if type(partIndex[job.model]) ~= "table" then
 		setPhase("part index")
@@ -761,8 +807,9 @@ local function runJob(job)
 		local allExist = true
 		for _, p in ipairs(meta.paths) do if not FS:fileExists(p) then allExist = false end end
 		if allExist then
-			if type(meta.sound) ~= "table" then
+			if type(meta.sound) ~= "table" or meta.sound.gearV ~= GEAR_VERSION then
 				meta.sound = resolveSound(job)
+				addGearing(job, meta.sound, meta.wheels)
 				jsonWriteFile(metaFile, meta, false)
 			else
 				log('I', 'MPProxyMeshGE', string.format("Proxy engine sound for %s/%s: %s (source: %s, cached)", job.model, string.sub(job.key, -16), meta.sound.event or "type mapping", tostring(meta.sound.source)))
@@ -776,6 +823,7 @@ local function runJob(job)
 				meta.skin = job.skin or false
 				meta.wheelV, meta.wheelDet = WHEEL_VERSION, cfg.wheelDetails
 				logWheels(job, meta.wheels or nil, why)
+				addGearing(job, meta.sound, meta.wheels)
 				jsonWriteFile(metaFile, meta, false)
 			elseif meta.wheels then
 				logWheels(job, meta.wheels, ", cached")
@@ -829,6 +877,7 @@ local function runJob(job)
 			local w, why = resolveWheels(job)
 			shape.wheels = checkWheels(w, shape)
 			logWheels(job, shape.wheels, why)
+			addGearing(job, shape.sound, shape.wheels)
 			shape.com, shape.skin = job.com, job.skin
 			mm.wheels, mm.wheelV, mm.bodyV, mm.com, mm.skin = shape.wheels or false, WHEEL_VERSION, BODY_VERSION, job.com or false, job.skin or false
 			mm.wheelDet = cfg.wheelDetails
@@ -1053,6 +1102,7 @@ local function runJob(job)
 	finishBBox(shape, bbox, job.model)
 	local wl, why = resolveWheels(job)
 	shape.wheels = checkWheels(wl, shape)
+	addGearing(job, shape.sound, shape.wheels)
 	shape.com, shape.skin = job.com, job.skin
 	logWheels(job, shape.wheels, why)
 	metaData.com, metaData.skin, metaData.wheelDet = job.com or false, job.skin or false, cfg.wheelDetails
