@@ -600,7 +600,7 @@ end
 -- (x away from the center line: posX + sign(posX) * x, lua/common/jbeam/utils.lua), pressureWheels options apply
 -- to the wheel rows after them, and each wheel is placed like lua/common/jbeam/sections/wheelTypes/pressureWheels.lua:
 -- midpoint of node1/node2 (or offsetFromNode), moved by wheelOffset along the axis, tireWidth wide, radius.
-local WHEEL_VERSION = 5 -- 5: livery (skin) name; 4: 4: centre of mass estimate; 3: tire flag per mesh; 2: named fields (mixed tables did not survive the json round trip), rim / tire meshes
+local WHEEL_VERSION = 6 -- 6: every skin slot; 5: livery (skin) name; 4: 4: centre of mass estimate; 3: tire flag per mesh; 2: named fields (mixed tables did not survive the json round trip), rim / tire meshes
 local MAX_WHEEL_MESHES = 6 -- per wheel
 
 -- jbeam values: numbers, "$var", or "$=expression" (arithmetic, comparisons, and/or/not, case(c1, v1, ..., default),
@@ -686,7 +686,9 @@ local function resolveWheels(job)
 				local slot = (d.skin.skinType and d.skin.skinType ~= "") and d.skin.skinType or st
 				if slot == "paint_design" then slot = "" end
 				local nm = d.skin.skinName or d.skin.globalSkin
-				if nm and nm ~= "" and string.sub(nm, 1, 1) ~= "$" then job.skin = slot .. "." .. nm end
+				if nm and nm ~= "" and string.sub(nm, 1, 1) ~= "$" then -- several skin slots: "a.x;b.y"
+					job.skin = (job.skin and (job.skin .. ";") or "") .. slot .. "." .. nm
+				end
 			end
 		end
 		if d.mass then for _, g in ipairs(d.mass) do mass[#mass + 1] = { g, off } end end
@@ -1280,6 +1282,40 @@ local function ensureMaterials(list)
 	end
 end
 
+-- TSStatic skin field: "old=new" pairs (";" separated) rename material targets starting with "old" to the same name
+-- with "new" in its place, only when a Material named like the result exists. Vehicle skin materials are named
+-- "<material>.<slot>.<skin>", the paint_design slot ("" in the vehicle skin string) as "skin" (e.g. pickup.skin.old,
+-- autobello_interior_a.skin_interior.black in the game's materials.json files), so each material of the merged
+-- file gets its own pair when that skin material exists. Longest names first, so "pickup_dark" is not caught by the
+-- shorter "pickup" pair. Memoized per skin string and material list.
+local skinFields = {}
+local function skinField(skin, mats, what)
+	if not skin or skin == "" or type(mats) ~= "table" or #mats == 0 then return "" end
+	local key = skin .. "|" .. table.concat(mats, ",")
+	local v = skinFields[key]
+	if v then return v end
+	local sorted = {}
+	for _, m in ipairs(mats) do sorted[#sorted + 1] = m end
+	table.sort(sorted, function(a, b) if #a ~= #b then return #a > #b end return a < b end)
+	local rules, found, missing = {}, {}, 0
+	for entry in string.gmatch(skin, "[^;]+") do
+		local slot, nm = string.match(entry, "^([^.]*)%.(.+)$")
+		if nm then
+			local mid = (slot == "" and "skin" or slot) .. "." .. nm
+			for _, m in ipairs(sorted) do
+				local target = m .. "." .. mid
+				if scenetree.findObject(target) then rules[#rules + 1] = m .. "=" .. target found[#found + 1] = target
+				else missing = missing + 1 end
+			end
+		end
+	end
+	v = table.concat(rules, ";")
+	skinFields[key] = v
+	log(#rules > 0 and 'I' or 'W', 'MPProxyMeshGE', string.format("Proxy livery %s for %s: skin field \"%s\" (%d renames, %d material / skin pairs have no skin material%s)",
+		skin, tostring(what), v, #rules, missing, #found > 0 and (": " .. table.concat(found, ", ")) or ", nothing to rename"))
+	return v
+end
+
 -- ============= REAL WHEEL MESHES =============
 -- Each wheel of a config (rim, tire, hubcap flexbodies from resolveWheels) becomes a small .dae of its own: the
 -- meshes are copied from the shared /vehicles/common/ (or the model's) .dae files with the jbeam flexbody
@@ -1506,7 +1542,8 @@ local function runWheelJob(job)
 	local matList = {}
 	for name in pairs(mats) do matList[#matList + 1] = name end
 	ensureMaterials(matList)
-	wheelInfo[job.key] = { tire = hasTire, rim = hasRim }
+	table.sort(matList)
+	wheelInfo[job.key] = { tire = hasTire, rim = hasRim, mats = matList }
 	jsonWriteFile((string.gsub(job.key, "%.dae$", ".json")), wheelInfo[job.key], false)
 	wheelFiles[job.key] = "ready"
 	log(#missing > 0 and 'W' or 'I', 'MPProxyMeshGE', string.format("Proxy wheel mesh %s for %s: %d of %d meshes (%s) from %d files, tire %s, rim %s%s",
@@ -1550,6 +1587,7 @@ local function runJob(job)
 			setPhase("materials")
 			loadModelMaterials(job.model)
 			ensureMaterials(meta.materials)
+			shape.materials = meta.materials
 			shape.paths = meta.paths
 			shape.tiers = meta.tiers
 			shape.fromCache = true -- built in an earlier session
@@ -1586,6 +1624,7 @@ local function runJob(job)
 			setPhase("materials")
 			loadModelMaterials(job.model)
 			ensureMaterials(mm.materials)
+			shape.materials = mm.materials
 			mm.sound = shape.sound -- per config, the mesh set is shared by configs with other engines
 			finishBBox(shape, mm.bbox, job.model)
 			local w, why = resolveWheels(job)
@@ -1676,6 +1715,7 @@ local function runJob(job)
 	for name in pairs(mats) do matList[#matList + 1] = name end
 	table.sort(matList)
 	ensureMaterials(matList)
+	shape.materials = matList
 	local metaData = { sig = sig, paths = paths, tiers = tiers, bbox = validBBox(bbox) and bbox or nil, materials = matList }
 	jsonWriteFile(meshMetaFile, metaData, false)
 	finishBBox(shape, bbox, job.model)
@@ -1930,9 +1970,9 @@ local function attach(p, shape, tier)
 				if cfg.metallicPaint then -- same field and format the game sets on vehicles (core/vehicle/partmgmt.lua)
 					for i = 1, 3 do obj:setField('metallicPaintData', i - 1, metallicString(paints[i] or paints[1])) end
 				end
-				-- livery: the TSStatic skin field takes the same "<slot>.<name>" string as vehicleObj:setSkin; always set,
-				-- pooled objects may carry an earlier proxy's skin
-				obj:setField('skin', 0, (cfg.liveries and shape.skin) or "")
+				-- livery: "material=material.<slot>.<skin>" pairs (skinField); always set, pooled objects may carry an
+				-- earlier proxy's skin
+				obj:setField('skin', 0, cfg.liveries and skinField(shape.skin, shape.materials, string.match(p.meshKey or "", "^(.-)_v%d")) or "")
 				obj.hidden = false
 				p.meshObjects[#p.meshObjects + 1] = { path = path, id = id, obj = obj }
 			end
@@ -1983,6 +2023,8 @@ local function attachWheels(p, shape)
 		end
 		local obj = id and scenetree.findObjectById(id)
 		if obj then
+			local info = wheelInfo[path]
+			obj:setField('skin', 0, cfg.liveries and info and skinField(shape.skin, info.mats, "wheel " .. tostring(shape.wheels[i].n)) or "")
 			obj.hidden = false
 			p.wheelObjects[i] = { path = path, id = id, obj = obj, roll = 0, info = wheelInfo[path] }
 		end
@@ -2558,6 +2600,7 @@ local function reset()
 	allObjects = {}
 	pools = {}
 	liveCount = 0
+	table.clear(skinFields) -- found / missing skin materials are per mission too
 	materialsLoaded = {} -- materials are invalidated on mission end (core_vehicle_manager does the same)
 	shapes = {} -- rebuilt from the disk cache (cheap) on the next request
 	jobs = {}
