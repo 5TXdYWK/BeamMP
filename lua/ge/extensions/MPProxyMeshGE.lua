@@ -1954,9 +1954,54 @@ local function cleanOldCache()
 		pruned > 0 and string.format(", removed %d least recently used (%.2f GB)", pruned, prunedBytes / 1073741824) or ""))
 end
 
+-- prebuild coverage (settings tab button, never on its own): how many installed models have their default config
+-- proxy mesh built and compiled. Spread over frames (1 ms each), it reads one .pc and one cache .json per model.
+local scan = nil
+local function stepScan()
+	local t0 = os.clock()
+	while scan.i < #scan.models and os.clock() - t0 < 0.001 do
+		scan.i = scan.i + 1
+		local model = scan.models[scan.i]
+		local vcf = defaultConfig(model)
+		if not vcf then scan.noConfig = scan.noConfig + 1
+		else
+			local key = configKey(model, vcf)
+			local meta = FS:fileExists(CACHE_DIR .. key .. ".json") and jsonReadFile(CACHE_DIR .. key .. ".json") or nil
+			local paths = type(meta) == "table" and type(meta.paths) == "table" and meta.paths or nil
+			if not paths or #paths == 0 then scan.missing = scan.missing + 1
+			else
+				local all = true
+				for _, path in ipairs(paths) do if not hasCdae(path) then all = false break end end
+				if all then scan.ready = scan.ready + 1 else scan.built = scan.built + 1 end
+			end
+		end
+	end
+	if scan.i < #scan.models then return end
+	local n = #scan.models - scan.noConfig
+	local msg = string.format("%d of %d models ready (%d%%), %d built but not compiled yet, %d not built%s", scan.ready, n,
+		n > 0 and math.floor(scan.ready * 100 / n + 0.5) or 0, scan.built, scan.missing,
+		scan.noConfig > 0 and string.format(", %d without a default config", scan.noConfig) or "")
+	log('I', 'MPProxyMeshGE', string.format("Prebuild coverage: %s (scan %.0f ms over %d frames)", msg, (os.clock() - scan.t0) * 1000, scan.frames))
+	guihooks.trigger("toastrMsg", { type = scan.missing + scan.built == 0 and "success" or "info", title = "Proxy prebuild coverage", msg = msg, config = { timeOut = 10000 } })
+	scan = nil
+end
+
+local function scanCoverage()
+	if scan then return end
+	local ok, list = pcall(function() return core_vehicles.getModelList().models end)
+	local models = {}
+	for name, info in pairs(ok and type(list) == "table" and list or {}) do
+		if type(info) == "table" and info.Type ~= "Prop" and name ~= "unicycle" then models[#models + 1] = name end
+	end
+	table.sort(models)
+	scan = { models = models, i = 0, ready = 0, built = 0, missing = 0, noConfig = 0, t0 = os.clock(), frames = 0 }
+	guihooks.trigger("toastrMsg", { type = "info", title = "Proxy prebuild coverage", msg = string.format("Scanning %d models...", #models), config = { timeOut = 3000 } })
+end
+
 local function onUpdate(dtReal)
 	clock = clock + (dtReal or 0)
 	suspFrame = suspFrame + 1
+	if scan then scan.frames = scan.frames + 1 stepScan() end
 	if not cfg.enabled then return end
 	updateFpsCap(dtReal or 0, clock)
 	if currentJob or #jobs > 0 or #wheelJobs > 0 then
@@ -2098,6 +2143,7 @@ M.forget            = forget
 M.reset             = reset
 M.onUpdate          = onUpdate
 M.getStats          = getStats
+M.scanCoverage      = scanCoverage
 M.isEnabled         = function() return cfg.enabled end
 M.onSettingsChanged = onSettingsChanged
 M.onExtensionLoaded = onExtensionLoaded
