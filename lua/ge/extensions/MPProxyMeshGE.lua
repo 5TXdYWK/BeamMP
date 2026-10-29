@@ -46,6 +46,7 @@ local cfg = { enabled = true, distance = 500, maxProxies = 48, wheels = true, ta
 -- and small trim left out, within the triangle budget), 3 = shell (only the biggest body panels). Further out
 -- MPProxyGE draws a low poly car shape and, at the far end, a box in the paint colour.
 local TIER_FULL, TIER_PARTS, TIER_SHELL = 1, 2, 3
+local MIN_FAR_PART = 0.12 -- m, largest bounds dimension a part needs to be kept in the parts and shell tiers
 local LOD_HYSTERESIS = 0.1 -- a tier boundary is moved out by this fraction (plus 3 m) for proxies already inside
 
 local function readSettings()
@@ -201,7 +202,7 @@ local function modelSignature(model)
 end
 
 local ENGINE_INDEX_VERSION = 7 -- 7: hub / brake disc flexbodies; 6: livery fields; part index files without this are rebuilt once (2: wheel sections, 3: wheel flexbodies, 4: no wheel meshes in the body lists, 5: node mass buckets)
-local BODY_VERSION = 2 -- per config meta written before this is not reused as is (2: wheel / tire / brake meshes left out of the body)
+local BODY_VERSION = 3 -- per config meta and mesh set meta written before this are not reused (3: parts under MIN_FAR_PART left out of the far tiers; 2: wheel / tire / brake meshes left out of the body)
 
 local engineIndex = {} -- [model] = engine sections by part (see addEngineSections)
 
@@ -810,7 +811,7 @@ local function runJob(job)
 	local meshList = {}
 	for mesh in pairs(wanted) do meshList[#meshList + 1] = mesh end
 	table.sort(meshList)
-	local meshKey = job.model .. "_" .. CACHE_VERSION .. "_m" .. hashString(job.model .. "|" .. cfg.triBudget .. "|" .. table.concat(meshList, ","))
+	local meshKey = job.model .. "_" .. CACHE_VERSION .. "_m" .. hashString(job.model .. "|" .. cfg.triBudget .. "|" .. BODY_VERSION .. "|" .. table.concat(meshList, ","))
 	local meshMetaFile = CACHE_DIR .. meshKey .. ".json"
 	if count > 0 and FS:fileExists(meshMetaFile) then
 		local mm = jsonReadFile(meshMetaFile)
@@ -908,11 +909,18 @@ local function runJob(job)
 	end
 	local maxSize = 0
 	for _, n in ipairs(all) do if n.size > maxSize then maxSize = n.size end end
-	local function visible(n) return isWantedMesh(n.name or "") end
+	-- the far tiers (parts from lodFull, shell from lodParts, 20 / 60 m by default) also leave out parts whose largest
+	-- bounds dimension is under MIN_FAR_PART m: a few pixels at that range, but each one is a mesh (draw call) of its
+	-- own. The full tier keeps them, so mirrors, lights and badges are there up close. Parts without bounds stay.
+	local function farVisible(n)
+		local b = n.e.b
+		if type(b) == "table" and b[1] and b[1] <= b[4] and math.max(b[4] - b[1], b[5] - b[2], b[6] - b[3]) < MIN_FAR_PART then return false end
+		return isWantedMesh(n.name or "")
+	end
 	local selections = {
 		[TIER_FULL] = function() return D.selectNodes(all, nil, 0, 0) end,
-		[TIER_PARTS] = function() return D.selectNodes(all, visible, cfg.triBudget, 0) end,
-		[TIER_SHELL] = function() return D.selectNodes(all, visible, math.max(3000, math.floor(cfg.triBudget / 6)), maxSize * 0.25) end,
+		[TIER_PARTS] = function() return D.selectNodes(all, farVisible, cfg.triBudget, 0) end,
+		[TIER_SHELL] = function() return D.selectNodes(all, farVisible, math.max(3000, math.floor(cfg.triBudget / 6)), maxSize * 0.25) end,
 	}
 	-- the kept meshes of a tier become shared pieces: one file per (source .dae, jbeam part) when that part holds at
 	-- least PC.minBytes of geometry, the small rest of the tier in one file per .dae unit / up axis. File names hash
