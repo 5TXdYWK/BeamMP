@@ -385,6 +385,49 @@ end
 -- shorter "pickup" pair. Memoized per skin string and material list.
 local skinFields = {}
 
+-- Fallback for liveries whose materials do not follow "<material>.<slot>.<skin>" (older and modded vehicles):
+-- a material of the merged file is renamed to an existing Material named like it plus a separator, an optional
+-- slot / "skin" part and the skin name ("<material>_<skin>", "<material>.skin_<skin>", "<material>.<slot>.<skin>"
+-- with another slot name...). Only names that start with the material's own name count, so a livery can
+-- never put another part's material (glass, chrome, a different panel) on a mesh. Material names are read once
+-- per mission (scenetree.findClassObjects), only when the regular method found nothing for a livery.
+local SEP = "[%._%-]"
+local function materialNames()
+	local names = skinFields["\0materials"]
+	if names then return names end
+	names = {}
+	for _, o in ipairs(scenetree.findClassObjects("Material") or {}) do
+		local n = type(o) == "string" and o or (type(o) == "userdata" or type(o) == "table") and o.getName and o:getName() or nil
+		if n then names[#names + 1] = n end
+	end
+	skinFields["\0materials"] = names
+	return names
+end
+local function fallbackRules(sorted, skinNames, found)
+	local rules = {}
+	local names = materialNames()
+	local taken = {}
+	for _, m in ipairs(sorted) do -- longest first, like the regular pairs
+		for _, nm in ipairs(skinNames) do
+			if not taken[m] then
+				for _, t in ipairs(names) do
+					if #t > #m and string.sub(t, 1, #m) == m then
+						local rest = string.sub(t, #m + 1)
+						local ok = string.match(rest, "^" .. SEP .. "(.+)$")
+						-- rest is "<sep><skin>" or "<sep><one slot or 'skin' word><sep><skin>", nothing else
+						local pre = ok and #ok > #nm and string.sub(ok, -#nm) == nm and string.sub(ok, 1, #ok - #nm) or nil
+						if ok and (ok == nm or (pre and string.match(pre, "^[%w_]+" .. SEP .. "$"))) then
+							rules[#rules + 1] = m .. "=" .. t found[#found + 1] = t taken[m] = true
+							break
+						end
+					end
+				end
+			end
+		end
+	end
+	return rules
+end
+
 local function skinField(skin, mats, what)
 	if not skin or skin == "" or type(mats) ~= "table" or #mats == 0 then return "" end
 	local key = skin .. "|" .. table.concat(mats, ",")
@@ -394,9 +437,11 @@ local function skinField(skin, mats, what)
 	for _, m in ipairs(mats) do sorted[#sorted + 1] = m end
 	table.sort(sorted, function(a, b) if #a ~= #b then return #a > #b end return a < b end)
 	local rules, found, missing = {}, {}, 0
+	local skinNames = {}
 	for entry in string.gmatch(skin, "[^;]+") do
 		local slot, nm = string.match(entry, "^([^.]*)%.(.+)$")
 		if nm then
+			skinNames[#skinNames + 1] = nm
 			local mid = (slot == "" and "skin" or slot) .. "." .. nm
 			for _, m in ipairs(sorted) do
 				local target = m .. "." .. mid
@@ -405,10 +450,15 @@ local function skinField(skin, mats, what)
 			end
 		end
 	end
+	local how = "per material"
+	if #rules == 0 and #skinNames > 0 then
+		rules = fallbackRules(sorted, skinNames, found)
+		how = "material rename fallback"
+	end
 	v = table.concat(rules, ";")
 	skinFields[key] = v
-	log(#rules > 0 and 'I' or 'W', 'MPProxyMeshGE', string.format("Proxy livery %s for %s: skin field \"%s\" (%d renames, %d material / skin pairs have no skin material%s)",
-		skin, tostring(what), v, #rules, missing, #found > 0 and (": " .. table.concat(found, ", ")) or ", nothing to rename"))
+	log(#rules > 0 and 'I' or 'W', 'MPProxyMeshGE', string.format("Proxy livery %s for %s: skin field \"%s\" (%s, %d renames, %d material / skin pairs have no skin material%s)",
+		skin, tostring(what), v, how, #rules, missing, #found > 0 and (": " .. table.concat(found, ", ")) or ", nothing to rename"))
 	return v
 end
 
