@@ -48,7 +48,7 @@
   "proxySwapCooldown"           : [ "local", 10 ],
   "proxyDrawDistance"           : [ "local", 3000 ],
   "proxyCollision"              : [ "local", false ],
-  "proxyCollisionRadius"        : [ "local", 40 ],
+  "proxyCollisionRadius"        : [ "local", 60 ],
   "proxyColliderPoolSize"       : [ "local", 4 ],
   "proxyColliderModel"          : [ "local", "simple_traffic" ],
   "proxyMeshEnabled"            : [ "local", true ],

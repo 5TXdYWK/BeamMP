@@ -13,6 +13,8 @@
 
 local M = {}
 
+local colliderPool = require("beammp.proxy.colliders")
+
 setmetatable(_G,{}) -- temporarily disable global notifications
 
 -- ============= SETTINGS =============
@@ -25,7 +27,7 @@ local cfg = {
 	cooldown = 10,        -- seconds a vehicle is not swapped again after a swap
 	drawDist = 3000,      -- proxies beyond this are not drawn
 	collision = false,
-	collisionRadius = 40,
+	collisionRadius = 60,
 	poolSize = 4,
 	colliderModel = "simple_traffic",
 	smoothHandover = true,
@@ -51,7 +53,6 @@ local MAX_RACC = 50            -- rad/s^2
 local OFFSET_SMOOTHING = 2     -- 1/s, how fast the sender clock offset follows new packets
 local SNAP_DISTANCE = 25       -- render position snaps instead of blending above this error
 local POS_BLEND = 12           -- 1/s, how fast the rendered pose converges to the prediction
-local COLLIDER_RELEASE_MARGIN = 15
 
 local function readSettings()
 	cfg.enabled = settings.getValue("enableProxyVehicles", true) ~= false
@@ -63,7 +64,7 @@ local function readSettings()
 	cfg.cooldown = math.max(0, tonumber(settings.getValue("proxySwapCooldown", 10)) or 10)
 	cfg.drawDist = tonumber(settings.getValue("proxyDrawDistance", 3000)) or 3000
 	cfg.collision = settings.getValue("proxyCollision", false) == true
-	cfg.collisionRadius = tonumber(settings.getValue("proxyCollisionRadius", 40)) or 40
+	cfg.collisionRadius = tonumber(settings.getValue("proxyCollisionRadius", 60)) or 60
 	cfg.poolSize = math.max(0, math.floor(tonumber(settings.getValue("proxyColliderPoolSize", 4)) or 4))
 	cfg.colliderModel = settings.getValue("proxyColliderModel", "simple_traffic") or "simple_traffic"
 	cfg.smoothHandover = settings.getValue("proxySmoothHandover", true) ~= false
@@ -167,8 +168,6 @@ local localVehPos = vec3()
 local hasLocalVeh = false
 
 local hybridActive = false  -- proxyHybridMode in effect (set by updateHybrid)
-local colliders = {}        -- [gameVehicleID] = { serverVehicleID = string|nil, ready = bool }
-local colliderCount = 0
 local nextColliderSpawnAllowed = 0
 
 -- garbage free temporaries
@@ -500,125 +499,17 @@ local function drawProxy(p, camPos, dist)
 	elseif dy < -hl then drawQuad(c[1], c[2], c[6], c[5], shade(p, 0.6, 235)) end
 end
 
--- ============= COLLIDER POOL (experimental, proxyCollision) =============
--- Moving a TSStatic with setPosRot only moves its render mesh, the static collision used by the vehicle physics is
--- baked and only rebuilt with be:reloadCollision() (a full world rebuild, see core/dynamicProps.lua), so a moving
--- static collision box is not viable. The cheapest collision vehicles interact with are other vehicles, so a small
--- pool of simplified vehicles is spawned on demand, parked with setActive(0) and reused: they follow the proxy
--- through the regular positionVE mailbox ("vehPosPckt"..serverVehicleID), exactly like a real remote vehicle.
-
-local function releaseCollider(gameVehicleID)
-	local c = colliders[gameVehicleID]
-	if not c then return end
-	local vehicle = c.serverVehicleID and MPVehicleGE.getVehicleByServerID(c.serverVehicleID)
-	if vehicle and vehicle.proxyColliderID == gameVehicleID then vehicle.proxyColliderID = nil end
-	c.serverVehicleID = nil
-	local veh = getObjectByID(gameVehicleID)
-	if veh then
-		veh:queueLuaCommand("if MPVehicleVE then MPVehicleVE.setServerID('') end")
-		veh:setActive(0)
-	end
-end
-
-local function applyColliderTarget(gameVehicleID)
-	local c = colliders[gameVehicleID]
-	local veh = getObjectByID(gameVehicleID)
-	if not c or not veh or not c.serverVehicleID then return end
-	veh:queueLuaCommand("if MPVehicleVE then MPVehicleVE.setVehicleType('R') MPVehicleVE.setServerID(mime.unb64('"..MPHelpers.b64encode(c.serverVehicleID).."')) end")
-end
-
-local function assignCollider(gameVehicleID, vehicle)
-	local c = colliders[gameVehicleID]
-	local veh = getObjectByID(gameVehicleID)
-	local p = vehicle.proxy
-	if not c or not veh or not p then return end
-	c.serverVehicleID = vehicle.serverVehicleString
-	vehicle.proxyColliderID = gameVehicleID
-	if MPProxyMeshGE then MPProxyMeshGE.release(p) end
-	veh:setActive(1)
-	-- same rotation convention as the reset packets (onServerVehicleResetted)
-	veh:setPositionRotation(p.rpos.x, p.rpos.y, p.rpos.z, p.rrot.x, p.rrot.y, p.rrot.z, p.rrot.w)
-	if p.vcfPaint then
-		pcall(extensions.core_vehicle_manager.liveUpdateVehicleColors, gameVehicleID, veh, 1, p.vcfPaint)
-	end
-	applyColliderTarget(gameVehicleID)
-end
-
-local function onColliderSpawned(gameVehicleID)
-	colliders[gameVehicleID] = { serverVehicleID = nil }
-	colliderCount = colliderCount + 1
-end
-
---- Called by MPVehicleGE.onVehicleReady, the VE extensions of the collider are loaded now.
-local function onColliderReady(gameVehicleID)
-	if colliders[gameVehicleID] then applyColliderTarget(gameVehicleID) return true end
-	return false
-end
-
-local function isCollider(gameVehicleID)
-	return colliders[gameVehicleID] ~= nil
-end
-
-local function onColliderDestroyed(gameVehicleID)
-	if colliders[gameVehicleID] then
-		local c = colliders[gameVehicleID]
-		local vehicle = c.serverVehicleID and MPVehicleGE.getVehicleByServerID(c.serverVehicleID)
-		if vehicle and vehicle.proxyColliderID == gameVehicleID then vehicle.proxyColliderID = nil end
-		colliders[gameVehicleID] = nil
-		colliderCount = colliderCount - 1
-	end
-end
-
-local function removeAllColliders()
-	for gameVehicleID, _ in pairs(colliders) do
-		local veh = getObjectByID(gameVehicleID)
-		colliders[gameVehicleID] = nil
-		if veh then veh:delete() end
-	end
-	colliders = {}
-	colliderCount = 0
-end
-
+-- ============= COLLIDER POOL (proxyCollision) =============
+-- see beammp/proxy/colliders.lua: invisible size class collision vehicles for the closest proxies
+local colliderCtx = { enabled = false, radius = 60, poolSize = 4, canSpawn = false, localVehPos = nil, model = nil }
 local function updateColliders(vehicles)
-	if not cfg.enabled or not cfg.collision or not hasLocalVeh then
-		for id, c in pairs(colliders) do if c.serverVehicleID then releaseCollider(id) end end
-		return
-	end
-	local r2 = cfg.collisionRadius * cfg.collisionRadius
-	local release2 = (cfg.collisionRadius + COLLIDER_RELEASE_MARGIN)^2
-	-- release colliders that are not needed anymore
-	for id, c in pairs(colliders) do
-		if c.serverVehicleID then
-			local v = vehicles[c.serverVehicleID]
-			if not v or not v.isProxy or v.isSpawned or not v.proxy or v.proxy.rpos:squaredDistance(localVehPos) > release2 then
-				releaseCollider(id)
-			end
-		end
-	end
-	-- find the closest proxy without collider inside the radius
-	local best, bestD2 = nil, r2
-	for _, v in pairs(vehicles) do
-		if v.isProxy and not v.isSpawned and not v.isLocal and v.proxy and v.proxy.hasData and not v.proxyColliderID then
-			local d2 = v.proxy.rpos:squaredDistance(localVehPos)
-			if d2 < bestD2 then best, bestD2 = v, d2 end
-		end
-	end
-	if not best then return end
-	for id, c in pairs(colliders) do
-		if not c.serverVehicleID and getObjectByID(id) then
-			assignCollider(id, best)
-			return
-		end
-	end
-	-- no free collider, grow the pool (this spawn stutters, so it is rate limited together with real spawns)
-	if colliderCount < cfg.poolSize and clock >= nextColliderSpawnAllowed and clock >= nextSpawnAllowed then
+	colliderCtx.enabled = cfg.enabled and cfg.collision
+	colliderCtx.radius, colliderCtx.poolSize, colliderCtx.model = cfg.collisionRadius, cfg.poolSize, cfg.colliderModel
+	colliderCtx.localVehPos = hasLocalVeh and localVehPos or nil
+	colliderCtx.canSpawn = clock >= nextColliderSpawnAllowed and clock >= nextSpawnAllowed
+	if colliderPool.update(vehicles, colliderCtx) then
 		nextColliderSpawnAllowed = clock + math.max(cfg.spawnInterval, 1)
 		nextSpawnAllowed = clock + cfg.spawnInterval
-		local id = MPVehicleGE.spawnProxyCollider(cfg.colliderModel, best.proxy.rpos, best.proxy.rrot)
-		if id then
-			onColliderSpawned(id)
-			assignCollider(id, best)
-		end
 	end
 end
 
@@ -1501,7 +1392,7 @@ local function decide(vehicles, activeVehID)
 	-- proxy -> real, at most one per spawnInterval (forced ones, e.g. spectate, skip the interval)
 	if (realCount < limit or nearestCand.proxyForceReal) and (clock >= nextSpawnAllowed or nearestCand.proxyForceReal) then
 		nextSpawnAllowed = clock + cfg.spawnInterval
-		if nearestCand.proxyColliderID then releaseCollider(nearestCand.proxyColliderID) end
+		if nearestCand.proxyColliderID then colliderPool.release(nearestCand.proxyColliderID) end
 		nearestCand.proxyForceReal = nil
 		startHandover(nearestCand) -- keeps the proxy drawn until the real vehicle is placed and synced
 		if not nearestCand.proxyHandover and MPProxyMeshGE then MPProxyMeshGE.release(nearestCand.proxy) end
@@ -1560,7 +1451,7 @@ local function update(dt, cameraPos, activeVehID)
 			else
 				predict(v, p, dt)
 			end
-			if not v.proxyColliderID and not v.isDeleted then
+			if not v.isDeleted then -- a collider is invisible, the proxy stays what is drawn
 				local d2 = camPos:squaredDistance(p.rpos)
 				if d2 < drawDist2 then
 					local dist = math.sqrt(d2)
@@ -1644,10 +1535,7 @@ local function getStats(resetWindow)
 			end
 		end
 	end
-	for _, c in pairs(colliders) do
-		out.collidersPool = out.collidersPool + 1
-		if c.serverVehicleID then out.collidersUsed = out.collidersUsed + 1 end
-	end
+	out.collidersPool, out.collidersUsed = colliderPool.getCount()
 	if resetWindow then resetPerf() end
 	return out
 end
@@ -1692,7 +1580,7 @@ local function tabRealList()
 	for i = 0, be:getObjectCount() - 1 do
 		local veh = be:getObject(i)
 		if veh and veh:getJBeamFilename() ~= "unicycle" and veh.playerUsable ~= false and veh:getActive()
-			and not colliders[veh:getId()] then
+			and not colliderPool.isCollider(veh:getId()) then
 			order[#order + 1] = veh:getId()
 		end
 	end
@@ -1825,7 +1713,7 @@ local function getSettings()
 end
 
 local function reset()
-	removeAllColliders()
+	colliderPool.removeAll()
 	stopAllSounds()
 	skid.stopAll()
 	smoke.stopAll()
@@ -1836,7 +1724,7 @@ end
 local function onSettingsChanged()
 	readSettings()
 	if not cfg.collision then
-		for id, c in pairs(colliders) do if c.serverVehicleID then releaseCollider(id) end end
+		colliderPool.releaseAll()
 	end
 end
 
@@ -1887,9 +1775,9 @@ M.isEnabled           = isEnabled
 M.getSettings         = getSettings
 M.getModelInfo        = getModelInfo
 M.reset               = reset
-M.isCollider          = isCollider
-M.onColliderReady     = onColliderReady
-M.onColliderDestroyed = onColliderDestroyed
+M.isCollider          = colliderPool.isCollider
+M.onColliderReady     = colliderPool.onReady
+M.onColliderDestroyed = colliderPool.onDestroyed
 M.onSettingsChanged   = onSettingsChanged
 M.onRealVehicleReady  = onRealVehicleReady
 M.isInHandover        = isInHandover

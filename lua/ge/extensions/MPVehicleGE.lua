@@ -1859,10 +1859,16 @@ end
 
 --- Spawns a pooled collision vehicle for MPProxyGE. It is not sent to the server and not mapped to any serverVehicleID.
 -- @treturn number gameVehicleID or nil
-local function spawnProxyCollider(model, position, rotation)
+local function spawnProxyCollider(model, position, rotation, config)
 	nextSpawnIsRemote = true -- don't send this spawn to the server
 	local spawnRot = quat(0,0,1,0) * quat(rotation) -- the car rotates 180 degrees on spawn, same as applyVehSpawn
-	local veh = spawn.spawnVehicle(model, nil, vec3(position), spawnRot, { autoEnterVehicle=false, vehicleName="beammpProxyCollider", cling=true, centeredPosition = true, removeWhenNoPositionFound = false})
+	local opts = { autoEnterVehicle=false, vehicleName="beammpProxyCollider", cling=true, centeredPosition = true, removeWhenNoPositionFound = false}
+	local veh = spawn.spawnVehicle(model, config, vec3(position), spawnRot, opts)
+	if not veh and config then -- config not found: the model's default one
+		log('W', 'spawnProxyCollider', "Proxy collider config "..tostring(config).." failed, spawning the default "..tostring(model))
+		nextSpawnIsRemote = true
+		veh = spawn.spawnVehicle(model, nil, vec3(position), spawnRot, opts)
+	end
 	-- nextSpawnIsRemote is consumed by onVehicleSpawned, like in applyVehSpawn
 	if not veh then log('E', 'spawnProxyCollider', "Failed to spawn proxy collider "..tostring(model)) return nil end
 	veh.playerUsable = false
