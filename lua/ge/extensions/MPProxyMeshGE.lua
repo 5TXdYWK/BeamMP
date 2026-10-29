@@ -10,10 +10,12 @@
 --   2. wanted meshes = flexbodies of the parts in the config, minus interior/small/mechanical parts,
 --      minus anything from /vehicles/common (wheels and tires are drawn as cylinders instead)
 --   3. the model's .dae files are streamed in chunks and only the wanted <geometry>/<node> blocks are kept
---   4. the result is written to /temp/beammp/proxymeshes/ and reused for every proxy with the same mesh set
---      (also across sessions). Vehicle meshes are modelled in place in vehicle space, so no transforms are needed.
+--   4. per LOD tier the kept meshes are written to /temp/beammp/proxymeshes/ as shared pieces (one file per source
+--      .dae + jbeam part with enough geometry, the small rest in one file), named by their content, so configs and
+--      tiers with the same meshes share files (also across sessions); a proxy draws one TSStatic per piece.
+--      Vehicle meshes are modelled in place in vehicle space, so no transforms are needed.
 -- All of that runs in a coroutine with a per frame time budget. The only blocking step left is the engine
--- importing the small generated shape on its first use, which is rate limited (one new shape per interval).
+-- importing a generated shape on its first use, which is rate limited (one new file per interval).
 -- Until a shape is ready the proxy stays a box.
 -- @module MPProxyMeshGE
 
@@ -23,18 +25,16 @@ setmetatable(_G,{}) -- temporarily disable global notifications
 
 local TIMER = (HighPerfTimer or hptimer)
 local CACHE_DIR = "/temp/beammp/proxymeshes/"
-local CACHE_VERSION = "v5" -- v5: three LOD tier mesh sets per config, v4: triangle budget (smallest parts dropped), v3: one merged .dae per mesh set, signatures
+local CACHE_VERSION = "v6" -- v6: shared pieces per (source .dae, jbeam part) instead of one file per mesh set and tier; v5: three LOD tier mesh sets per config, v4: triangle budget (smallest parts dropped), v3: one merged .dae per mesh set, signatures
 local READ_CHUNK = 128 * 1024     -- bytes per read step (smaller steps keep each resume near the frame budget)
 local FRAME_BUDGET_MS = 2         -- coroutine work per frame in game (proxyMeshFrameBudgetMs)
 local PRELOAD_BUDGET_MS = 40      -- while the join loading screen hides the stutter
 local frameBudget = FRAME_BUDGET_MS
-local MAX_MESHES = 250            -- per config (the full tier keeps everything the config shows)
 local MAX_NEW_OBJECTS_PER_PASS = 4
 local SUSP_MAX_PROXIES = 8       -- nearest proxies with visual suspension (proxySuspension)
 local MAX_DETACHES_PER_PASS = 6   -- mesh -> box changes per pass, farthest first, so a group leaving range spreads out
 local NEW_SHAPE_INTERVAL = 2      -- seconds between first uses of not yet loaded shapes (engine import hitch)
 local CACHED_SHAPE_INTERVAL = 0.5 -- same, when the engine already has a compiled .cdae of every file (cheaper load)
-local RELEASE_MARGIN = 50
 
 local cfg = { enabled = true, distance = 500, maxProxies = 48, wheels = true, targetFps = 0, triBudget = 60000, prebuild = false,
 	lodFull = 20, lodParts = 60, lodShell = 150, frameBudget = FRAME_BUDGET_MS }
@@ -45,7 +45,6 @@ local cfg = { enabled = true, distance = 500, maxProxies = 48, wheels = true, ta
 -- MPProxyGE draws a low poly car shape and, at the far end, a box in the paint colour.
 local TIER_FULL, TIER_PARTS, TIER_SHELL = 1, 2, 3
 local LOD_HYSTERESIS = 0.1 -- a tier boundary is moved out by this fraction (plus 3 m) for proxies already inside
-local SHELL_MIN_TRIS = 3000
 
 local function readSettings()
 	cfg.enabled = settings.getValue("proxyMeshEnabled", true) ~= false
@@ -162,6 +161,11 @@ local function hashString(s)
 	for i = 1, #s do h = (h * 33 + string.byte(s, i)) % 4294967296 end
 	return string.format("%08x%d", h, #s)
 end
+
+-- shared mesh pieces: minBytes = geometry a jbeam part needs for a file of its own (smaller ones share a rest file),
+-- info[model] = mesh facts (loadMeshInfo), owner[model] = { [mesh] = jbeam part }, used = { [path] = os.time() of
+-- the last session that imported it } for the cache size cap
+local PC = { minBytes = 512 * 1024, info = {}, owner = {}, used = nil, usedDirty = false }
 
 local budgetTimer = nil
 local jobPhase = "start" -- what the running job does now, for the per step timings in the job log
@@ -601,7 +605,6 @@ end
 -- to the wheel rows after them, and each wheel is placed like lua/common/jbeam/sections/wheelTypes/pressureWheels.lua:
 -- midpoint of node1/node2 (or offsetFromNode), moved by wheelOffset along the axis, tireWidth wide, radius.
 local WHEEL_VERSION = 6 -- 6: every skin slot; 5: livery (skin) name; 4: 4: centre of mass estimate; 3: tire flag per mesh; 2: named fields (mixed tables did not survive the json round trip), rim / tire meshes
-local MAX_WHEEL_MESHES = 6 -- per wheel
 
 -- jbeam values: numbers, "$var", or "$=expression" (arithmetic, comparisons, and/or/not, case(c1, v1, ..., default),
 -- min/max/abs...). Unknown variables (also "$components.x") become nil like in the game's evaluator.
@@ -788,7 +791,7 @@ local function resolveWheels(job)
 				w.m = w.m or {}
 				local dup = false
 				for _, e in ipairs(w.m) do if e[1] == fb.m then dup = true end end
-				if not dup and #w.m < MAX_WHEEL_MESHES then
+				if not dup and #w.m < 6 then -- meshes per wheel
 					w.m[#w.m + 1] = { fb.m, x - w.x, y - w.y, z - w.z, evalVal(r[1], vars) or 0, evalVal(r[2], vars) or 0, evalVal(r[3], vars) or 0,
 						evalVal(sc[1], vars) or 1, evalVal(sc[2], vars) or 1, evalVal(sc[3], vars) or 1, fb.t and 1 or 0 }
 				end
@@ -1105,7 +1108,7 @@ local function filterDae(filename, wanted, bbox, mats)
 		mergeNodeBBox(nb, block, geomBoxes[url])
 		mergeNodeBBox(bbox, block, geomBoxes[url])
 		local size = nb[1] <= nb[4] and math.sqrt((nb[4]-nb[1])^2 + (nb[5]-nb[2])^2 + (nb[6]-nb[3])^2) or 0
-		nodes[#nodes + 1] = { block = block .. "\n", url = url, name = name, tris = geomBoxes[url] and geomBoxes[url].tris or 0, size = size, mats = {} }
+		nodes[#nodes + 1] = { block = block .. "\n", url = url, name = name, tris = geomBoxes[url] and geomBoxes[url].tris or 0, size = size, mats = {}, bb = nb[1] <= nb[4] and nb or nil }
 		collectMaterials(block, nodes[#nodes].mats)
 	end
 	local ok = scanDae(filename, keepByName, function(block, name, url)
@@ -1133,7 +1136,7 @@ end
 -- the parts into the plain lists mergeDae wants (only geometries some kept node uses)
 -- marks n.keep on the nodes that pass filter and fit the budget (biggest first); returns kept count and triangles
 local function selectNodes(all, filter, budget, minSize)
-	table.sort(all, function(a, b) return a.size > b.size end)
+	table.sort(all, function(a, b) if a.size ~= b.size then return a.size > b.size end return a.name < b.name end)
 	local sum, kept = 0, 0
 	for _, n in ipairs(all) do
 		n.keep = false
@@ -1143,19 +1146,6 @@ local function selectNodes(all, filter, budget, minSize)
 		end
 	end
 	return kept, sum
-end
-
--- the kept nodes of one file as the plain lists mergeDae wants (only geometries some kept node uses)
-local function keptLists(part, mats)
-	local nodes, geoms, used = {}, {}, {}
-	for _, n in ipairs(part.nodes) do
-		if n.keep then
-			nodes[#nodes + 1] = n.block
-			for m in pairs(n.mats) do mats[m] = true end
-			if not used[n.url] and part.geomById[n.url] then used[n.url] = true geoms[#geoms + 1] = part.geomById[n.url] end
-		end
-	end
-	return { header = part.header, nodes = nodes, geoms = geoms }
 end
 
 -- ============= MERGING =============
@@ -1327,7 +1317,6 @@ local wheelJobs = {}      -- FIFO of wheel mesh builds
 local wheelInfo = {}      -- [wheel .dae path] = { tire = bool, rim = bool } (what the file has, sidecar .json)
 local meshIndexes = {}    -- ["common"] / [model] = { [scene node name] = source .dae } (disk cached)
 -- wheel files are named with this: v2 = found through the scene node index (v1 guessed files by name and missed many)
-local WHEEL_FILE_TAG = "wheel2_"
 
 local function wheelPath(w)
 	if w.path ~= nil then return w.path end
@@ -1337,7 +1326,7 @@ local function wheelPath(w)
 		list[#list + 1] = string.format("%s|%.3f|%.3f|%.3f|%.1f|%.1f|%.1f|%.3f|%.3f|%.3f", tostring(e[1]), e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9], e[10])
 	end
 	table.sort(list)
-	w.path = CACHE_DIR .. WHEEL_FILE_TAG .. CACHE_VERSION .. "_" .. hashString(table.concat(list, ";")) .. ".dae"
+	w.path = CACHE_DIR .. "wheel2_" .. CACHE_VERSION .. "_" .. hashString(table.concat(list, ";")) .. ".dae"
 	return w.path
 end
 
@@ -1551,6 +1540,18 @@ local function runWheelJob(job)
 		hasRim and "yes" or "drawn", #missing > 0 and (", missing: " .. table.concat(missing, ", ")) or ""))
 end
 
+-- mesh facts of a model from earlier scans (file per model and CACHE_VERSION), dropped when the model signature changes
+local function loadMeshInfo(model, sig)
+	local d = PC.info[model]
+	if d and d.sig == sig then return d end
+	local file = CACHE_DIR .. model .. "_" .. CACHE_VERSION .. "_meshinfo.json"
+	d = FS:fileExists(file) and jsonReadFile(file) or nil
+	if type(d) ~= "table" or d.sig ~= sig or type(d.m) ~= "table" then d = { m = {} } end
+	d.nf, d.gs, d.sig, d.file = type(d.nf) == "table" and d.nf or {}, type(d.gs) == "table" and d.gs or {}, sig, file
+	PC.info[model] = d
+	return d
+end
+
 local function runJob(job)
 	local shape = shapes[job.key]
 	shape.state = "building"
@@ -1603,7 +1604,7 @@ local function runJob(job)
 	local wanted, count = {}, 0
 	for _, partName in ipairs(job.parts) do
 		for _, mesh in ipairs(index[partName] or {}) do
-			if count < MAX_MESHES and not wanted[mesh] then -- the full tier keeps all, the others filter
+			if count < 250 and not wanted[mesh] then -- the full tier keeps all, the others filter
 				wanted[mesh] = true
 				count = count + 1
 			end
@@ -1649,66 +1650,187 @@ local function runJob(job)
 		return
 	end
 
-	local bbox = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
+	-- per mesh facts (source file, triangles, size, bounds, materials) from earlier scans of this model: the tier
+	-- selection needs no .dae scan when every wanted mesh is known already
+	setPhase("mesh info")
+	local info = loadMeshInfo(job.model, sig)
+	local unknown, nUnknown = {}, 0
+	for mesh in pairs(wanted) do if not info.m[mesh] and not info.nf[mesh] then unknown[mesh] = true nUnknown = nUnknown + 1 end end
 	local daes = FS:findFiles("/vehicles/" .. job.model .. "/", "*.dae", -1, false, false) or {}
-	local paths, mats = {}, {}
+	table.sort(daes)
+	local parsed = {} -- [file] = filterDae result of this job, node blocks in memory
 	FS:directoryCreate(CACHE_DIR, true)
-	local groups, groupOrder = {}, {}
-	setPhase("dae scan")
-	for _, dae in ipairs(daes) do
-		local part = filterDae(dae, wanted, bbox, nil)
-		if part then
-			local gsig = daeSignature(part.header)
-			if not groups[gsig] then groups[gsig] = {} groupOrder[#groupOrder + 1] = gsig end
-			table.insert(groups[gsig], part)
+	if nUnknown > 0 then
+		setPhase("dae scan")
+		local scratch = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
+		for _, dae in ipairs(daes) do
+			local part = filterDae(dae, unknown, scratch, nil)
+			if part then
+				parsed[dae] = part
+				info.gs[dae] = daeSignature(part.header)
+				for _, n in ipairs(part.nodes) do
+					if unknown[n.name] then -- first file with the name wins (all its nodes of that name are used)
+						unknown[n.name] = nil
+						local g, ml = part.geomById[n.url], {}
+						for m in pairs(n.mats) do ml[#ml + 1] = m end
+						table.sort(ml)
+						info.m[n.name] = { f = dae, t = n.tris, s = n.size, g = g and #g or 0, b = n.bb, m = table.concat(ml, ",") }
+					end
+				end
+			end
+			coroutine.yield()
 		end
+		for mesh in pairs(unknown) do info.nf[mesh] = true end
+		jsonWriteFile(info.file, { sig = sig, m = info.m, nf = info.nf, gs = info.gs }, false)
 		coroutine.yield()
 	end
+	-- the jbeam part a mesh belongs to, the same for every config (alphabetically first part listing it)
+	local own = PC.owner[job.model]
+	if not own then
+		own = {}
+		for pn, ms in pairs(index) do for _, m in ipairs(ms) do if not own[m] or pn < own[m] then own[m] = pn end end end
+		PC.owner[job.model] = own
+	end
+	local bbox = {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}
 	local all = {}
-	for _, gsig in ipairs(groupOrder) do for _, part in ipairs(groups[gsig]) do for _, n in ipairs(part.nodes) do all[#all + 1] = n end end end
+	for mesh in pairs(wanted) do
+		local e = info.m[mesh]
+		if e then
+			all[#all + 1] = { name = mesh, tris = e.t or 0, size = e.s or 0, e = e }
+			local nb = e.b
+			if type(nb) == "table" and nb[1] and nb[1] <= nb[4] then
+				for k = 1, 3 do
+					if nb[k] < bbox[k] then bbox[k] = nb[k] end
+					if nb[k + 3] > bbox[k + 3] then bbox[k + 3] = nb[k + 3] end
+				end
+			end
+		end
+	end
+	if #all == 0 then
+		log('W', 'MPProxyMeshGE', string.format("No proxy mesh for %s: %d wanted meshes not found in %d .dae files of /vehicles/%s/", job.model, count, #daes, job.model))
+		shape.state = "failed" shape.reason = "meshes not found in the .dae files"
+		return
+	end
 	local maxSize = 0
 	for _, n in ipairs(all) do if n.size > maxSize then maxSize = n.size end end
 	local function visible(n) return isWantedMesh(n.name or "") end
 	local selections = {
 		[TIER_FULL] = function() return selectNodes(all, nil, 0, 0) end,
 		[TIER_PARTS] = function() return selectNodes(all, visible, cfg.triBudget, 0) end,
-		[TIER_SHELL] = function() return selectNodes(all, visible, math.max(SHELL_MIN_TRIS, math.floor(cfg.triBudget / 6)), maxSize * 0.25) end,
+		[TIER_SHELL] = function() return selectNodes(all, visible, math.max(3000, math.floor(cfg.triBudget / 6)), maxSize * 0.25) end,
 	}
-	local tiers, prevKept, tierInfo = {}, nil, {}
+	-- the kept meshes of a tier become shared pieces: one file per (source .dae, jbeam part) when that part holds at
+	-- least PC.minBytes of geometry, the small rest of the tier in one file per .dae unit / up axis. File names hash
+	-- the content (source files + mesh names), so configs and tiers keeping the same meshes use the same file.
+	local pieces, paths, mats, tierInfo = {}, {}, {}, {}
+	local function plan()
+		local byPart, list, rest = {}, {}, {}
+		for _, n in ipairs(all) do
+			if n.keep then
+				local k = n.e.f .. "|" .. (own[n.name] or "?")
+				local g = byPart[k]
+				if not g then g = { bytes = 0, nodes = {} } byPart[k] = g end
+				g.nodes[#g.nodes + 1] = n
+				g.bytes = g.bytes + (n.e.g or 0)
+				for m in string.gmatch(n.e.m or "", "[^,]+") do mats[m] = true end
+			end
+		end
+		local function add(nodes)
+			local files, fl = {}, {}
+			for _, n in ipairs(nodes) do
+				if not files[n.e.f] then files[n.e.f] = {} fl[#fl + 1] = n.e.f end
+				table.insert(files[n.e.f], n.name)
+			end
+			table.sort(fl)
+			local desc = {}
+			for _, f in ipairs(fl) do table.sort(files[f]) desc[#desc + 1] = f .. ":" .. table.concat(files[f], ",") end
+			local path = CACHE_DIR .. job.model .. "_" .. CACHE_VERSION .. "_p" .. hashString(table.concat(desc, ";")) .. ".dae"
+			if not pieces[path] then pieces[path] = { files = files, order = fl } paths[#paths + 1] = path end
+			list[#list + 1] = path
+		end
+		local keys = {}
+		for k in pairs(byPart) do keys[#keys + 1] = k end
+		table.sort(keys)
+		for _, k in ipairs(keys) do
+			local g = byPart[k]
+			if g.bytes >= PC.minBytes then add(g.nodes)
+			else
+				local gs = info.gs[g.nodes[1].e.f] or ""
+				rest[gs] = rest[gs] or {}
+				for _, n in ipairs(g.nodes) do table.insert(rest[gs], n) end
+			end
+		end
+		local gl = {}
+		for gs in pairs(rest) do gl[#gl + 1] = gs end
+		table.sort(gl)
+		for _, gs in ipairs(gl) do add(rest[gs]) end
+		return list
+	end
+	local tiers, prevKept = {}, nil
 	for t = 1, 3 do
 		local kept, tris = selections[t]()
 		if kept == 0 and t > 1 then tiers[t] = tiers[t - 1] -- nothing left for this tier, reuse the one before
 		elseif kept == prevKept and t > 1 then tiers[t] = tiers[t - 1] -- same selection, same files
-		else
-			tiers[t] = {}
-			for g, gsig in ipairs(groupOrder) do
-				local lists = {}
-				for _, part in ipairs(groups[gsig]) do
-					local l = keptLists(part, mats)
-					if #l.nodes > 0 then lists[#lists + 1] = l end
+		else tiers[t] = plan() end
+		prevKept = kept
+		tierInfo[#tierInfo + 1] = string.format("%d parts/%d tris/%d pieces", kept, tris, #tiers[t])
+		coroutine.yield()
+	end
+	-- build the pieces not on disk yet; their source files are scanned once (again, when the info came from disk)
+	local need, built, reused = {}, 0, 0
+	for _, path in ipairs(paths) do
+		if FS:fileExists(path) then reused = reused + 1
+		else for f, names in pairs(pieces[path].files) do need[f] = need[f] or {} for _, nm in ipairs(names) do need[f][nm] = true end end end
+	end
+	for f, names in pairs(need) do
+		local part = parsed[f]
+		local have = {}
+		if part then for _, n in ipairs(part.nodes) do have[n.name] = true end end
+		for nm in pairs(names) do if not have[nm] then part = nil break end end
+		if not part then
+			setPhase("dae scan")
+			parsed[f] = filterDae(f, names, {math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge}, nil)
+			coroutine.yield()
+		end
+	end
+	for _, path in ipairs(paths) do
+		local pc = pieces[path]
+		if not FS:fileExists(path) then
+			local lists, ok = {}, true
+			for _, f in ipairs(pc.order) do
+				local part = parsed[f]
+				if not part then ok = false break end
+				local want = {}
+				for _, nm in ipairs(pc.files[f]) do want[nm] = true end
+				local nodes, geoms, used = {}, {}, {}
+				local sel = {}
+				for _, n in ipairs(part.nodes) do if want[n.name] then sel[#sel + 1] = n end end
+				table.sort(sel, function(x, y) if x.name ~= y.name then return x.name < y.name end return x.url < y.url end)
+				for _, n in ipairs(sel) do
+					nodes[#nodes + 1] = n.block
+					if not used[n.url] and part.geomById[n.url] then used[n.url] = true geoms[#geoms + 1] = part.geomById[n.url] end
 				end
-				if #lists > 0 then
-					local out = CACHE_DIR .. meshKey .. "_t" .. t .. "_" .. g .. ".dae"
-					setPhase("merge")
-					local text = mergeDae(lists)
-					coroutine.yield()
-					setPhase("write") -- streamed in slices, budget checks between them
-					if writePieces(out, text) then tiers[t][#tiers[t] + 1] = out paths[#paths + 1] = out end
-					text = nil
-					coroutine.yield()
-				end
+				lists[#lists + 1] = { header = part.header, nodes = nodes, geoms = geoms }
+			end
+			if ok and #lists > 0 then
+				setPhase("merge")
+				local text = mergeDae(lists)
+				coroutine.yield()
+				setPhase("write") -- streamed in slices, budget checks between them
+				if writePieces(path, text) then built = built + 1 else ok = false end
+				text = nil
+				coroutine.yield()
+			end
+			if not ok then
+				log('W', 'MPProxyMeshGE', string.format("Proxy mesh piece %s for %s could not be built", string.match(path, "([^/]+)$"), job.model))
+				shape.state = "failed" shape.reason = "a mesh piece could not be written"
+				return
 			end
 		end
-		prevKept = kept
-		tierInfo[#tierInfo + 1] = string.format("%d parts/%d tris", kept, tris)
 	end
-	log('I', 'MPProxyMeshGE', string.format("Proxy mesh tiers for %s: full %s, parts %s, shell %s", job.model, tierInfo[1], tierInfo[2], tierInfo[3]))
-	if #paths == 0 then
-		log('W', 'MPProxyMeshGE', string.format("No proxy mesh for %s: %d wanted meshes not found in %d .dae files of /vehicles/%s/", job.model, count, #daes, job.model))
-		shape.state = "failed" shape.reason = "meshes not found in the .dae files"
-		return
-	end
-	log('I', 'MPProxyMeshGE', string.format("Proxy mesh for %s ready (%d meshes, %d files)", job.model, count, #paths))
+	parsed = nil
+	log('I', 'MPProxyMeshGE', string.format("Proxy mesh tiers for %s: full %s, parts %s, shell %s; %d pieces, %d built, %d shared from disk, %d of %d mesh facts scanned now",
+		job.model, tierInfo[1], tierInfo[2], tierInfo[3], #paths, built, reused, nUnknown, count))
 	setPhase("materials")
 	loadModelMaterials(job.model)
 	local matList = {}
@@ -1912,6 +2034,9 @@ local function createStatic(path, plain)
 	obj.useInstanceRenderData = not plain    -- per instance paint (instanceColor*), not for wheels
 	obj.canSave = false
 	obj:registerObject(Sim.getUniqueName("beammpProxyMesh"))
+	importedPaths[path] = true -- the engine has the shape now
+	PC.used = PC.used or {}
+	PC.used[path] = os.time() PC.usedDirty = true -- cache size cap: least recently used files go first
 	liveCount = liveCount + 1
 	allObjects[obj:getId()] = true
 	return obj:getId()
@@ -1929,6 +2054,22 @@ local function returnStatic(path, id)
 	obj.hidden = true
 	pools[path] = pools[path] or {}
 	table.insert(pools[path], id)
+end
+
+-- engine import of the first not yet loaded file of a tier through a hidden pooled TSStatic; returns the wait
+-- before the next first use (shorter when its .cdae existed), nil when every file of the tier is loaded
+local function warmOne(shape, tier, key)
+	for _, path in ipairs(tierPaths(shape, tier)) do
+		if not importedPaths[path] then
+			local t, cdae = TIMER(), hasCdae(path)
+			local id = takeStatic(path)
+			if id then returnStatic(path, id) end
+			log(t:stop() > 20 and 'W' or 'I', 'MPProxyMeshGE', string.format("Engine import of %s tier %d (%s): %.1f ms, compiled .cdae was %s",
+				tostring(string.match(key or "", "^(.-)_v%d")), tier, string.match(path, "([^/]+)$") or path, t:stop(),
+				cdae and "on disk" or "not on disk (compiled now)"))
+			return cdae and CACHED_SHAPE_INTERVAL or NEW_SHAPE_INTERVAL
+		end
+	end
 end
 
 local function paintString(paint)
@@ -2098,12 +2239,15 @@ local function decide(vehicles, refPos)
 			if shape and shape.state == "ready" and created < MAX_NEW_OBJECTS_PER_PASS then
 				-- first use of a file this session (disk cached shapes too): the engine imports it synchronously,
 				-- so only one such attach per interval (shorter when the compiled .cdae already exists)
+				-- a tier of several pieces imports them one per interval (hidden, pooled), the proxy attaches once all are in
 				local interval = not c.v.isFakeTest and importInterval(shape, want) or nil
 				if interval then
 					if clock >= nextNewShapeAllowed then
-						nextNewShapeAllowed = clock + interval
-						attach(p, shape, want)
-						created = created + 1
+						nextNewShapeAllowed = clock + (warmOne(shape, want, p.meshKey) or interval)
+						if not importInterval(shape, want) then
+							attach(p, shape, want)
+							created = created + 1
+						end
 					else
 						waitingLoad[#waitingLoad + 1] = c.v.jbeam or string.match(p.meshKey, "^(.-)_v%d") or "?"
 					end
@@ -2132,7 +2276,6 @@ local function decide(vehicles, refPos)
 	end
 end
 
-local tmpV = vec3()
 local org = vec3()
 local axX, axY, axZ = vec3(), vec3(), vec3()
 local unitX, unitY, unitZ = vec3(1,0,0), vec3(0,1,0), vec3(0,0,1)
@@ -2433,8 +2576,6 @@ end
 -- PRELOAD_TIMEOUT. Whatever is left continues in the background with the normal budget.
 local PRELOAD_TAG = "beammpProxyPreload"
 local PRELOAD_TIMEOUT = 25  -- seconds
-local PRELOAD_FIRST_WAIT = 6 -- seconds to wait for the first spawn packets
-local PRELOAD_QUIET = 2      -- seconds without new requests before finishing
 local preload = nil
 
 local function finishPreload(reason)
@@ -2450,14 +2591,14 @@ local function startPreload()
 	if preload or not cfg.enabled then return end
 	if not (MPCoreNetwork and MPCoreNetwork.isMPSession and MPCoreNetwork.isMPSession()) then return end
 	if not (core_gamestate and core_gamestate.requestEnterLoadingScreen) then return end
-	preload = { started = clock, quietUntil = clock + PRELOAD_FIRST_WAIT }
+	preload = { started = clock, quietUntil = clock + 6 } -- 6 s for the first spawn packets
 	frameBudget = PRELOAD_BUDGET_MS
 	core_gamestate.requestEnterLoadingScreen(PRELOAD_TAG)
 	log('I', 'MPProxyMeshGE', "Join preload started")
 end
 
 M._onRequest = function()
-	if preload then preload.quietUntil = math.max(preload.quietUntil, clock + PRELOAD_QUIET) end
+	if preload then preload.quietUntil = math.max(preload.quietUntil, clock + 2) end -- 2 s without new requests before finishing
 end
 
 -- imports every ready shape once (hidden pooled TSStatic), so the first real use does not hitch
@@ -2496,7 +2637,17 @@ local function updatePreload()
 	elseif not busy and not imported and clock > preload.quietUntil then finishPreload("all vehicles ready") end
 end
 
--- removes cache files of older CACHE_VERSIONs (and their engine .cdae copies)
+-- last use times of the cache files (written at mission end and unload, read by the size cap)
+local function saveUsed()
+	if PC.usedDirty and PC.used then
+		FS:directoryCreate(CACHE_DIR, true)
+		jsonWriteFile(CACHE_DIR .. "lru_" .. CACHE_VERSION .. "_used.json", PC.used, false)
+		PC.usedDirty = false
+	end
+end
+
+-- removes cache files of older CACHE_VERSIONs (and their engine .cdae copies), then keeps the current .dae files
+-- under proxyMeshCacheMaxGB (0 = no cap): least recently used first (last import, else file time), with their .cdae
 local function cleanOldCache()
 	local removed, bytes = 0, 0
 	for _, dir in ipairs({ CACHE_DIR, "/temp" .. CACHE_DIR }) do
@@ -2513,9 +2664,36 @@ local function cleanOldCache()
 			end
 		end
 	end
-	if removed > 0 then log('I', 'MPProxyMeshGE', string.format("Removed %d old proxy mesh cache files (%.0f MB)", removed, bytes / 1048576)) end
+	if removed > 0 then log('I', 'MPProxyMeshGE', string.format("Removed %d old proxy mesh cache files (%.2f GB freed)", removed, bytes / 1073741824)) end
+	local usedFile = CACHE_DIR .. "lru_" .. CACHE_VERSION .. "_used.json"
+	local used = FS:fileExists(usedFile) and jsonReadFile(usedFile) or nil
+	PC.used = type(used) == "table" and used or {}
+	local cap = (tonumber(settings.getValue("proxyMeshCacheMaxGB", 4)) or 4) * 1073741824
+	local files, total = {}, 0
+	for _, f in ipairs(FS:findFiles(CACHE_DIR, "*.dae", 0, false, false) or {}) do
+		local st, cst = FS:stat(f), FS:stat("/temp" .. string.gsub(f, "%.dae$", ".cdae"))
+		local size = (st and tonumber(st.filesize) or 0) + (cst and tonumber(cst.filesize) or 0)
+		files[#files + 1] = { f = f, size = size, t = math.max(tonumber(PC.used[f]) or 0, st and tonumber(st.modtime) or 0) }
+		total = total + size
+	end
+	local pruned, prunedBytes = 0, 0
+	if cap > 0 and total > cap then
+		table.sort(files, function(a, b) if a.t ~= b.t then return a.t < b.t end return a.f < b.f end)
+		for _, e in ipairs(files) do
+			if total <= cap then break end
+			FS:removeFile(e.f)
+			local c = "/temp" .. string.gsub(e.f, "%.dae$", ".cdae")
+			if FS:fileExists(c) then FS:removeFile(c) end
+			PC.used[e.f] = nil
+			total, pruned, prunedBytes = total - e.size, pruned + 1, prunedBytes + e.size
+		end
+		PC.usedDirty = true
+		saveUsed()
+	end
+	log('I', 'MPProxyMeshGE', string.format("Proxy mesh cache: %.2f GB in %d files (cap %s)%s", total / 1073741824, #files - pruned,
+		cap > 0 and string.format("%.0f GB", cap / 1073741824) or "off",
+		pruned > 0 and string.format(", removed %d least recently used (%.2f GB)", pruned, prunedBytes / 1073741824) or ""))
 end
-
 
 local function onUpdate(dtReal)
 	clock = clock + (dtReal or 0)
@@ -2664,7 +2842,8 @@ M.getStats          = getStats
 M.isEnabled         = function() return cfg.enabled end
 M.onSettingsChanged = onSettingsChanged
 M.onExtensionLoaded = onExtensionLoaded
-M.onClientEndMission = function() finishPreload("mission ended") reset() end
+M.onClientEndMission = function() finishPreload("mission ended") saveUsed() reset() end
+M.onExtensionUnloaded = function() saveUsed() end
 M.onClientStartMission = startPreload
 M.onInit = function() setExtensionUnloadMode(M, "manual") end
 

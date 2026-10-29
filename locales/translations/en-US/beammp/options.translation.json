@@ -143,6 +143,8 @@
     "ui.options.beammp.proxySmoke.tooltip": "Adds tire smoke to nearby proxies that are sliding and an exhaust puff when they pull away hard (up to 4 emitters at once).",
     "ui.options.beammp.proxySmokeDistance": "Smoke distance",
     "ui.options.beammp.proxySmokeDistance.tooltip": "How close a proxy has to be to get smoke effects.",
+    "ui.options.beammp.proxyMeshCacheMaxGB": "Proxy mesh cache size limit",
+    "ui.options.beammp.proxyMeshCacheMaxGB.tooltip": "Most disk space the proxy mesh cache may use. Checked when the game starts: the files used longest ago are removed (and rebuilt when needed again). 0 = no limit.",
     "ui.options.beammp.proxyGroup.general": "General",
     "ui.options.beammp.proxyGroup.realVehicles": "Real vehicles & spawning",
     "ui.options.beammp.proxyGroup.meshes": "Meshes & detail",

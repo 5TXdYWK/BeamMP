@@ -90,6 +90,7 @@
   "proxyTireScreechDistance"    : [ "local", 50 ],
   "proxySmoke"                  : [ "local", false ],
   "proxySmokeDistance"          : [ "local", 80 ],
+  "proxyMeshCacheMaxGB"         : [ "local", 4 ],
   "proxyMeshRealWheelsMax"      : [ "local", 12 ],
   "showPlayerIDs"               : [ "cloud", true  ],
   "licensePlateUsesPlayerName"  : [ "cloud", true ],
